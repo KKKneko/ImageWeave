@@ -50,6 +50,38 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.proxy.transport_core_binary, (root / "bin" / "mihomo").resolve())
         self.assertEqual(settings.proxy.transport_core_sha256, "1" * 64)
 
+    def test_retry_backoff_cap_default_is_five_minutes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = AppSettings.load(Path(temporary) / "missing-config.json")
+
+        self.assertEqual(settings.scheduler.retry_backoff_cap_seconds, 300.0)
+        # public_dict serializes the whole SchedulerSettings via asdict, so the new
+        # field is reported without a bespoke serializer entry.
+        self.assertEqual(
+            settings.public_dict()["scheduler"]["retry_backoff_cap_seconds"], 300.0
+        )
+
+    def test_retry_backoff_cap_is_parsed_and_floored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"scheduler": {"retry_backoff_cap_seconds": 45.0}}),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.scheduler.retry_backoff_cap_seconds, 45.0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"scheduler": {"retry_backoff_cap_seconds": 0.0}}),
+                encoding="utf-8",
+            )
+            floored = AppSettings.load(config_path)
+        self.assertEqual(floored.scheduler.retry_backoff_cap_seconds, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

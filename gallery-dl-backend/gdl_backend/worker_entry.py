@@ -34,6 +34,12 @@ def main() -> int:
     sys.argv = ["gallery-dl", *gallery_args]
     import gallery_dl
 
+    # Backend-owned runtime patches (stable .part naming, stall heartbeats).
+    # They live outside the submodule so the vendored tree stays pristine.
+    from gdl_backend import worker_patches
+
+    worker_patches.apply_all()
+
     return int(gallery_dl.main() or 0)
 
 

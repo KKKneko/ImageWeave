@@ -145,7 +145,18 @@ class OrderedCrawlManager:
             )
 
         try:
-            remaining = int(batch["max_tasks"]) - self.db.crawl_batch_task_count(batch["id"])
+            # Re-planning keeps this address's already-linked tasks (reset does not delete
+            # them) and re-enqueues them idempotently under the same key, so they consume
+            # no NEW budget. crawl_batch_task_count still counts them, understating the
+            # room left by exactly this address's own linked count — add it back so a large
+            # partially-planned address can be fully re-discovered. On first planning this
+            # address has 0 linked tasks, so the budget is unchanged.
+            already_linked = self.db.crawl_address_task_count(address["id"])
+            remaining = (
+                int(batch["max_tasks"])
+                - self.db.crawl_batch_task_count(batch["id"])
+                + already_linked
+            )
             if remaining <= 0:
                 raise CrawlPlanError(
                     "crawl_plan_too_large",
@@ -193,8 +204,12 @@ class OrderedCrawlManager:
                 / f"{int(address['address_order']):04d}"
             )
             for sequence_no, (unit, digest) in enumerate(deduplicated, start=1):
-                latest = self.db.get_crawl_batch(batch["id"])
-                if latest is None or latest["cancel_requested"]:
+                # Hot loop over up to max_tasks units: use the cheap cancel-flag read
+                # instead of get_crawl_batch (which loads every address + the review)
+                # on each iteration — that lookup made planning a large address O(N²)
+                # and blocked the event loop for seconds.
+                cancelled = self.db.crawl_batch_cancel_requested(batch["id"])
+                if cancelled is None or cancelled:
                     await cancel_linked()
                     return
                 unit_site = unit.site or address["site"]
@@ -243,6 +258,7 @@ class OrderedCrawlManager:
             if linked_tasks and self.db.mark_crawl_address_running(
                 address["id"],
                 last_error=error,
+                planning_error=error,
             ):
                 # Keep linked tasks attached to this address. On the next start the
                 # scheduler recovers them and strict sequencing drains this address
@@ -262,6 +278,7 @@ class OrderedCrawlManager:
                 if linked_tasks and self.db.mark_crawl_address_running(
                     address["id"],
                     last_error=error,
+                    planning_error=error,
                 ):
                     # Keep the address active until every partially-created task reaches
                     # a terminal state. This preserves strict address sequencing.

@@ -19,6 +19,7 @@ Desktop.ini
 **/htmlcov/
 **/.venv/
 **/venv/
+/.models/
 **/dist/
 **/build/
 **/*.egg-info/
@@ -51,10 +52,16 @@ Desktop.ini
 
 # Known sibling utilities that are outside this repository.  Keep them
 # excluded as well if they are ever copied into the worktree.
+# (差分去除_优化版.py 已转正为仓库内去重核心，不再排除)
 /grok_tmp/
-/差分去除_优化版.py
 /三裁剪.py
 /视频帧提取.html
+
+# Machine-local assistant/tooling state and scratch downloads
+/.claude/
+/.mcp.json
+/.repowise/
+/gallery-dl-backend/test-dl/
 
 # gallery-dl backend machine-local configuration and run output
 /gallery-dl-backend/config.json

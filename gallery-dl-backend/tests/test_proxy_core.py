@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gdl_backend.proxy import ProxyPoolAdapter
+from gdl_backend.proxy import ProxyPoolAdapter, ProxyPoolUnavailable
 from gdl_backend.proxy_core import (
     CoreEndpoint,
     _core_binary_names,
@@ -147,6 +147,99 @@ class ProxyCoreTests(unittest.TestCase):
         self.assertEqual(len(endpoints), 1)
         self.assertEqual(config["proxies"][0]["port-range"], "5000-5010")
         self.assertNotIn("port", config["proxies"][0])
+
+    def test_acquire_returns_none_when_pool_never_started(self):
+        # 未启动（含 auto_start=False）不属于核心启动失败：保持原契约返回 None，
+        # prefer 降级直连、required 走原重试路径。
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            self.assertIsNone(adapter.acquire("task-not-running"))
+
+    def test_acquire_returns_none_after_manual_stop_without_core_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            settings.proxy.inline_nodes = ["http://127.0.0.1:39999"]
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            adapter.probe = lambda **_: {"total": 1, "healthy": 1, "results": []}
+            adapter.start(force_refresh=True)
+            adapter.stop()
+            self.assertIsNone(adapter.acquire("task-stopped"))
+
+    def test_core_start_failure_fails_pool_start_and_blocks_acquire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            settings.proxy.transport_core_enabled = True
+            node_file = Path(tmp) / "nodes.yaml"
+            node_file.write_text(CLASH_TUNNEL_FIXTURE, encoding="utf-8")
+            settings.proxy.node_file = node_file
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            adapter.probe = lambda **_: {"total": 3, "healthy": 3, "results": []}
+            fake_endpoints = [
+                CoreEndpoint(
+                    id=f"node-{index}",
+                    name=f"fixture-{index}",
+                    source_protocol="trojan",
+                    source_host="fixture.example",
+                    local_http=f"http://127.0.0.1:{29100 + index}",
+                )
+                for index in range(3)
+            ]
+            with patch("gdl_backend.proxy.TunnelTransportCore") as core_class:
+                core = core_class.return_value
+                core.start.side_effect = RuntimeError(
+                    "代理核心启动失败，3 个监听端口尚未就绪"
+                )
+                with self.assertRaisesRegex(RuntimeError, "监听端口尚未就绪"):
+                    adapter.start(force_refresh=True)
+                core.stop.assert_called()
+                # 启动失败原因在 /proxy/status 可见；acquire 硬错误，禁止直连回退。
+                self.assertIn(
+                    "隧道核心启动失败",
+                    adapter.status()["transport_core"]["last_error"],
+                )
+                with self.assertRaisesRegex(ProxyPoolUnavailable, "隧道核心启动失败"):
+                    adapter.acquire("task-core-down")
+                # 修复核心后重启成功即恢复正常出租，标记被清除。
+                core.start.side_effect = None
+                core.start.return_value = fake_endpoints
+                core.status.return_value = {
+                    "enabled": True,
+                    "running": True,
+                    "listeners": 3,
+                    "last_error": "",
+                }
+                adapter.start(force_refresh=True)
+                self.assertEqual(adapter.status()["transport_core"]["last_error"], "")
+                lease = adapter.acquire("task-recovered")
+                self.assertIsNotNone(lease)
+                adapter.release("task-recovered", proxy_fault=False)
+                adapter.stop()
+
+    def test_core_start_failure_fails_pool_even_with_direct_nodes(self):
+        # 混合订阅（隧道 + 直连 HTTP 节点）同样硬失败：选择了 mihomo 就不做
+        # “丢弃隧道节点继续跑”的静默降级。
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            settings.proxy.transport_core_enabled = True
+            node_file = Path(tmp) / "nodes.yaml"
+            node_file.write_text(CLASH_TUNNEL_FIXTURE, encoding="utf-8")
+            settings.proxy.node_file = node_file
+            settings.proxy.inline_nodes = ["http://127.0.0.1:39999"]
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            with patch("gdl_backend.proxy.TunnelTransportCore") as core_class:
+                core_class.return_value.start.side_effect = RuntimeError(
+                    "代理核心启动失败，3 个监听端口尚未就绪"
+                )
+                with self.assertRaisesRegex(RuntimeError, "监听端口尚未就绪"):
+                    adapter.start(force_refresh=True)
+            self.assertFalse(adapter.status()["running"])
+            with self.assertRaisesRegex(ProxyPoolUnavailable, "隧道核心启动失败"):
+                adapter.acquire("task-mixed")
 
     def test_adapter_wires_core_endpoints_into_native_pool(self):
         with tempfile.TemporaryDirectory() as tmp:

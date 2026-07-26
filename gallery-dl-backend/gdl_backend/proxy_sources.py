@@ -687,6 +687,18 @@ def _parse_vmess_uri(line: str) -> ParsedProxyNode | None:
 
 
 def parse_proxy_line(raw: str) -> ParsedProxyNode | None:
+    # A single malformed node line must never abort the whole subscription parse.
+    # urlsplit raises ValueError on e.g. an unbalanced IPv6 bracket ("vless://u@[bad:1"),
+    # and several sub-parsers call it unguarded; one bad line would otherwise take out
+    # every good node in the same file (and, on the node_file/inline_nodes path, keep
+    # the proxy pool from starting at all).
+    try:
+        return _parse_proxy_line_impl(raw)
+    except Exception:
+        return None
+
+
+def _parse_proxy_line_impl(raw: str) -> ParsedProxyNode | None:
     line = str(raw or "").strip().strip("\ufeff")
     if not line or line.startswith("#"):
         return None
@@ -1130,11 +1142,24 @@ def fetch_subscriptions(
                     payload.extend(chunk)
                     if len(payload) > MAX_SUBSCRIPTION_BYTES:
                         raise ValueError("订阅响应超过 8 MiB 上限")
-                encoding = response.encoding or "utf-8-sig"
+                # requests defaults text/* without a charset to ISO-8859-1, which mojibakes
+                # UTF-8 CJK/emoji node names (breaking region tag matching). Only trust an
+                # explicitly declared charset; otherwise decode as UTF-8 (BOM-tolerant).
+                if "charset=" in response.headers.get("Content-Type", "").lower():
+                    encoding = response.encoding or "utf-8-sig"
+                else:
+                    encoding = "utf-8-sig"
                 text = bytes(payload).decode(encoding, errors="replace")
                 return url, parse_subscription_text(text), ""
         except Exception as exc:
-            return url, [], str(exc) or exc.__class__.__name__
+            # Never surface str(exc): a requests error embeds the full URL, and a token
+            # in the path segment (/sub/<SECRET>/clash) or a signed CDN redirect would
+            # leak through /proxy/status (redact_text only masks key=value query forms).
+            message = exc.__class__.__name__
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status:
+                message = f"{message}({status})"
+            return url, [], message
         finally:
             session.close()
 
@@ -1146,7 +1171,11 @@ def fetch_subscriptions(
         for future in as_completed(futures):
             url, parsed_nodes, error = future.result()
             if error:
-                warnings.append(f"订阅拉取失败: {url} -> {error}")
+                # Show only scheme://host so a token in the subscription URL path isn't
+                # exposed via /proxy/status.
+                parts = urlsplit(url)
+                safe_url = f"{parts.scheme}://{parts.hostname}" if parts.hostname else "订阅地址"
+                warnings.append(f"订阅拉取失败: {safe_url} -> {error}")
             else:
                 nodes.extend(parsed_nodes)
     if warnings and len(warnings) == len(clean_urls):

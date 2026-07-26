@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -20,7 +21,14 @@ from .schemas import EHDownloadOptions
 
 LineCallback = Callable[[str, str], Awaitable[None]]
 StartedCallback = Callable[[int, str], Awaitable[None]]
-_TWITTER_WEB_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+_TWITTER_WEB_HOSTS = {
+    "x.com",
+    "www.x.com",
+    "mobile.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "mobile.twitter.com",
+}
 
 
 def _is_twitter_web_url(url: str) -> bool:
@@ -63,12 +71,24 @@ class GalleryRunner:
     def validate_args(self, args: list[str]) -> list[str]:
         values = [str(arg) for arg in args]
         forbidden = list(self.settings.forbidden_args)
+        forbidden_long = [item for item in forbidden if item.startswith("--")]
+        forbidden_short = [item for item in forbidden if not item.startswith("--")]
         for arg in values:
-            for item in forbidden:
-                if arg == item or arg.startswith(item + "="):
-                    raise ValueError(f"gallery-dl 参数由后端管理: {item}")
-                if item in {"-d", "-D", "-S", "-o", "-c", "-C", "-u", "-p"} and arg.startswith(item):
-                    raise ValueError(f"gallery-dl 参数由后端管理: {item}")
+            token = arg.split("=", 1)[0]
+            if token.startswith("--") and len(token) > 2:
+                # gallery-dl's argparse keeps allow_abbrev=True, so any unambiguous
+                # prefix expands to a real option: --exec-afte -> --exec-after,
+                # --optio -> --option, --config-j -> --config-json. Exact matching
+                # left that bypass open. Every forbidden option is fully backend-
+                # managed, so blocking whenever the token and a forbidden long
+                # option are prefix-compatible in either direction is safe.
+                for item in forbidden_long:
+                    if token.startswith(item) or item.startswith(token):
+                        raise ValueError(f"gallery-dl 参数由后端管理: {item}")
+            else:
+                for item in forbidden_short:
+                    if arg == item or arg.startswith(item):
+                        raise ValueError(f"gallery-dl 参数由后端管理: {item}")
         return values
 
     @staticmethod
@@ -101,7 +121,9 @@ class GalleryRunner:
         site: str | None,
         options: EHDownloadOptions | None,
     ) -> list[str]:
-        if site != "exhentai" or options is None:
+        if site != "exhentai":
+            return []
+        if options is None:
             return []
         original = options.image_mode == "original"
         args = [
@@ -172,6 +194,7 @@ class GalleryRunner:
         http_timeout: float,
         gallery_retries: int,
         task_timeout: float,
+        stall_timeout: float = 0.0,
         cookies_file: str | None,
         config_file: str | None,
         credentials_ref: str | None,
@@ -200,6 +223,15 @@ class GalleryRunner:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        activity_path: Path | None = None
+        activity_started_path: Path | None = None
+        if stall_timeout and stall_timeout > 0:
+            activity_path = Path(output_dir).resolve() / f".gdl-activity-{marker}"
+            activity_started_path = activity_path.with_name(activity_path.name + ".started")
+        env["GDL_ACTIVITY_FILE"] = str(activity_path) if activity_path is not None else ""
+        env["GDL_ACTIVITY_STARTED_FILE"] = (
+            str(activity_started_path) if activity_started_path is not None else ""
+        )
         pythonpath = [str(self.backend_root), str(self.settings.repo_path)]
         if env.get("PYTHONPATH"):
             pythonpath.append(env["PYTHONPATH"])
@@ -233,29 +265,102 @@ class GalleryRunner:
             if stream is None:
                 return
             while True:
-                raw = await stream.readline()
+                try:
+                    raw = await stream.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    # gallery-dl printed a single line longer than the StreamReader
+                    # limit (giant data: URL, dumped error body). readline() discards
+                    # it and resets the buffer; skip it so we keep draining the pipe
+                    # instead of letting the child block on a full stdout/stderr,
+                    # which — with task_timeout=0 and no stall watchdog off-EH — would
+                    # otherwise hang the task until a backend restart.
+                    tail.append(f"[{name}] <单行输出超出上限，已跳过>")
+                    continue
                 if not raw:
                     break
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 safe = redact_text(line, secrets=(username, password), limit=self.settings.max_log_line_chars)
                 tail.append(f"[{name}] {safe}")
-                await on_line(name, safe)
+                try:
+                    await on_line(name, safe)
+                except Exception:
+                    # A logging/DB hiccup in the callback must not kill the reader
+                    # and stall the pipe; the line is already retained in `tail`.
+                    pass
 
         readers = [
             asyncio.create_task(read_stream(process.stdout, "stdout")),
             asyncio.create_task(read_stream(process.stderr, "stderr")),
         ]
         timed_out = False
+        wait_task: asyncio.Task | None = None
+        stall_task: asyncio.Task | None = None
+
+        async def wait_for_stall() -> bool:
+            if not stall_timeout or stall_timeout <= 0:
+                return False
+            last_progress: float | None = None
+            last_mtime = 0.0
+            while process.returncode is None:
+                await asyncio.sleep(min(1.0, max(0.2, float(stall_timeout) / 10.0)))
+                now = time.monotonic()
+                if activity_started_path is not None and last_progress is None:
+                    if not activity_started_path.is_file():
+                        continue
+                    last_progress = now
+                if activity_path is not None and last_progress is not None:
+                    try:
+                        mtime = activity_path.stat().st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    if mtime > last_mtime:
+                        last_mtime = mtime
+                        last_progress = now
+                if last_progress is not None and now - last_progress >= float(stall_timeout):
+                    return True
+            return False
+
         try:
+            wait_task = asyncio.create_task(process.wait(), name=f"gallery-wait-{task_id}")
+            wait_set = {wait_task}
+            if stall_timeout and stall_timeout > 0:
+                stall_task = asyncio.create_task(wait_for_stall(), name=f"gallery-stall-{task_id}")
+                wait_set.add(stall_task)
             if task_timeout and task_timeout > 0:
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=task_timeout)
-                except asyncio.TimeoutError:
+                done, _ = await asyncio.wait(
+                    wait_set,
+                    timeout=float(task_timeout),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    timed_out = True
+                    await terminate_process(process, self.settings.terminate_grace_seconds)
+                elif stall_task is not None and stall_task in done and stall_task.result():
                     timed_out = True
                     await terminate_process(process, self.settings.terminate_grace_seconds)
             else:
-                await process.wait()
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                if stall_task is not None and stall_task in done and stall_task.result():
+                    timed_out = True
+                    await terminate_process(process, self.settings.terminate_grace_seconds)
+            if timed_out:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(wait_task),
+                        timeout=max(2.0, float(self.settings.terminate_grace_seconds) + 5.0),
+                    )
+                except asyncio.TimeoutError:
+                    wait_task.cancel()
+            else:
+                await wait_task
         finally:
+            for waiter in (stall_task, wait_task):
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(
+                *(waiter for waiter in (stall_task, wait_task) if waiter is not None),
+                return_exceptions=True,
+            )
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*readers, return_exceptions=True),
@@ -269,6 +374,12 @@ class GalleryRunner:
                 current = self._active.get(task_id)
                 if current and current[0] is process:
                     self._active.pop(task_id, None)
+            for heartbeat in (activity_path, activity_started_path):
+                if heartbeat is not None:
+                    try:
+                        heartbeat.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         return GalleryRunResult(process.returncode, "\n".join(tail), timed_out, marker, process.pid)
 
     async def capture(

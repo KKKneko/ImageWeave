@@ -8,7 +8,7 @@ from pathlib import Path
 
 from gdl_backend.database import Database
 from gdl_backend.gallery import GalleryRunResult
-from gdl_backend.proxy import ProxyLease
+from gdl_backend.proxy import ProxyLease, ProxyPoolUnavailable
 from gdl_backend.scheduler import TaskScheduler
 from gdl_backend.schemas import EHDownloadOptions, SitePolicy, TaskPolicy
 
@@ -37,6 +37,25 @@ class FakeGallery:
         return None
 
 
+class ArtifactGallery(FakeGallery):
+    """FakeGallery that also emits stdout file paths so the scheduler records
+    them as downloaded artifacts (task_artifacts is populated from stdout only)."""
+
+    def __init__(self, results: list[GalleryRunResult], stdout_paths):
+        super().__init__(results)
+        self.stdout_paths = [str(p) for p in stdout_paths]
+
+    async def run(self, task_id: str, **kwargs):
+        self.calls.append({"task_id": task_id, **kwargs})
+        await kwargs["on_started"](100 + len(self.results), f"marker-{task_id}")
+        result = self.results.pop(0)
+        for path in self.stdout_paths:
+            await kwargs["on_line"]("stdout", path)
+        if result.output_tail:
+            await kwargs["on_line"]("stderr", result.output_tail)
+        return result
+
+
 class FakeProxy:
     def __init__(self, with_nodes: bool = False):
         self.with_nodes = with_nodes
@@ -62,6 +81,14 @@ class FakeProxy:
 
     def release(self, task_id: str, *, proxy_fault: bool, reason: str = ""):
         self.releases.append((task_id, proxy_fault))
+
+
+class UnavailableProxy(FakeProxy):
+    """Models the mihomo-core-startup-failure state: acquire hard-fails."""
+
+    def acquire(self, task_id: str, **kwargs):
+        super().acquire(task_id, **kwargs)
+        raise ProxyPoolUnavailable("代理池未运行（隧道核心启动失败）")
 
 
 class ReleaseFailingProxy(FakeProxy):
@@ -157,6 +184,26 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gallery.calls[0]["site"], "exhentai")
         self.assertEqual(gallery.calls[0]["eh_download"].image_mode, "original")
         self.assertEqual(gallery.calls[0]["eh_download"].gp_policy, "stop")
+        self.assertEqual(gallery.calls[0]["stall_timeout"], 180.0)
+
+    async def test_artifact_scan_ignores_partial_and_activity_files(self):
+        output = self.root / "artifacts"
+        output.mkdir()
+        (output / "complete.png").write_bytes(b"ok")
+        (output / "complete.png.part").write_bytes(b"partial")
+        (output / ".gdl-activity-marker").write_bytes(b"heartbeat")
+        self.assertEqual(TaskScheduler._scan_artifacts(str(output)), (1, 2))
+
+    async def test_artifact_output_is_scoped_to_the_current_task(self):
+        output = self.root / "shared"
+        output.mkdir()
+        own = output / "own.png"
+        other = output / "other.png"
+        own.write_bytes(b"own")
+        other.write_bytes(b"other")
+        self.assertEqual(TaskScheduler._artifact_from_output(str(own), str(output)), own.resolve())
+        self.assertIsNone(TaskScheduler._artifact_from_output("not a path", str(output)))
+        self.assertEqual(TaskScheduler._artifact_totals({own.resolve()}), (1, 3))
 
     async def test_prefer_uses_proxy_when_a_node_is_available(self):
         self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))
@@ -227,6 +274,29 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("本次任务使用直连" in row["line"] for row in self.db.get_logs("task-1"))
         )
+
+    async def test_pool_down_terminates_task_without_direct_fallback(self):
+        # Core startup failure / pool down: both prefer and required tasks must
+        # terminate with a reminder instead of silently downloading direct.
+        for mode in ("prefer", "required"):
+            with self.subTest(mode=mode):
+                task_id = f"task-pool-down-{mode}"
+                task_values = values(self.root, proxy_mode=mode, attempts=3)
+                task_values["id"] = task_id
+                self.db.create_task(task_values)
+                gallery = FakeGallery([GalleryRunResult(0, "unused", False, "m", 101)])
+                proxy = UnavailableProxy()
+                scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+                await scheduler.start()
+                task = await self.wait_terminal(task_id)
+                await scheduler.stop()
+                self.assertEqual(task["status"], "failed")
+                self.assertEqual(task["last_error_class"], "proxy_unavailable")
+                self.assertEqual(task["attempt_count"], 1)
+                self.assertEqual(gallery.calls, [])
+                logs = [row["line"] for row in self.db.get_logs(task_id)]
+                self.assertTrue(any("不会回退直连" in line for line in logs))
+                self.assertFalse(any("本次任务使用直连" in line for line in logs))
 
     async def test_proxy_failure_switches_node_then_succeeds(self):
         self.db.create_task(values(self.root, proxy_mode="required", attempts=2))
@@ -307,6 +377,46 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.stop()
         self.assertEqual(task["status"], "succeeded")
 
+    async def test_extraction_error_with_partial_artifacts_is_requeued(self):
+        # bit 4 with a downloaded file recorded = partial success -> bounded retry.
+        out_dir = self.root / "out"
+        out_dir.mkdir()
+        artifact = out_dir / "image_001.jpg"
+        artifact.write_bytes(b"partial-download")
+        self.db.create_task(values(self.root, proxy_mode="direct", attempts=2))
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = ArtifactGallery(
+            [GalleryRunResult(
+                4,
+                "gallery_dl.exception.ExtractionError: unable to parse gallery page",
+                False, "m", 101,
+            )],
+            stdout_paths=[artifact],
+        )
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        await scheduler._execute("task-1")
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["last_error_class"], "extraction_partial")
+
+    async def test_extraction_error_without_artifacts_is_not_requeued(self):
+        # bit 4 with zero downloaded files = pure extraction failure -> terminal,
+        # even with retry budget remaining (attempts=2).
+        self.db.create_task(values(self.root, proxy_mode="direct", attempts=2))
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = FakeGallery(
+            [GalleryRunResult(
+                4,
+                "gallery_dl.exception.ExtractionError: unable to parse gallery page",
+                False, "m", 101,
+            )]
+        )
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        await scheduler._execute("task-1")
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["last_error_class"], "extraction_error")
+
     async def test_authentication_failure_notifies_managed_auth_callback(self):
         task_values = values(self.root, proxy_mode="direct", attempts=1)
         cookie_file = str(self.root / "twitter.cookies.txt")
@@ -335,6 +445,81 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][:2], ("twitter", cookie_file))
         self.assertIn("authenticated cookies needed", calls[0][2])
         self.assertTrue(any("等待重新授权" in row["line"] for row in self.db.get_logs("task-1")))
+
+    def _set_task_columns(self, task_id: str, **columns) -> None:
+        assignments = ", ".join(f"{name}=?" for name in columns)
+        with self.db._transaction() as conn:
+            conn.execute(
+                f"UPDATE tasks SET {assignments} WHERE id=?",
+                (*columns.values(), task_id),
+            )
+
+    async def test_retry_backoff_is_capped_for_deep_attempt_sequences(self):
+        # A task with a huge accumulated automatic-retry history (attempt_count=20,
+        # anchor still 0) must not schedule base*2**19 (~1M s); the cap engages.
+        # max_attempts is the DB gate the scheduler checks (not policy.retry_limit,
+        # which pydantic caps at 20), so set it directly to leave retry budget.
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values["max_attempts"] = 30
+        task_values["policy"] = SitePolicy(
+            max_concurrency=1,
+            retry_limit=1,
+            backoff_base_seconds=2.0,
+            proxy_mode="direct",
+            gallery_retries=0,
+        ).model_dump()
+        self.db.create_task(task_values)
+        self._set_task_columns("task-1", attempt_count=20)
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = FakeGallery([GalleryRunResult(128, "download failed", False, "m", 101)])
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+
+        before = time.time()
+        await scheduler._execute("task-1")
+        after = time.time()
+
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "queued")
+        cap = self.settings.scheduler.retry_backoff_cap_seconds
+        jitter = self.settings.scheduler.retry_jitter_seconds
+        # next_run_at was computed with time.time() inside _execute (>= before),
+        # so (next_run_at - after) is a floor on the scheduled delay and must stay
+        # within the cap; (next_run_at - before) is a ceiling and proves the cap
+        # actually engaged rather than a tiny uncapped value slipping through.
+        self.assertLessEqual(task["next_run_at"] - after, cap + jitter)
+        self.assertGreaterEqual(task["next_run_at"] - before, cap)
+
+    async def test_backoff_anchor_resets_exponent_for_a_manual_round(self):
+        # A manual retry round pinned the anchor to the prior attempt_count (20) and
+        # bumped max_attempts, so this round's first automatic retry restarts the
+        # exponent at 0 -> delay ~= base, not the accumulated cap/huge value.
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values["policy"] = SitePolicy(
+            max_concurrency=1,
+            retry_limit=0,
+            backoff_base_seconds=2.0,
+            proxy_mode="direct",
+            gallery_retries=0,
+        ).model_dump()
+        self.db.create_task(task_values)
+        self._set_task_columns(
+            "task-1", attempt_count=20, max_attempts=22, backoff_anchor_attempt=20
+        )
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = FakeGallery([GalleryRunResult(128, "download failed", False, "m", 101)])
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+
+        before = time.time()
+        await scheduler._execute("task-1")
+        after = time.time()
+
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "queued")
+        base = 2.0
+        jitter = self.settings.scheduler.retry_jitter_seconds
+        # exponent = attempt_no(21) - 1 - anchor(20) = 0 -> delay == base (fresh).
+        self.assertLessEqual(task["next_run_at"] - after, base + jitter)
+        self.assertGreaterEqual(task["next_run_at"] - before, base)
 
 
 if __name__ == "__main__":

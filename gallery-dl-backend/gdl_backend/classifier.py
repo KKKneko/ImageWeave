@@ -56,6 +56,10 @@ _TRANSIENT_SITE_MARKERS = (
     "504 gateway timeout",
     "temporarily unavailable",
 )
+_CONTINUATION_MARKERS = (
+    "as input url to continue downloading from the current position",
+    "as input url to continue downloading from current position",
+)
 
 
 def classify_result(
@@ -77,6 +81,11 @@ def classify_result(
     if exit_code == 0:
         return FailureDecision("success", False, False, "")
     code = int(exit_code or 0)
+    # gallery-dl's main() maps a top-level NoExtractorError to exit bit 64
+    # (__init__.py: `retval |= 64`), NOT to NoExtractorError.code (32) — so this
+    # branch is the authoritative signal for an unsupported input URL and must
+    # stay. The text fallback additionally catches a NoExtractorError that
+    # surfaces mid-run (e.g. a child extractor) and only prints "Unsupported URL".
     if code & 64 or "unsupported url" in lower:
         return FailureDecision("unsupported_url", False, False, message)
     if code & 32:
@@ -85,8 +94,17 @@ def classify_result(
         return FailureDecision("proxy_access_failure", True, True, message)
     if code & 16 or any(marker in lower for marker in _AUTH_MARKERS):
         return FailureDecision("authentication", False, False, message)
+    if code & 8:
+        # ChallengeError (Cloudflare / DDoS-Guard challenge) — exception.py sets
+        # ChallengeError.code = 8, OR-accumulated into the exit status by job.py.
+        # A challenge is proxy/IP-specific, so rotate to another node and retry:
+        # proxy_fault=True marks the current node tried, retryable=True requeues.
+        # Checked before code & 4 so a combined status (e.g. 8|4=12) stays a challenge.
+        return FailureDecision("cloudflare_challenge", True, True, message)
     if any(marker in lower for marker in _NOT_FOUND_MARKERS):
         return FailureDecision("not_found", False, False, message)
+    if any(marker in lower for marker in _CONTINUATION_MARKERS):
+        return FailureDecision("download_error", True, proxy_fault, message)
     if proxy_fault:
         return FailureDecision("proxy_failure", True, True, message)
     if any(marker in lower for marker in _TRANSIENT_SITE_MARKERS):

@@ -64,7 +64,8 @@
         <div class="search-grid">
           <label class="field keyword-field">
             <span>画师 / 角色 / 作品关键词</span>
-            <input id="keyword" type="search" required maxlength="1000" placeholder="例如：clover days">
+            <input id="keyword" type="search" required maxlength="1000" placeholder="例如：clover days" autocomplete="off">
+            <div id="keywordSuggest" class="keyword-suggest" hidden></div>
           </label>
           <label class="field small-field">
             <span>证据上限</span>
@@ -86,6 +87,7 @@
           <label><input type="checkbox" name="site" value="twitter" checked><span>X / Twitter</span></label>
           <label><input type="checkbox" name="site" value="pixiv" checked><span>Pixiv</span></label>
           <label><input type="checkbox" name="site" value="exhentai" checked><span>EH</span></label>
+          <label><input type="checkbox" name="site" value="pawchive" checked><span>Pawchive</span></label>
         </fieldset>
 
         <section id="authCenter" class="auth-center" aria-labelledby="authCenterTitle">
@@ -137,6 +139,11 @@
                 <button class="button danger-quiet compact hidden" data-auth-clear="exhentai" type="button">删除导出凭证</button>
               </div>
             </article>
+            <article class="auth-card" data-auth-card="pawchive">
+              <div class="auth-card-title"><strong>Pawchive</strong><span class="auth-state">检测中</span></div>
+              <p class="auth-summary muted">读取公开 API 状态…</p>
+              <div class="auth-actions"></div>
+            </article>
           </div>
 
         </section>
@@ -150,6 +157,7 @@
             <div class="source-config-row" data-source-config="twitter"><strong>X</strong><select name="source_route_twitter" aria-label="X 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
             <div class="source-config-row" data-source-config="pixiv"><strong>Pixiv</strong><select name="source_route_pixiv" aria-label="Pixiv 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
             <div class="source-config-row" data-source-config="exhentai"><strong>EH</strong><select name="source_route_exhentai" aria-label="EH 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
+            <div class="source-config-row" data-source-config="pawchive"><strong>Pawchive</strong><select name="source_route_pawchive" aria-label="Pawchive 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
           </div>
         </details>
 
@@ -280,6 +288,8 @@
         </div>
         <div class="button-row compact-row">
           <button id="refreshBatch" class="button secondary" type="button">刷新</button>
+          <button id="retryFailedBatch" class="button secondary hidden" type="button">补齐失败下载</button>
+          <button id="rerunBatch" class="button secondary hidden" type="button">重新爬取</button>
           <button id="cancelBatch" class="button danger-quiet" type="button" disabled>取消批次</button>
         </div>
       </div>
@@ -301,6 +311,52 @@
         <div id="batchHeader" class="batch-header"></div>
         <div class="progress-track" aria-label="任务进度"><span id="batchProgress"></span></div>
         <div id="batchSources" class="batch-sources"></div>
+
+        <section id="reviewPanel" class="review-workspace hidden" aria-labelledby="reviewTitle">
+          <div class="review-heading">
+            <div>
+              <p class="eyebrow">图片整理</p>
+              <h3 id="reviewTitle">去重与质量审核</h3>
+            </div>
+            <div class="review-heading-actions">
+              <span id="reviewStatus" class="status-pill neutral"><span class="status-dot"></span>去重未开始</span>
+              <button id="reviewStart" class="button primary compact hidden" type="button">开始去重分析</button>
+            </div>
+          </div>
+
+          <div id="reviewStats" class="review-stats"></div>
+          <p id="reviewError" class="inline-error hidden" role="alert"></p>
+
+          <div id="reviewControls" class="review-controls hidden">
+            <div class="review-tabs" role="tablist" aria-label="审核分组筛选">
+              <button class="review-tab active" type="button" role="tab" data-review-kind="" aria-selected="true">全部</button>
+              <button class="review-tab" type="button" role="tab" data-review-kind="duplicate" aria-selected="false">重复组</button>
+              <button class="review-tab" type="button" role="tab" data-review-kind="single" aria-selected="false">独立图片</button>
+              <button class="review-tab" type="button" role="tab" data-review-kind="unreadable" aria-selected="false">读取失败</button>
+            </div>
+            <div class="button-row compact-row review-page-actions">
+              <button id="reviewKeepPage" class="button secondary compact" type="button">本页全留</button>
+              <button id="reviewDropPage" class="button danger-quiet compact" type="button">本页全不留</button>
+              <button id="reviewRecommendedPage" class="button secondary compact" type="button">每组仅留推荐</button>
+            </div>
+          </div>
+
+          <div id="reviewLoading" class="review-loading hidden">正在读取审核分组…</div>
+          <div id="reviewGroups" class="review-groups"></div>
+
+          <div id="reviewFooter" class="review-footer hidden">
+            <div class="review-pagination">
+              <button id="reviewPrevious" class="button ghost compact" type="button">上一页</button>
+              <span id="reviewPageSummary" class="muted"></span>
+              <button id="reviewNext" class="button ghost compact" type="button">下一页</button>
+            </div>
+            <div class="button-row compact-row">
+              <button id="reviewRetry" class="button secondary hidden" type="button">重试分析</button>
+              <button id="reviewSave" class="button primary" type="button">保存本页选择</button>
+              <button id="reviewApply" class="button success" type="button">应用审核结果</button>
+            </div>
+          </div>
+        </section>
 
         <div class="task-heading">
           <h3>图片任务</h3>

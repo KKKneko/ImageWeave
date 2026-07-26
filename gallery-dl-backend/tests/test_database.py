@@ -22,6 +22,20 @@ def task_values(root: Path) -> dict:
     }
 
 
+def crawl_address_values(batch_id: str) -> list[dict]:
+    return [
+        {
+            "id": f"{batch_id}-address",
+            "site": "danbooru",
+            "source_order": 0,
+            "address_order": 0,
+            "url": "https://danbooru.donmai.us/posts?tags=review",
+            "proxy_mode": "direct",
+            "max_attempts": 1,
+        }
+    ]
+
+
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -69,6 +83,28 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.get_task("task-1")["status"], "failed")
         retried = self.db.retry_task("task-1", 2)
         self.assertEqual(retried["status"], "queued")
+
+    def test_retry_task_anchors_backoff_to_prior_attempt_count(self):
+        self.db.create_task(task_values(self.root))
+        self.assertTrue(self.db.claim_task("task-1"))
+        attempt = self.db.begin_attempt("task-1")
+        self.db.complete_task(
+            "task-1",
+            "failed",
+            error_class="download_error",
+            error_message="boom",
+            expected_attempt_id=attempt["id"],
+        )
+        # Emulate a longer automatic-retry history before the manual round.
+        with self.db._transaction() as conn:
+            conn.execute("UPDATE tasks SET attempt_count=? WHERE id=?", (5, "task-1"))
+
+        retried = self.db.retry_task("task-1", 2)
+        self.assertEqual(retried["status"], "queued")
+        # The manual round pins the anchor to the accumulated attempt_count so the
+        # scheduler's backoff exponent restarts at 0, and grows the budget by 2.
+        self.assertEqual(retried["backoff_anchor_attempt"], 5)
+        self.assertEqual(retried["max_attempts"], 7)
 
     def test_logs_events_and_policy(self):
         self.db.create_task(task_values(self.root))
@@ -188,6 +224,381 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(batch["succeeded_task_count"], 1)
         self.assertEqual(batch["sources"][0]["status"], "succeeded")
         self.assertEqual(batch["sources"][1]["status"], "pending")
+
+    def test_retry_failed_crawl_tasks_requeues_only_failed_media(self):
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-retry",
+                "output_dir": str(self.root / "batch-retry"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-retry",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/1/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        values = {**task_values(self.root), "id": "task-retry"}
+        self.assertTrue(self.db.begin_crawl_address_planning("address-retry"))
+        self.db.create_task(values)
+        self.db.link_crawl_task("address-retry", "task-retry", 1)
+        self.assertTrue(self.db.mark_crawl_address_running("address-retry"))
+        self.assertTrue(self.db.claim_task("task-retry"))
+        attempt = self.db.begin_attempt("task-retry")
+        self.db.finish_attempt(
+            attempt["id"],
+            exit_code=1,
+            status="failed",
+            error_class="download_error",
+            error_message="continuation",
+            retryable=True,
+        )
+        self.db.complete_task(
+            "task-retry",
+            "failed",
+            exit_code=1,
+            error_class="download_error",
+            error_message="continuation",
+            expected_attempt_id=attempt["id"],
+        )
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-retry"))
+        result = self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=2)
+        self.assertEqual(result["retried_count"], 1)
+        self.assertEqual(result["address_ids"], ["address-retry"])
+        task = self.db.get_task("task-retry")
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["max_attempts"], 3)
+        # The manual round anchors the backoff exponent to the prior attempt_count
+        # (one attempt was recorded), so the next automatic retry starts fresh.
+        self.assertEqual(task["backoff_anchor_attempt"], 1)
+        batch = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(batch["status"], "running")
+        self.assertEqual(batch["sources"][0]["addresses"][0]["status"], "running")
+
+    def test_retry_failed_crawl_tasks_requeues_cancelled_media(self):
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-cancel",
+                "output_dir": str(self.root / "batch-cancel"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-cancel",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/2/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        values = {**task_values(self.root), "id": "task-cancel"}
+        self.assertTrue(self.db.begin_crawl_address_planning("address-cancel"))
+        self.db.create_task(values)
+        self.db.link_crawl_task("address-cancel", "task-cancel", 1)
+        self.assertTrue(self.db.mark_crawl_address_running("address-cancel"))
+        self.assertTrue(self.db.claim_task("task-cancel"))
+        attempt = self.db.begin_attempt("task-cancel")
+        self.db.request_cancel("task-cancel")
+        self.db.complete_task(
+            "task-cancel",
+            "cancelled",
+            exit_code=1,
+            error_class="cancelled",
+            error_message="任务已取消",
+            expected_attempt_id=attempt["id"],
+        )
+        cancelled = self.db.get_task("task-cancel")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertTrue(cancelled["cancel_requested"])
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-cancel"))
+
+        result = self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=2)
+        self.assertEqual(result["retried_count"], 1)
+        self.assertEqual(result["task_ids"], ["task-cancel"])
+        self.assertEqual(result["address_ids"], ["address-cancel"])
+        task = self.db.get_task("task-cancel")
+        self.assertEqual(task["status"], "queued")
+        self.assertFalse(task["cancel_requested"])
+        self.assertEqual(task["max_attempts"], 3)
+        batch = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(batch["status"], "running")
+        self.assertEqual(batch["sources"][0]["addresses"][0]["status"], "running")
+
+    def test_manual_retry_preserves_last_error_until_success(self):
+        # retry_failed_crawl_tasks must not blank the prior failure evidence.
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-err",
+                "output_dir": str(self.root / "batch-err"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-err",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/3/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-err"))
+        self.db.create_task({**task_values(self.root), "id": "task-err"})
+        self.db.link_crawl_task("address-err", "task-err", 1)
+        self.assertTrue(self.db.mark_crawl_address_running("address-err"))
+        self.assertTrue(self.db.claim_task("task-err"))
+        attempt = self.db.begin_attempt("task-err")
+        self.db.complete_task(
+            "task-err",
+            "failed",
+            exit_code=1,
+            error_class="download_error",
+            error_message="遗漏图片-42",
+            expected_attempt_id=attempt["id"],
+        )
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-err"))
+
+        self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=1)
+        requeued = self.db.get_task("task-err")
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["last_error_class"], "download_error")
+        self.assertEqual(requeued["last_error"], "遗漏图片-42")
+
+        # A later success clears the stale error via complete_task.
+        self.db.complete_task("task-err", "succeeded")
+        succeeded = self.db.get_task("task-err")
+        self.assertEqual(succeeded["status"], "succeeded")
+        self.assertEqual(succeeded["last_error_class"], "")
+        self.assertEqual(succeeded["last_error"], "")
+
+        # retry_task (standalone manual retry) must preserve it too.
+        self.db.create_task({**task_values(self.root), "id": "task-solo"})
+        self.assertTrue(self.db.claim_task("task-solo"))
+        solo_attempt = self.db.begin_attempt("task-solo")
+        self.db.complete_task(
+            "task-solo",
+            "failed",
+            exit_code=1,
+            error_class="http_error",
+            error_message="断点丢图-7",
+            expected_attempt_id=solo_attempt["id"],
+        )
+        self.db.retry_task("task-solo", 1)
+        solo = self.db.get_task("task-solo")
+        self.assertEqual(solo["status"], "queued")
+        self.assertEqual(solo["last_error_class"], "http_error")
+        self.assertEqual(solo["last_error"], "断点丢图-7")
+
+        self.db.complete_task("task-solo", "succeeded")
+        solo_done = self.db.get_task("task-solo")
+        self.assertEqual(solo_done["last_error_class"], "")
+        self.assertEqual(solo_done["last_error"], "")
+
+    def test_retry_replans_address_that_failed_planning_with_zero_tasks(self):
+        # B2: planning failed before any media task existed, so there is nothing to
+        # requeue at the task level; retry must re-plan the address instead.
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-replan-zero",
+                "output_dir": str(self.root / "batch-replan-zero"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-replan-zero",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/9/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-replan-zero"))
+        self.db.fail_crawl_address("address-replan-zero", "discovery exploded")
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+
+        finished = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(finished["status"], "completed_with_errors")
+        self.assertEqual(finished["failed_task_count"], 0)
+        address = finished["sources"][0]["addresses"][0]
+        self.assertEqual(address["status"], "failed")
+        self.assertEqual(address["planning_error"], "discovery exploded")
+        # Resumable purely because of the planning gap (no failed/cancelled tasks).
+        self.assertTrue(finished["resumable"])
+
+        result = self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=1)
+        self.assertEqual(result["retried_count"], 0)
+        self.assertEqual(result["replanned_address_count"], 1)
+        self.assertEqual(result["replanned_address_ids"], ["address-replan-zero"])
+
+        reactivated = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(reactivated["status"], "running")
+        replanned = reactivated["sources"][0]["addresses"][0]
+        self.assertEqual(replanned["status"], "pending")
+        self.assertEqual(replanned["planning_error"], "")
+        self.assertEqual(replanned["last_error"], "")
+        self.assertIsNone(replanned["started_at"])
+        self.assertIsNone(replanned["finished_at"])
+
+    def test_retry_replans_partially_planned_address(self):
+        # B3: planning threw after linking one task; that task even SUCCEEDS, so the
+        # address looks complete at the task level but silently dropped un-planned units.
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-replan-partial",
+                "output_dir": str(self.root / "batch-replan-partial"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-replan-partial",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/10/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-replan-partial"))
+        self.db.create_task({**task_values(self.root), "id": "task-partial"})
+        self.db.link_crawl_task("address-replan-partial", "task-partial", 1)
+        self.assertTrue(
+            self.db.mark_crawl_address_running(
+                "address-replan-partial",
+                last_error="planning interrupted",
+                planning_error="planning interrupted",
+            )
+        )
+        self.db.complete_task("task-partial", "succeeded")
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-replan-partial"))
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+
+        finished = self.db.get_crawl_batch(batch_id)
+        address = finished["sources"][0]["addresses"][0]
+        # Terminal 'failed' via planning_error even though its media task succeeded.
+        self.assertEqual(address["status"], "failed")
+        self.assertEqual(address["planning_error"], "planning interrupted")
+        self.assertEqual(finished["failed_task_count"], 0)
+        self.assertEqual(finished["succeeded_task_count"], 1)
+        self.assertTrue(finished["resumable"])
+
+        result = self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=1)
+        self.assertEqual(result["retried_count"], 0)
+        self.assertEqual(result["replanned_address_count"], 1)
+
+        reactivated = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(reactivated["status"], "running")
+        replanned = reactivated["sources"][0]["addresses"][0]
+        self.assertEqual(replanned["status"], "pending")
+        self.assertEqual(replanned["planning_error"], "")
+        # The already-succeeded task stays attached for idempotent re-planning.
+        linked = self.db.crawl_address_tasks("address-replan-partial")
+        self.assertEqual([task["id"] for task in linked], ["task-partial"])
+        self.assertEqual(linked[0]["status"], "succeeded")
+
+    def test_retry_requeues_tasks_without_replanning_fully_planned_address(self):
+        # Fully planned (planning_error==''), only a media task failed: requeue the task
+        # but do NOT reset the address to 'pending' (no needless re-discovery).
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-noreplan",
+                "output_dir": str(self.root / "batch-noreplan"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-noreplan",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/11/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-noreplan"))
+        self.db.create_task({**task_values(self.root), "id": "task-noreplan"})
+        self.db.link_crawl_task("address-noreplan", "task-noreplan", 1)
+        self.assertTrue(self.db.mark_crawl_address_running("address-noreplan"))
+        self.assertTrue(self.db.claim_task("task-noreplan"))
+        attempt = self.db.begin_attempt("task-noreplan")
+        self.db.complete_task(
+            "task-noreplan",
+            "failed",
+            exit_code=1,
+            error_class="download_error",
+            error_message="boom",
+            expected_attempt_id=attempt["id"],
+        )
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-noreplan"))
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+
+        finished = self.db.get_crawl_batch(batch_id)
+        address = finished["sources"][0]["addresses"][0]
+        self.assertEqual(address["status"], "failed")
+        self.assertEqual(address["planning_error"], "")
+        self.assertTrue(finished["resumable"])
+
+        result = self.db.retry_failed_crawl_tasks(batch_id, additional_attempts=1)
+        self.assertEqual(result["retried_count"], 1)
+        self.assertEqual(result["replanned_address_count"], 0)
+        self.assertEqual(result["replanned_address_ids"], [])
+
+        reactivated = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(reactivated["status"], "running")
+        address = reactivated["sources"][0]["addresses"][0]
+        # Requeued via the task path (status 'running'), NOT re-planned ('pending').
+        self.assertEqual(address["status"], "running")
+        self.assertEqual(self.db.get_task("task-noreplan")["status"], "queued")
+
+    def test_crawl_address_task_count(self):
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-count",
+                "output_dir": str(self.root / "batch-count"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "addr-count",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=x",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertEqual(self.db.crawl_address_task_count("addr-count"), 0)
+        for i in range(3):
+            self.db.create_task({**task_values(self.root), "id": f"ct-{i}"})
+            self.db.link_crawl_task("addr-count", f"ct-{i}", i + 1)
+        self.assertEqual(self.db.crawl_address_task_count("addr-count"), 3)
+        self.assertEqual(self.db.crawl_batch_task_count(batch_id), 3)
 
     def test_ordered_crawl_recovery_resets_only_planning_address(self):
         self.db.create_crawl_batch(
@@ -332,6 +743,308 @@ class DatabaseTests(unittest.TestCase):
         batch = self.db.get_crawl_batch("batch-linked-recovery")
         self.assertEqual(batch["sources"][0]["addresses"][0]["status"], "failed")
 
+    def test_new_crawl_requires_explicit_review_start_after_terminal(self):
+        batch_id = "batch-review-queue"
+        self.db.create_crawl_batch(
+            {
+                "id": batch_id,
+                "output_dir": str(self.root / batch_id),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            crawl_address_values(batch_id),
+        )
+
+        self.assertIsNone(self.db.get_crawl_review(batch_id))
+        self.assertIsNone(self.db.claim_next_crawl_review())
+        with self.assertRaisesRegex(RuntimeError, "结束后"):
+            self.db.start_crawl_review(batch_id)
+
+        address_id = f"{batch_id}-address"
+        self.assertTrue(self.db.begin_crawl_address_planning(address_id))
+        self.assertTrue(self.db.finish_crawl_address_as_pre_deduplicated(address_id, 0))
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+        self.assertIsNone(self.db.get_crawl_review(batch_id))
+        self.assertIsNone(self.db.claim_next_crawl_review())
+
+        review = self.db.start_crawl_review(batch_id)
+        self.assertEqual(review["status"], "pending")
+        self.assertEqual(
+            self.db.start_crawl_review(batch_id)["created_at"],
+            review["created_at"],
+        )
+        claimed = self.db.claim_next_crawl_review()
+        self.assertEqual(claimed["batch_id"], batch_id)
+
+    def test_legacy_waiting_review_is_not_claimed_until_explicit_start(self):
+        batch_id = "batch-review-legacy-waiting"
+        self.db.create_crawl_batch(
+            {
+                "id": batch_id,
+                "output_dir": str(self.root / batch_id),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            crawl_address_values(batch_id),
+        )
+        address_id = f"{batch_id}-address"
+        self.assertTrue(self.db.begin_crawl_address_planning(address_id))
+        self.assertTrue(self.db.finish_crawl_address_as_pre_deduplicated(address_id, 0))
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+
+        with self.db._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO crawl_reviews(batch_id, status, created_at, updated_at)
+                VALUES (?, 'waiting_for_crawl', 1, 1)
+                """,
+                (batch_id,),
+            )
+        self.assertIsNone(self.db.claim_next_crawl_review())
+        self.assertEqual(self.db.get_crawl_review(batch_id)["status"], "waiting_for_crawl")
+        self.assertEqual(self.db.start_crawl_review(batch_id)["status"], "pending")
+        self.assertEqual(self.db.claim_next_crawl_review()["batch_id"], batch_id)
+
+    def test_historical_terminal_review_is_registered_only_by_explicit_start(self):
+        batch_ids = ("batch-review-history-a", "batch-review-history-b")
+        for batch_id in batch_ids:
+            self.db.create_crawl_batch(
+                {
+                    "id": batch_id,
+                    "output_dir": str(self.root / batch_id),
+                    "concurrency": 1,
+                    "max_tasks": 10,
+                },
+                crawl_address_values(batch_id),
+            )
+            address_id = f"{batch_id}-address"
+            self.assertTrue(self.db.begin_crawl_address_planning(address_id))
+            self.assertTrue(self.db.finish_crawl_address_as_pre_deduplicated(address_id, 0))
+            self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+
+        self.assertIsNone(self.db.claim_next_crawl_review())
+        review = self.db.start_crawl_review(batch_ids[0])
+        self.assertEqual(review["status"], "pending")
+        self.assertIsNone(self.db.get_crawl_review(batch_ids[1]))
+        self.assertEqual(
+            self.db.start_crawl_review(batch_ids[0])["created_at"],
+            review["created_at"],
+        )
+
+    def test_link_crawl_task_keeps_existing_link_on_relink(self):
+        # Re-planning re-links the SAME (address, task) under a shifted sequence_no; the
+        # original row must stay untouched (no churn, no duplicate).
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-relink",
+                "output_dir": str(self.root / "batch-relink"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "addr-relink",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.db.create_task({**task_values(self.root), "id": "task-relink"})
+        self.db.link_crawl_task("addr-relink", "task-relink", 1)
+        self.db.link_crawl_task("addr-relink", "task-relink", 5)
+        linked = self.db.crawl_address_tasks("addr-relink")
+        self.assertEqual([task["id"] for task in linked], ["task-relink"])
+        self.assertEqual(linked[0]["sequence_no"], 1)
+        self.assertEqual(self.db.crawl_address_task_count("addr-relink"), 1)
+
+    def test_link_crawl_task_appends_new_task_on_sequence_collision(self):
+        # A NEW work prepended on re-plan requests a sequence_no already owned by an old
+        # task. INSERT OR IGNORE (the old bug) would silently drop the link; the fix must
+        # append the new task at MAX+1 so it stays visible to counts / completion.
+        batch_id, _ = self.db.create_crawl_batch(
+            {
+                "id": "batch-collision",
+                "output_dir": str(self.root / "batch-collision"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "addr-collision",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.db.create_task({**task_values(self.root), "id": "task-old"})
+        self.db.link_crawl_task("addr-collision", "task-old", 1)
+        self.db.create_task({**task_values(self.root), "id": "task-new"})
+        self.db.link_crawl_task("addr-collision", "task-new", 1)
+        linked = self.db.crawl_address_tasks("addr-collision")
+        self.assertEqual({task["id"] for task in linked}, {"task-old", "task-new"})
+        self.assertEqual(self.db.crawl_address_task_count("addr-collision"), 2)
+        sequences = {task["id"]: task["sequence_no"] for task in linked}
+        self.assertEqual(sequences["task-old"], 1)
+        self.assertEqual(sequences["task-new"], 2)
+        self.assertEqual(self.db.crawl_batch_task_count(batch_id), 2)
+
+    def _settle_task(self, task_id, status):
+        if status == "succeeded":
+            self.db.complete_task(task_id, "succeeded")
+            return
+        self.assertTrue(self.db.claim_task(task_id))
+        attempt = self.db.begin_attempt(task_id)
+        if status == "cancelled":
+            self.db.request_cancel(task_id)
+            self.db.complete_task(
+                task_id,
+                "cancelled",
+                exit_code=1,
+                error_class="cancelled",
+                error_message="cancelled",
+                expected_attempt_id=attempt["id"],
+            )
+        else:
+            self.db.complete_task(
+                task_id,
+                "failed",
+                exit_code=1,
+                error_class="download_error",
+                error_message=f"boom-{task_id}",
+                expected_attempt_id=attempt["id"],
+            )
+
+    def _build_terminal_batch(self, batch_id, task_specs):
+        # task_specs: list of (task_id, status). Builds one address holding those tasks
+        # and drives the batch to a terminal status.
+        address_id = f"{batch_id}-addr"
+        self.db.create_crawl_batch(
+            {
+                "id": batch_id,
+                "output_dir": str(self.root / batch_id),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": address_id,
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/1/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning(address_id))
+        for sequence_no, (task_id, _status) in enumerate(task_specs, start=1):
+            self.db.create_task({**task_values(self.root), "id": task_id})
+            self.db.link_crawl_task(address_id, task_id, sequence_no)
+        self.assertTrue(self.db.mark_crawl_address_running(address_id))
+        for task_id, status in task_specs:
+            self._settle_task(task_id, status)
+        self.assertTrue(self.db.finish_crawl_address_if_terminal(address_id))
+        self.assertTrue(self.db.finish_crawl_batch_if_ready(batch_id))
+        return address_id
+
+    def test_rerun_resets_addresses_and_keeps_succeeded_tasks(self):
+        address_id = self._build_terminal_batch(
+            "batch-rerun-ok", [("rk-1", "succeeded"), ("rk-2", "succeeded")]
+        )
+        self.assertEqual(self.db.get_crawl_batch("batch-rerun-ok")["status"], "succeeded")
+
+        result = self.db.rerun_crawl_batch("batch-rerun-ok")
+        self.assertEqual(result["requeued_task_count"], 0)
+        self.assertEqual(result["task_ids"], [])
+        self.assertEqual(result["replanned_address_count"], 1)
+        self.assertEqual(result["replanned_address_ids"], [address_id])
+        self.assertFalse(result["requeue_succeeded"])
+
+        reactivated = self.db.get_crawl_batch("batch-rerun-ok")
+        self.assertEqual(reactivated["status"], "running")
+        address = reactivated["sources"][0]["addresses"][0]
+        self.assertEqual(address["status"], "pending")
+        self.assertEqual(address["planning_error"], "")
+        self.assertEqual(address["last_error"], "")
+        self.assertIsNone(address["started_at"])
+        self.assertIsNone(address["finished_at"])
+        # Succeeded tasks are untouched so idempotent re-planning skips them (no re-download).
+        self.assertEqual(self.db.get_task("rk-1")["status"], "succeeded")
+        self.assertEqual(self.db.get_task("rk-2")["status"], "succeeded")
+
+    def test_rerun_requeues_failed_and_cancelled_preserving_last_error(self):
+        self._build_terminal_batch(
+            "batch-rerun-mixed",
+            [("mk-ok", "succeeded"), ("mk-fail", "failed"), ("mk-cancel", "cancelled")],
+        )
+        self.assertEqual(
+            self.db.get_crawl_batch("batch-rerun-mixed")["status"],
+            "completed_with_errors",
+        )
+
+        result = self.db.rerun_crawl_batch("batch-rerun-mixed", additional_attempts=2)
+        self.assertEqual(result["requeued_task_count"], 2)
+        self.assertEqual(set(result["task_ids"]), {"mk-fail", "mk-cancel"})
+        self.assertEqual(result["replanned_address_count"], 1)
+
+        reactivated = self.db.get_crawl_batch("batch-rerun-mixed")
+        self.assertEqual(reactivated["status"], "running")
+        self.assertEqual(reactivated["sources"][0]["addresses"][0]["status"], "pending")
+
+        failed = self.db.get_task("mk-fail")
+        self.assertEqual(failed["status"], "queued")
+        # backoff anchored to the prior attempt_count (1), budget grown by 2.
+        self.assertEqual(failed["backoff_anchor_attempt"], 1)
+        self.assertEqual(failed["max_attempts"], 3)
+        self.assertEqual(failed["last_error_class"], "download_error")
+        self.assertEqual(failed["last_error"], "boom-mk-fail")
+
+        cancelled = self.db.get_task("mk-cancel")
+        self.assertEqual(cancelled["status"], "queued")
+        self.assertFalse(cancelled["cancel_requested"])
+        self.assertEqual(cancelled["backoff_anchor_attempt"], 1)
+
+        self.assertEqual(self.db.get_task("mk-ok")["status"], "succeeded")
+
+    def test_rerun_with_requeue_succeeded_requeues_succeeded_tasks(self):
+        self._build_terminal_batch(
+            "batch-rerun-all", [("ak-1", "succeeded"), ("ak-2", "succeeded")]
+        )
+        result = self.db.rerun_crawl_batch("batch-rerun-all", requeue_succeeded=True)
+        self.assertEqual(result["requeued_task_count"], 2)
+        self.assertTrue(result["requeue_succeeded"])
+        self.assertEqual(set(result["task_ids"]), {"ak-1", "ak-2"})
+        self.assertEqual(self.db.get_task("ak-1")["status"], "queued")
+        self.assertEqual(self.db.get_task("ak-2")["status"], "queued")
+
+    def test_rerun_rejects_running_batch_and_unknown_batch(self):
+        self.assertIsNone(self.db.rerun_crawl_batch("does-not-exist"))
+        self.db.create_crawl_batch(
+            {
+                "id": "batch-rerun-live",
+                "output_dir": str(self.root / "batch-rerun-live"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            crawl_address_values("batch-rerun-live"),
+        )
+        # Activate the address so the batch is genuinely 'running', not terminal.
+        self.assertTrue(self.db.begin_crawl_address_planning("batch-rerun-live-address"))
+        self.assertEqual(self.db.get_crawl_batch("batch-rerun-live")["status"], "running")
+        self.assertEqual(
+            self.db.rerun_crawl_batch("batch-rerun-live"),
+            {"batch_id": "batch-rerun-live", "not_terminal": True},
+        )
+
     def test_schema_v1_reopen_creates_ordered_crawl_tables(self):
         path = self.root / "legacy.sqlite3"
         legacy = Database(path)
@@ -362,9 +1075,17 @@ class DatabaseTests(unittest.TestCase):
                     "PRAGMA table_info(crawl_addresses)"
                 ).fetchall()
             }
-            self.assertEqual(version, "5")
+            review_columns = {
+                row[1]
+                for row in upgraded._conn.execute(
+                    "PRAGMA table_info(crawl_reviews)"
+                ).fetchall()
+            }
+            self.assertEqual(version, "7")
             self.assertIn("download_options_json", address_columns)
             self.assertIn("pre_dedup_skipped_count", address_columns)
+            self.assertIn("automatic_group_count", review_columns)
+            self.assertIn("automatic_rejected_image_count", review_columns)
             self.assertTrue(
                 {
                     "crawl_batches",
@@ -373,6 +1094,9 @@ class DatabaseTests(unittest.TestCase):
                     "crawl_task_source_keys",
                     "crawl_address_proxy_probes",
                     "crawl_address_proxy_nodes",
+                    "crawl_reviews",
+                    "crawl_review_groups",
+                    "crawl_review_images",
                 }.issubset(tables)
             )
         finally:

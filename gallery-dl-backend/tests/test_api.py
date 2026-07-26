@@ -51,6 +51,11 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="ehDownloadOptions"', index.text)
         self.assertIn('name="ehImageMode"', index.text)
         self.assertIn('id="ehGpPolicy"', index.text)
+        self.assertIn('id="reviewPanel"', index.text)
+        self.assertIn('id="reviewGroups"', index.text)
+        self.assertIn('id="reviewStart"', index.text)
+        self.assertIn('id="reviewApply"', index.text)
+        self.assertIn('id="rerunBatch"', index.text)
         self.assertIn("删除导出凭证", index.text)
         self.assertIn("X、Pixiv 与 EH 共用同一个项目授权 Chrome Profile", index.text)
         self.assertNotIn('id="apiKey"', index.text)
@@ -65,6 +70,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(script.status_code, 200)
         self.assertIn("/api/v1/search", script.text)
         self.assertIn("/api/v1/crawls", script.text)
+        self.assertIn("rerunActiveBatch", script.text)
+        self.assertIn("/rerun", script.text)
         self.assertNotIn("X-API-Key", script.text)
         self.assertNotIn("gdl.apiKey", script.text)
         self.assertIn("address-thumbnail", script.text)
@@ -80,6 +87,10 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("importBrowserLogin", script.text)
         self.assertIn("schedulePixivOAuthPoll", script.text)
         self.assertIn("/api/v1/auth/browser-profile", script.text)
+        self.assertIn("/review/decisions", script.text)
+        self.assertIn("/review/start", script.text)
+        self.assertIn("automatic_rejected_image_count", script.text)
+        self.assertIn("setReviewGroupSelection", script.text)
         self.assertNotIn("completePixivOAuth", script.text)
 
         styles = self.client.get("/ui/styles.css")
@@ -93,13 +104,15 @@ class ApiTests(unittest.TestCase):
         self.assertIn(".oauth-panel", styles.text)
         self.assertIn(".segmented-control", styles.text)
         self.assertIn(".eh-download-options", styles.text)
+        self.assertIn(".review-image-grid", styles.text)
+        self.assertIn(".review-group.duplicate", styles.text)
 
     def test_managed_auth_api_contract(self):
         listing = self.client.get("/api/v1/auth")
         self.assertEqual(listing.status_code, 200, listing.text)
         self.assertEqual(
             [item["site"] for item in listing.json()["items"]],
-            ["danbooru", "twitter", "pixiv", "exhentai"],
+            ["danbooru", "twitter", "pixiv", "exhentai", "pawchive"],
         )
         self.assertFalse(listing.json()["secrets_exposed"])
         self.assertTrue(listing.json()["browser_profile"]["shared"])
@@ -302,7 +315,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(sites.status_code, 200)
         self.assertEqual(
             {item["site"] for item in sites.json()["items"]},
-            {"twitter", "pixiv", "danbooru", "exhentai"},
+            {"twitter", "pixiv", "danbooru", "exhentai", "pawchive"},
         )
         eh_catalog = next(
             item for item in sites.json()["items"] if item["site"] == "exhentai"
@@ -428,6 +441,9 @@ class ApiTests(unittest.TestCase):
             ],
         }
         self.container.discovery.search = AsyncMock(return_value=raw)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
         self.container.discovery.enrich_exhentai_previews = AsyncMock(
             return_value=enriched
         )
@@ -488,6 +504,9 @@ class ApiTests(unittest.TestCase):
             "attempts": 1,
         }
         self.container.discovery.search = AsyncMock(return_value=raw)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
         self.container.discovery.enrich_exhentai_previews = AsyncMock(
             side_effect=DiscoveryError("exhentai_preview_lookup_failed", "temporary")
         )
@@ -515,6 +534,191 @@ class ApiTests(unittest.TestCase):
             source["enrichment_errors"][0]["stage"],
             "exhentai_gallery_previews",
         )
+
+    def test_exhentai_search_expands_danbooru_aliases(self):
+        def gallery(gid: str, token: str) -> dict:
+            url = f"https://e-hentai.org/g/{gid}/{token}/"
+            return {
+                "id": gid,
+                "site": "exhentai",
+                "kind": "gallery",
+                "title": f"Gallery {gid}",
+                "url": url,
+                "download_url": url,
+                "thumbnail_url": None,
+                "media_count": None,
+                "metadata": {},
+            }
+
+        async def search_side_effect(*, site, keyword, **kwargs):
+            self.assertEqual(site, "exhentai")
+            candidates = {
+                "wlop": [gallery("100", "aaaaaaaaaa")],
+                "王凌": [gallery("100", "aaaaaaaaaa"), gallery("200", "bbbbbbbbbb")],
+                "wlopwangling": [],
+            }[keyword]
+            return {
+                "site": site,
+                "keyword": keyword,
+                "search_url": "https://e-hentai.org/?f_search=wlop",
+                "candidate_count": len(candidates),
+                "author_count": 0,
+                "candidates": candidates,
+                "authors": [],
+                "proxy": {"used": False},
+                "attempts": 1,
+            }
+
+        self.container.discovery.search = AsyncMock(side_effect=search_side_effect)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={
+                "authors": [
+                    {
+                        "name": "wlop",
+                        "other_names": ["王凌", "wlopwangling"],
+                        "origin": "danbooru_artist_directory",
+                    }
+                ]
+            }
+        )
+        self.container.discovery.enrich_exhentai_previews = AsyncMock(
+            side_effect=lambda result, **kwargs: result
+        )
+
+        response = self.client.post(
+            "/api/v1/search",
+            headers=self.headers,
+            json={
+                "sites": ["eh"],
+                "keyword": "wlop",
+                "limit": 20,
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        source = response.json()["sources"][0]
+        self.assertEqual(source["status"], "succeeded")
+        self.assertEqual(source["alias_keywords"], ["王凌", "wlopwangling"])
+        self.assertEqual(source["address_count"], 2)
+        by_label = {item["label"]: item for item in source["addresses"]}
+        self.assertEqual(
+            by_label["Gallery 100"]["evidence_reasons"],
+            ["keyword_gallery_search", "danbooru_alias_search"],
+        )
+        self.assertEqual(
+            by_label["Gallery 200"]["evidence_reasons"],
+            ["danbooru_alias_search"],
+        )
+        self.assertEqual(by_label["Gallery 200"]["matched_keywords"], ["王凌"])
+        searched = sorted(
+            call.kwargs["keyword"]
+            for call in self.container.discovery.search.await_args_list
+        )
+        self.assertEqual(searched, sorted(["wlop", "王凌", "wlopwangling"]))
+        self.container.discovery.search_danbooru_artists.assert_awaited_once()
+
+    def test_exhentai_alias_lookup_failure_degrades_to_plain_search(self):
+        raw = {
+            "site": "exhentai",
+            "keyword": "wlop",
+            "search_url": "https://e-hentai.org/?f_search=wlop",
+            "candidate_count": 1,
+            "author_count": 0,
+            "candidates": [
+                {
+                    "id": "100",
+                    "site": "exhentai",
+                    "kind": "gallery",
+                    "title": "Gallery 100",
+                    "url": "https://e-hentai.org/g/100/aaaaaaaaaa/",
+                    "download_url": "https://e-hentai.org/g/100/aaaaaaaaaa/",
+                    "thumbnail_url": None,
+                    "media_count": None,
+                    "metadata": {},
+                }
+            ],
+            "authors": [],
+            "proxy": {"used": False},
+            "attempts": 1,
+        }
+        self.container.discovery.search = AsyncMock(return_value=raw)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            side_effect=DiscoveryError("danbooru_api_protocol", "directory down")
+        )
+        self.container.discovery.enrich_exhentai_previews = AsyncMock(
+            side_effect=lambda result, **kwargs: result
+        )
+
+        response = self.client.post(
+            "/api/v1/search",
+            headers=self.headers,
+            json={
+                "sites": ["eh"],
+                "keyword": "wlop",
+                "limit": 20,
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        source = response.json()["sources"][0]
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["alias_keywords"], [])
+        self.assertEqual(source["address_count"], 1)
+        self.assertEqual(
+            source["enrichment_errors"][0]["stage"], "danbooru_alias_lookup"
+        )
+        self.assertEqual(
+            source["addresses"][0]["evidence_reasons"], ["keyword_gallery_search"]
+        )
+        self.container.discovery.search.assert_awaited_once()
+
+    def test_search_autocomplete_endpoint(self):
+        self.container.discovery.danbooru_autocomplete = AsyncMock(
+            return_value={
+                "query": "柠檬静",
+                "items": [
+                    {
+                        "value": "ningmeng_jing_jing_jing_jing",
+                        "label": "ningmeng jing jing jing jing",
+                        "match_type": "tag-other-name",
+                        "antecedent": "柠檬静静静静",
+                        "category": "artist",
+                        "post_count": 255,
+                    }
+                ],
+                "proxy": {"used": False},
+                "attempts": 1,
+            }
+        )
+        response = self.client.get(
+            "/api/v1/search/autocomplete",
+            headers=self.headers,
+            params={"q": "柠檬静"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["source"], "danbooru")
+        self.assertEqual(payload["query"], "柠檬静")
+        self.assertEqual(
+            payload["items"][0]["value"], "ningmeng_jing_jing_jing_jing"
+        )
+        self.assertEqual(payload["items"][0]["antecedent"], "柠檬静静静静")
+        call = self.container.discovery.danbooru_autocomplete.await_args
+        self.assertEqual(call.args[0], "柠檬静")
+        self.assertEqual(call.kwargs["limit"], 10)
+
+        blank = self.client.get(
+            "/api/v1/search/autocomplete", headers=self.headers, params={"q": "  "}
+        )
+        self.assertEqual(blank.status_code, 422)
+
+        self.container.discovery.danbooru_autocomplete = AsyncMock(
+            side_effect=DiscoveryError("danbooru_api_protocol", "bad upstream")
+        )
+        failed = self.client.get(
+            "/api/v1/search/autocomplete", headers=self.headers, params={"q": "abc"}
+        )
+        self.assertEqual(failed.status_code, 502)
 
     def test_cross_source_search_uses_danbooru_curated_profiles(self):
         async def search_side_effect(*, site, keyword, **kwargs):
@@ -639,6 +843,60 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(sources["twitter"]["search_strategy"], "danbooru_artist_urls")
         self.assertEqual(sources["pixiv"]["search_strategy"], "danbooru_artist_urls")
 
+    def test_account_discovery_failure_marks_x_pixiv_partial(self):
+        async def search_side_effect(*, site, keyword, **kwargs):
+            self.assertEqual(site, "danbooru")
+            return {
+                "site": site,
+                "keyword": keyword,
+                "search_url": "https://danbooru.donmai.us/posts?tags=artist_name",
+                "candidate_count": 1,
+                "author_count": 0,
+                "candidates": [
+                    {
+                        "id": "10",
+                        "site": "danbooru",
+                        "kind": "post",
+                        "metadata": {"artists": ["artist_name"]},
+                    }
+                ],
+                "authors": [],
+                "proxy": {"used": False},
+                "attempts": 1,
+            }
+
+        self.container.discovery.search = AsyncMock(side_effect=search_side_effect)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
+        self.container.discovery.danbooru_artist_profiles = AsyncMock(
+            side_effect=DiscoveryError("discovery_failed", "proxy node flaked")
+        )
+        response = self.client.post(
+            "/api/v1/search",
+            headers=self.headers,
+            json={
+                "sites": ["danbooru", "x", "pixiv"],
+                "keyword": "artist_name",
+                "limit": 5,
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        sources = {item["site"]: item for item in response.json()["sources"]}
+        self.assertEqual(sources["danbooru"]["status"], "partial")
+        for affected in ("twitter", "pixiv"):
+            self.assertEqual(sources[affected]["status"], "partial")
+            self.assertEqual(sources[affected]["addresses"], [])
+            stages = [
+                item["stage"] for item in sources[affected]["enrichment_errors"]
+            ]
+            self.assertIn("danbooru_account_discovery", stages)
+            self.assertIn(
+                "proxy node flaked",
+                sources[affected]["enrichment_errors"][-1]["message"],
+            )
+
     def test_cross_source_search_skips_native_account_lookups(self):
         async def search_side_effect(*, site, keyword, **kwargs):
             self.assertEqual(site, "danbooru")
@@ -655,6 +913,9 @@ class ApiTests(unittest.TestCase):
             }
 
         self.container.discovery.search = AsyncMock(side_effect=search_side_effect)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
         response = self.client.post(
             "/api/v1/search",
             headers=self.headers,
@@ -671,6 +932,7 @@ class ApiTests(unittest.TestCase):
             [call.kwargs["site"] for call in self.container.discovery.search.await_args_list],
             ["danbooru"],
         )
+        self.container.discovery.search_danbooru_artists.assert_awaited_once()
 
     def test_ordered_crawl_sequence_and_batch_idempotency(self):
         async def discover_side_effect(*, site, url, **kwargs):
@@ -1325,6 +1587,395 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(cancelled.status_code, 200, cancelled.text)
         self.assertEqual(cancelled.json()["status"], "cancelled")
         self.assertEqual(cancelled.json()["sources"][0]["addresses"][0]["status"], "cancelled")
+
+    def test_retry_replans_batch_with_only_planning_failures(self):
+        # A finished batch whose only defect is a planning failure (0 media tasks) must
+        # still be resumable and its /retry endpoint must NOT 409.
+        batch_id, _ = self.container.db.create_crawl_batch(
+            {
+                "id": "batch-api-replan",
+                "output_dir": str(Path(self.temp.name) / "batch-api-replan"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-api-replan",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/12/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.container.db.begin_crawl_address_planning("address-api-replan"))
+        self.container.db.fail_crawl_address("address-api-replan", "planning blew up")
+        self.assertTrue(self.container.db.finish_crawl_batch_if_ready(batch_id))
+
+        detail = self.client.get(f"/api/v1/crawls/{batch_id}", headers=self.headers)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["failed_task_count"], 0)
+        self.assertTrue(detail.json()["resumable"])
+
+        retry = self.client.post(
+            f"/api/v1/crawls/{batch_id}/retry",
+            headers=self.headers,
+            json={"additional_attempts": 1},
+        )
+        self.assertEqual(retry.status_code, 202, retry.text)
+        payload = retry.json()
+        self.assertEqual(payload["retried_count"], 0)
+        self.assertEqual(payload["replanned_address_count"], 1)
+        self.assertEqual(payload["replanned_address_ids"], ["address-api-replan"])
+        self.assertEqual(payload["batch"]["status"], "running")
+        replanned = payload["batch"]["sources"][0]["addresses"][0]
+        self.assertEqual(replanned["status"], "pending")
+        self.assertEqual(replanned["planning_error"], "")
+
+    def test_replan_returns_address_own_linked_tasks_to_budget(self):
+        # Re-planning a large partially-planned address must not trip crawl_plan_too_large:
+        # its already-linked tasks are counted by crawl_batch_task_count but re-enqueue
+        # idempotently (no new budget), so `remaining` must add that count back. Here
+        # max_tasks=10, another address holds 2 tasks, this address holds 5 partial tasks;
+        # the fixed remaining is 10-2=8 (the old formula gave 10-7=3 and would raise).
+        import asyncio
+
+        root = Path(self.temp.name)
+
+        def task_row(task_id):
+            return {
+                "id": task_id,
+                "url": "https://danbooru.donmai.us/posts/1",
+                "site": "danbooru",
+                "subcategory": "post",
+                "extractor": "DanbooruExtractor",
+                "output_dir": str(root / "out"),
+                "proxy_mode": "direct",
+                "max_attempts": 3,
+                "policy": {"max_concurrency": 1},
+                "extra_args": [],
+            }
+
+        batch_id, _ = self.container.db.create_crawl_batch(
+            {
+                "id": "batch-budget",
+                "output_dir": str(self.settings.default_output_root / "batch-budget"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "addr-A",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                },
+                {
+                    "id": "addr-B",
+                    "site": "danbooru",
+                    "source_order": 1,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=b",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                },
+            ],
+        )
+        # Address B contributes 2 tasks to the batch budget (other addresses' work).
+        for i in range(2):
+            self.container.db.create_task(task_row(f"b-task-{i}"))
+            self.container.db.link_crawl_task("addr-B", f"b-task-{i}", i + 1)
+        # Address A already holds 5 partially-planned tasks still linked (re-plan keeps them).
+        for i in range(5):
+            self.container.db.create_task(task_row(f"a-task-{i}"))
+            self.container.db.link_crawl_task("addr-A", f"a-task-{i}", i + 1)
+
+        self.assertEqual(self.container.db.crawl_address_task_count("addr-A"), 5)
+        self.assertEqual(self.container.db.crawl_batch_task_count(batch_id), 7)
+
+        captured = {}
+        units = [
+            CrawlUnit(
+                url=f"https://danbooru.donmai.us/posts/{100 + i}",
+                site="danbooru",
+                kind="post",
+                source_id=f"danbooru:{100 + i}",
+            )
+            for i in range(4)  # old remaining 3 would raise; fixed remaining 8 allows it
+        ]
+
+        async def fake_plan(address, *, batch_id, policy, max_tasks):
+            captured["max_tasks"] = max_tasks
+            return units, 0
+
+        batch = self.container.db.get_crawl_batch(batch_id)
+        address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(address["id"], "addr-A")
+        with patch.object(self.container.ordered_crawls, "_plan_address", new=fake_plan):
+            asyncio.run(self.container.ordered_crawls._activate_address(batch, address))
+
+        # remaining passed to the planner adds addr-A's own 5 linked tasks back:
+        # 10 - crawl_batch_task_count(7) + crawl_address_task_count(5) = 8.
+        self.assertEqual(captured["max_tasks"], 8)
+        replanned = self.container.db.get_crawl_batch(batch_id)["sources"][0]["addresses"][0]
+        # Guard did NOT raise (the old formula would have driven addr-A to 'failed').
+        self.assertEqual(replanned["status"], "running", replanned.get("last_error"))
+
+    def test_rerun_endpoint_reopens_terminal_batch(self):
+        root = Path(self.temp.name)
+        batch_id, _ = self.container.db.create_crawl_batch(
+            {
+                "id": "batch-api-rerun",
+                "output_dir": str(root / "batch-api-rerun"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-api-rerun",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.container.db.begin_crawl_address_planning("address-api-rerun"))
+        self.container.db.create_task(
+            {
+                "id": "api-rerun-task",
+                "url": "https://danbooru.donmai.us/posts/1",
+                "site": "danbooru",
+                "output_dir": str(root / "out"),
+                "proxy_mode": "direct",
+                "max_attempts": 3,
+                "policy": {"max_concurrency": 1},
+                "extra_args": [],
+            }
+        )
+        self.container.db.link_crawl_task("address-api-rerun", "api-rerun-task", 1)
+        self.assertTrue(self.container.db.mark_crawl_address_running("address-api-rerun"))
+        self.container.db.complete_task("api-rerun-task", "succeeded")
+        self.assertTrue(
+            self.container.db.finish_crawl_address_if_terminal("address-api-rerun")
+        )
+        self.assertTrue(self.container.db.finish_crawl_batch_if_ready(batch_id))
+
+        detail = self.client.get(f"/api/v1/crawls/{batch_id}", headers=self.headers)
+        self.assertEqual(detail.json()["status"], "succeeded")
+
+        rerun = self.client.post(
+            f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+        )
+        self.assertEqual(rerun.status_code, 202, rerun.text)
+        payload = rerun.json()
+        self.assertEqual(payload["requeued_task_count"], 0)
+        self.assertEqual(payload["replanned_address_count"], 1)
+        self.assertFalse(payload["requeue_succeeded"])
+        self.assertEqual(payload["batch"]["status"], "running")
+        self.assertEqual(
+            payload["batch"]["sources"][0]["addresses"][0]["status"], "pending"
+        )
+        # Succeeded task untouched -> idempotent re-planning will skip it (no re-download).
+        self.assertEqual(
+            self.container.db.get_task("api-rerun-task")["status"], "succeeded"
+        )
+
+    def test_rerun_endpoint_rejects_running_and_missing_batch(self):
+        missing = self.client.post(
+            "/api/v1/crawls/does-not-exist/rerun", headers=self.headers, json={}
+        )
+        self.assertEqual(missing.status_code, 404, missing.text)
+        self.assertEqual(missing.json()["error"]["code"], "crawl_not_found")
+
+        response = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "danbooru",
+                        "addresses": [
+                            {"url": "https://danbooru.donmai.us/posts?tags=artist_name"}
+                        ],
+                    }
+                ],
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        batch_id = response.json()["id"]
+        rerun = self.client.post(
+            f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+        )
+        self.assertEqual(rerun.status_code, 409, rerun.text)
+        self.assertEqual(rerun.json()["error"]["code"], "crawl_not_finished")
+
+    def test_rerun_endpoint_blocks_in_flight_review_only(self):
+        root = Path(self.temp.name)
+        batch_id, _ = self.container.db.create_crawl_batch(
+            {
+                "id": "batch-api-rerun-review",
+                "output_dir": str(root / "batch-api-rerun-review"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-api-rerun-review",
+                    "site": "exhentai",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://e-hentai.org/g/13/TOKEN/",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(
+            self.container.db.begin_crawl_address_planning("address-api-rerun-review")
+        )
+        self.container.db.fail_crawl_address("address-api-rerun-review", "planning blew up")
+        self.assertTrue(self.container.db.finish_crawl_batch_if_ready(batch_id))
+
+        # A review whose analysis is running actively scans the batch dir; re-crawling
+        # would race it, so the endpoint must block with 409 review_in_progress.
+        with self.container.db._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO crawl_reviews(batch_id, status, created_at, updated_at)
+                VALUES (?, 'analyzing', 1, 1)
+                """,
+                (batch_id,),
+            )
+        blocked = self.client.post(
+            f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertEqual(blocked.json()["error"]["code"], "review_in_progress")
+
+        # A stale finished review (ready) does not touch files and must not block.
+        with self.container.db._transaction() as conn:
+            conn.execute(
+                "UPDATE crawl_reviews SET status='ready' WHERE batch_id=?",
+                (batch_id,),
+            )
+        allowed = self.client.post(
+            f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+        )
+        self.assertEqual(allowed.status_code, 202, allowed.text)
+        self.assertEqual(allowed.json()["batch"]["status"], "running")
+
+    def test_rerun_incremental_replan_skips_succeeded_and_links_new_unit(self):
+        import asyncio
+
+        plan_state = {"units": []}
+
+        async def fake_plan(address, *, batch_id, policy, max_tasks):
+            return list(plan_state["units"]), 0
+
+        unit_a = CrawlUnit(
+            url="https://danbooru.donmai.us/posts/1",
+            site="danbooru",
+            kind="post",
+            source_id="danbooru:1",
+        )
+        unit_new = CrawlUnit(
+            url="https://danbooru.donmai.us/posts/2",
+            site="danbooru",
+            kind="post",
+            source_id="danbooru:2",
+        )
+
+        create = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "danbooru",
+                        "addresses": [{"url": "https://danbooru.donmai.us/posts?tags=a"}],
+                    }
+                ],
+                "proxy_mode": "direct",
+                "max_tasks": 10,
+            },
+        )
+        self.assertEqual(create.status_code, 202, create.text)
+        batch_id = create.json()["id"]
+
+        with patch.object(self.container.ordered_crawls, "_plan_address", new=fake_plan):
+            # Initial crawl: one unit -> one task, which succeeds.
+            plan_state["units"] = [unit_a]
+            asyncio.run(self.container.ordered_crawls.run_once())
+            tasks = self.container.db.list_crawl_tasks(batch_id)
+            self.assertEqual(len(tasks), 1)
+            task_a_id = tasks[0]["id"]
+            self.container.db.complete_task(task_a_id, "succeeded")
+            asyncio.run(self.container.ordered_crawls.run_once())
+            asyncio.run(self.container.ordered_crawls.run_once())
+            self.assertEqual(
+                self.container.db.get_crawl_batch(batch_id)["status"], "succeeded"
+            )
+            address_id = self.container.db.get_crawl_batch(batch_id)["sources"][0][
+                "addresses"
+            ][0]["id"]
+
+            # (a) Rerun re-discovering the SAME unit: idempotent skip, zero new tasks and
+            # zero requeued; the succeeded task stays succeeded.
+            rerun_a = self.client.post(
+                f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+            )
+            self.assertEqual(rerun_a.status_code, 202, rerun_a.text)
+            self.assertEqual(rerun_a.json()["requeued_task_count"], 0)
+            plan_state["units"] = [unit_a]
+            asyncio.run(self.container.ordered_crawls.run_once())
+            asyncio.run(self.container.ordered_crawls.run_once())
+            after_a = self.container.db.get_crawl_batch(batch_id)
+            self.assertEqual(after_a["status"], "succeeded")
+            self.assertEqual(
+                after_a["sources"][0]["addresses"][0]["status"], "succeeded"
+            )
+            self.assertEqual(len(self.container.db.list_crawl_tasks(batch_id)), 1)
+            self.assertEqual(
+                self.container.db.get_task(task_a_id)["status"], "succeeded"
+            )
+
+            # (b) Rerun re-discovering a SUPERSET with a NEW unit PREPENDED. The new unit
+            # requests sequence_no=1, already owned by the succeeded task, forcing the
+            # collision the Part 1 fix handles: exactly one new task is created AND linked
+            # (INSERT OR IGNORE would have silently dropped it).
+            rerun_b = self.client.post(
+                f"/api/v1/crawls/{batch_id}/rerun", headers=self.headers, json={}
+            )
+            self.assertEqual(rerun_b.status_code, 202, rerun_b.text)
+            plan_state["units"] = [unit_new, unit_a]
+            asyncio.run(self.container.ordered_crawls.run_once())
+            linked = self.container.db.crawl_address_tasks(address_id)
+            self.assertEqual(len(linked), 2)
+            new_ids = [task["id"] for task in linked if task["id"] != task_a_id]
+            self.assertEqual(len(new_ids), 1)
+            new_task_id = new_ids[0]
+            self.assertEqual(
+                self.container.db.get_task(new_task_id)["url"],
+                "https://danbooru.donmai.us/posts/2",
+            )
+
+            # The address completes once the single new task finishes.
+            self.container.db.complete_task(new_task_id, "succeeded")
+            asyncio.run(self.container.ordered_crawls.run_once())
+            asyncio.run(self.container.ordered_crawls.run_once())
+            final = self.container.db.get_crawl_batch(batch_id)
+            self.assertEqual(final["status"], "succeeded")
+            self.assertEqual(final["sources"][0]["addresses"][0]["status"], "succeeded")
+            self.assertEqual(final["task_count"], 2)
 
 
 if __name__ == "__main__":

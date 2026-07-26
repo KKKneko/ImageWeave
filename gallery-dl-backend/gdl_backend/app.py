@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import re
 import socket
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,8 +29,10 @@ from .discovery import (
     DiscoveryError,
     DiscoveryService,
     canonical_gallery_address,
+    danbooru_alias_terms,
     discovery_addresses,
     exhentai_tag_facets,
+    merge_alias_search_results,
     search_site,
     search_site_catalog,
     validate_discovery_args,
@@ -37,19 +41,29 @@ from .gallery import GalleryRunner
 from .ordered_crawl import OrderedCrawlManager
 from .proxy import ProxyPoolAdapter, ProxyPoolConflict, ProxyPoolError
 from .redaction import redact_text
+from .review import DedupReviewManager, resolve_review_file
 from .scheduler import TaskScheduler
 from .schemas import (
+    CrawlRerunRequest,
     CrawlRequest,
     ProxyProbeRequest,
     ProxyStartRequest,
     ProxyStopRequest,
     RetryRequest,
+    ReviewDecisions,
     SearchRequest,
     SitePolicy,
     TaskCreate,
     TaskPolicy,
 )
 from .site import SiteResolver
+
+# How long an EH/Pawchive search waits for the shared Danbooru artist-directory
+# lookup before proceeding without alias expansion.  The lookup keeps running
+# for the danbooru source itself, which awaits it in full.
+_ALIAS_LOOKUP_WAIT_SECONDS = 30.0
+
+_search_logger = logging.getLogger("gdl_backend.search")
 
 
 class ApiError(RuntimeError):
@@ -99,6 +113,11 @@ class ServiceContainer:
             self.policy_for,
             poll_interval=settings.scheduler.poll_interval_seconds,
         )
+        self.reviews = DedupReviewManager(
+            self.db,
+            settings.dedup,
+            settings.runtime_dir,
+        )
         self._health_task: asyncio.Task | None = None
         self._started = False
 
@@ -114,12 +133,33 @@ class ServiceContainer:
         if self.settings.proxy.enabled and self.settings.proxy.auto_start:
             try:
                 await asyncio.to_thread(self.proxy.start, force_refresh=True)
-            except Exception:
-                # Service remains available in degraded mode; /proxy/status exposes the cause.
-                pass
+            except Exception as exc:
+                # Keep the service up so the pool can be fixed and restarted from
+                # the WebUI, but never silently. Only a mihomo core startup
+                # failure blocks tasks (terminate, no direct fallback); other
+                # start failures keep the original prefer/required semantics.
+                core_error = ""
+                try:
+                    core_error = str(
+                        (self.proxy.status().get("transport_core") or {}).get("last_error") or ""
+                    )
+                except Exception:
+                    pass
+                reminder = (
+                    "；mihomo 传输核心启动失败，修复前非 direct 任务将被终止（不会回退直连）"
+                    if core_error
+                    else ""
+                )
+                print(
+                    f"[gdl-backend] 代理池启动失败：{redact_text(exc, limit=500)}{reminder}；"
+                    "详情见 /api/v1/proxy/status",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if background:
             await self.scheduler.start()
             await self.ordered_crawls.start()
+            await self.reviews.start()
             self._health_task = asyncio.create_task(self._proxy_health_loop(), name="proxy-health-monitor")
 
     async def stop(self) -> None:
@@ -127,6 +167,7 @@ class ServiceContainer:
             self._health_task.cancel()
             await asyncio.gather(self._health_task, return_exceptions=True)
             self._health_task = None
+        await self.reviews.stop()
         await self.ordered_crawls.stop()
         await self.scheduler.stop()
         await self.auth.stop()
@@ -629,11 +670,50 @@ def create_app(
             )
             if implicit_danbooru:
                 execution_sites.insert(0, "danbooru")
+            alias_search_sites = {"exhentai", "pawchive"}
+            needs_artist_directory = "danbooru" in execution_sites or any(
+                site in alias_search_sites for site in execution_sites
+            )
+            option_sites = list(execution_sites)
+            if needs_artist_directory and "danbooru" not in option_sites:
+                option_sites.append("danbooru")
             options = {
-                site: _effective_search_options(body, site) for site in execution_sites
+                site: _effective_search_options(body, site) for site in option_sites
             }
         except ValueError as exc:
             raise ApiError(422, "invalid_search", str(exc)) from exc
+
+        # One artist-directory lookup shared by the danbooru source (author
+        # merging) and the EH/Pawchive alias expansion below.
+        artist_directory_task: asyncio.Task | None = None
+        if needs_artist_directory:
+
+            async def _artist_directory_lookup() -> dict[str, Any]:
+                option = options["danbooru"]
+                credentials_ref, cookies_value, config_value = _managed_request_credentials(
+                    container,
+                    "danbooru",
+                    credentials_ref=option["credentials_ref"],
+                    cookies_file=option["cookies_file"],
+                    config_file=option["config_file"],
+                )
+                cookies, config_file = _allowed_request_files(
+                    container,
+                    cookies_file=cookies_value,
+                    config_file=config_value,
+                )
+                return await container.discovery.search_danbooru_artists(
+                    keyword=body.keyword,
+                    limit=body.limit,
+                    policy=container.policy_for("danbooru"),
+                    proxy_mode=option["proxy_mode"],
+                    credentials_ref=credentials_ref,
+                    cookies_file=str(cookies) if cookies else None,
+                    config_file=str(config_file) if config_file else None,
+                    timeout_seconds=option["timeout_seconds"],
+                )
+
+            artist_directory_task = asyncio.create_task(_artist_directory_lookup())
 
         async def run_source(order: int, site: str) -> dict[str, Any]:
             spec = search_site(site)
@@ -685,19 +765,90 @@ def create_app(
                 )
                 validate_discovery_args(option["search_extra_args"])
                 container.gallery.validate_args(option["search_extra_args"])
-                result = await container.discovery.search(
-                    site=site,
-                    keyword=body.keyword,
-                    limit=body.limit,
-                    policy=container.policy_for(site),
-                    proxy_mode=option["proxy_mode"],
-                    credentials_ref=credentials_ref,
-                    cookies_file=str(cookies) if cookies else None,
-                    config_file=str(config_file) if config_file else None,
-                    extra_args=option["search_extra_args"],
-                    timeout_seconds=option["timeout_seconds"],
-                )
                 source_enrichment_errors: list[dict[str, str]] = []
+
+                async def _search_term(term: str) -> dict[str, Any]:
+                    return await container.discovery.search(
+                        site=site,
+                        keyword=term,
+                        limit=body.limit,
+                        policy=container.policy_for(site),
+                        proxy_mode=option["proxy_mode"],
+                        credentials_ref=credentials_ref,
+                        cookies_file=str(cookies) if cookies else None,
+                        config_file=str(config_file) if config_file else None,
+                        extra_args=option["search_extra_args"],
+                        timeout_seconds=option["timeout_seconds"],
+                    )
+
+                # The primary keyword search starts immediately; the alias
+                # wait below runs while it is in flight so alias expansion
+                # never delays the native search.
+                primary_task = asyncio.create_task(_search_term(body.keyword))
+
+                alias_terms: list[str] = []
+                if site in alias_search_sites and artist_directory_task is not None:
+                    # Danbooru's curated artist entries carry other_names
+                    # (Japanese/romaji/CJK aliases); EH and Pawchive have no
+                    # such link maintenance, so a keyword in "the wrong"
+                    # variant silently misses artists that do exist there.
+                    try:
+                        artist_result = await asyncio.wait_for(
+                            asyncio.shield(artist_directory_task),
+                            timeout=_ALIAS_LOOKUP_WAIT_SECONDS,
+                        )
+                        alias_terms = danbooru_alias_terms(artist_result, body.keyword)
+                    except asyncio.TimeoutError:
+                        source_enrichment_errors.append(
+                            {
+                                "stage": "danbooru_alias_lookup",
+                                "message": (
+                                    "Danbooru 画师目录查询超过 "
+                                    f"{_ALIAS_LOOKUP_WAIT_SECONDS:g}s，已跳过别名扩搜"
+                                ),
+                            }
+                        )
+                    except Exception as exc:
+                        source_enrichment_errors.append(
+                            {
+                                "stage": "danbooru_alias_lookup",
+                                "message": redact_text(
+                                    exc.message
+                                    if isinstance(exc, DiscoveryError)
+                                    else exc,
+                                    limit=1000,
+                                ),
+                            }
+                        )
+
+                alias_outcomes = await asyncio.gather(
+                    *(_search_term(term) for term in alias_terms),
+                    return_exceptions=True,
+                )
+                result = await primary_task
+                if alias_terms:
+                    alias_results: list[tuple[str, dict[str, Any]]] = []
+                    for term, outcome in zip(alias_terms, alias_outcomes):
+                        if isinstance(outcome, BaseException):
+                            source_enrichment_errors.append(
+                                {
+                                    "stage": "danbooru_alias_search",
+                                    "message": redact_text(
+                                        f"{term}: "
+                                        + str(
+                                            outcome.message
+                                            if isinstance(outcome, DiscoveryError)
+                                            else outcome
+                                        ),
+                                        limit=1000,
+                                    ),
+                                }
+                            )
+                        else:
+                            alias_results.append((term, outcome))
+                    result = merge_alias_search_results(
+                        body.keyword, result, alias_results, limit=body.limit
+                    )
                 if site == "exhentai":
                     try:
                         result = await container.discovery.enrich_exhentai_previews(
@@ -725,18 +876,9 @@ def create_app(
                                 ),
                             }
                         )
-                if site == "danbooru":
+                if site == "danbooru" and artist_directory_task is not None:
                     try:
-                        artist_result = await container.discovery.search_danbooru_artists(
-                            keyword=body.keyword,
-                            limit=body.limit,
-                            policy=container.policy_for(site),
-                            proxy_mode=option["proxy_mode"],
-                            credentials_ref=credentials_ref,
-                            cookies_file=str(cookies) if cookies else None,
-                            config_file=str(config_file) if config_file else None,
-                            timeout_seconds=option["timeout_seconds"],
-                        )
+                        artist_result = await artist_directory_task
                         merged_authors = list(result.get("authors") or [])
                         author_by_key = {
                             str(author.get("works_url") or author.get("url") or author.get("name")): author
@@ -801,6 +943,7 @@ def create_app(
                     "site": site,
                     "status": "partial" if source_enrichment_errors else "succeeded",
                     "search_url": result.get("search_url"),
+                    "alias_keywords": list(result.get("alias_keywords") or []),
                     "evidence_count": result.get("candidate_count", 0),
                     "preview_count": result.get("preview_count", 0),
                     "preview_missing_count": result.get("preview_missing_count", 0),
@@ -847,6 +990,16 @@ def create_app(
                 *(run_source(order, site) for order, site in enumerate(execution_sites))
             )
         )
+        if artist_directory_task is not None:
+            # Every consumer guards its own await; retrieve the outcome here so
+            # an all-consumers-timed-out run never leaves an unretrieved task
+            # exception behind.
+            if not artist_directory_task.done():
+                artist_directory_task.cancel()
+            try:
+                await artist_directory_task
+            except (Exception, asyncio.CancelledError):
+                pass
         source_by_site = {source["site"]: source for source in sources}
         related_profiles: list[dict[str, Any]] = []
         enrichment_errors: list[dict[str, str]] = [
@@ -988,10 +1141,62 @@ def create_app(
                     source["address_count"] = len(source["addresses"])
                     source["weak_evidence_count"] = len(source["weak_evidence"])
 
+        # X/Pixiv account discovery rides entirely on the Danbooru artist
+        # entry; when that upstream failed, an empty account list is an
+        # incident, not "no results" — surface it on the affected sources
+        # instead of letting them report a clean success with zero addresses.
+        danbooru_upstream_errors = [
+            error for error in enrichment_errors if error.get("source") == "danbooru"
+        ]
+        if danbooru is not None and danbooru.get("status") == "failed":
+            danbooru_upstream_errors.append(
+                {
+                    "source": "danbooru",
+                    "stage": "danbooru_search",
+                    "message": ((danbooru.get("error") or {}).get("message"))
+                    or "Danbooru 搜索失败",
+                }
+            )
+        if danbooru_upstream_errors:
+            detail = "; ".join(
+                str(error.get("message") or error.get("stage") or "")[:200]
+                for error in danbooru_upstream_errors[:3]
+            )
+            for affected in ("twitter", "pixiv"):
+                target = source_by_site.get(affected)
+                if target is None or target["addresses"]:
+                    continue
+                if target["status"] == "succeeded":
+                    target["status"] = "partial"
+                target["enrichment_errors"] = [
+                    *(target.get("enrichment_errors") or []),
+                    {
+                        "stage": "danbooru_account_discovery",
+                        "message": (
+                            "Danbooru 画师条目查询失败，本次未完成账号发现"
+                            "（通常重试搜索即可恢复）：" + detail
+                        ),
+                    },
+                ]
+
         if implicit_danbooru:
             sources = [source for source in sources if source["site"] != "danbooru"]
         for order, source in enumerate(sources):
             source["order"] = order
+        for source in sources:
+            if source.get("status") == "succeeded":
+                continue
+            _search_logger.warning(
+                "search source issue keyword=%r site=%s status=%s error=%s enrichment=[%s]",
+                body.keyword,
+                source.get("site"),
+                source.get("status"),
+                (source.get("error") or {}).get("message"),
+                "; ".join(
+                    f"{item.get('stage')}: {str(item.get('message'))[:160]}"
+                    for item in source.get("enrichment_errors") or []
+                ),
+            )
 
         return {
             "keyword": body.keyword,
@@ -1021,6 +1226,35 @@ def create_app(
     @api.get("/search/sites")
     async def supported_search_sites():
         return {"items": search_site_catalog()}
+
+    @api.get("/search/autocomplete")
+    async def search_autocomplete(
+        q: str,
+        limit: int = 10,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        # Prefix suggestions from Danbooru's search-box autocomplete so the
+        # user can resolve a partial/alias spelling to the real artist tag
+        # themselves — nothing here feeds the search silently.
+        query = str(q or "").strip()
+        if not query:
+            raise ApiError(422, "invalid_autocomplete", "补全关键词不能为空")
+        if len(query) > 200:
+            raise ApiError(422, "invalid_autocomplete", "补全关键词过长")
+        try:
+            result = await container.discovery.danbooru_autocomplete(
+                query,
+                limit=min(max(1, int(limit)), 20),
+                policy=container.policy_for("danbooru"),
+                proxy_mode=None,
+            )
+        except DiscoveryError as exc:
+            raise ApiError(502, exc.code, exc.message) from exc
+        return {
+            "query": result["query"],
+            "source": "danbooru",
+            "items": result["items"],
+        }
 
     @api.post("/search")
     async def search_candidates(
@@ -1208,6 +1442,12 @@ def create_app(
         batch = container.db.get_crawl_batch(batch_id)
         if batch is None:
             raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        if (
+            batch["status"] in {"succeeded", "completed_with_errors", "cancelled"}
+            and batch.get("review") is None
+        ):
+            status = "not_started" if container.settings.dedup.enabled else "disabled"
+            batch["review"] = {"batch_id": batch_id, "status": status}
         return batch
 
     @api.get("/crawls/{batch_id}/tasks")
@@ -1231,6 +1471,126 @@ def create_app(
             "offset": offset,
         }
 
+    @api.get("/crawls/{batch_id}/review")
+    async def get_crawl_review(
+        batch_id: str,
+        kind: str | None = Query(default=None, pattern="^(duplicate|single|unreadable)$"),
+        limit: int = Query(default=12, ge=1, le=50),
+        offset: int = Query(default=0, ge=0),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        batch = container.db.get_crawl_batch(batch_id)
+        if batch is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        if batch["status"] not in {"succeeded", "completed_with_errors", "cancelled"}:
+            raise ApiError(409, "crawl_not_finished", "爬取批次结束后才会进入图片审核")
+        review = container.db.get_crawl_review(batch_id)
+        if review is None:
+            status = "not_started" if container.settings.dedup.enabled else "disabled"
+            return {
+                "batch_id": batch_id,
+                "status": status,
+                "groups": {"items": [], "total": 0, "limit": limit, "offset": offset},
+            }
+        page = {"items": [], "total": 0, "limit": limit, "offset": offset}
+        if review["status"] in {"ready", "applying", "applied", "apply_failed"}:
+            page = container.db.list_crawl_review_groups(
+                batch_id,
+                kind=kind,
+                limit=limit,
+                offset=offset,
+            )
+            for group in page["items"]:
+                for image in group["images"]:
+                    image["url"] = (
+                        f"/api/v1/crawls/{batch_id}/review/images/{image['id']}"
+                    )
+        return {**review, "groups": page}
+
+    @api.post("/crawls/{batch_id}/review/start", status_code=202)
+    async def start_crawl_review(
+        batch_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        if not container.settings.dedup.enabled:
+            raise ApiError(409, "dedup_disabled", "去重功能未启用")
+        try:
+            return container.reviews.start_analysis(batch_id)
+        except KeyError as exc:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在") from exc
+        except RuntimeError as exc:
+            raise ApiError(409, "review_state_conflict", str(exc)) from exc
+
+    @api.put("/crawls/{batch_id}/review/decisions")
+    async def update_crawl_review_decisions(
+        batch_id: str,
+        body: ReviewDecisions,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        try:
+            container.db.update_crawl_review_decisions(
+                batch_id,
+                [group.model_dump() for group in body.groups],
+            )
+        except KeyError as exc:
+            raise ApiError(404, "review_not_found", "审核批次或分组不存在") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(409, "review_state_conflict", str(exc)) from exc
+        review = container.db.get_crawl_review(batch_id)
+        if review is None:
+            raise ApiError(404, "review_not_found", "审核批次不存在")
+        return review
+
+    @api.post("/crawls/{batch_id}/review/apply")
+    async def apply_crawl_review(
+        batch_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        if container.db.get_crawl_batch(batch_id) is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        try:
+            return await asyncio.to_thread(container.reviews.apply, batch_id)
+        except KeyError as exc:
+            raise ApiError(404, "review_not_found", "审核批次不存在") from exc
+        except RuntimeError as exc:
+            raise ApiError(409, "review_state_conflict", str(exc)) from exc
+
+    @api.post("/crawls/{batch_id}/review/retry", status_code=202)
+    async def retry_crawl_review(
+        batch_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        try:
+            retried = container.reviews.retry_analysis(batch_id)
+        except RuntimeError as exc:
+            raise ApiError(409, "review_state_conflict", str(exc)) from exc
+        if not retried:
+            raise ApiError(404, "review_not_found", "审核批次不存在")
+        return container.db.get_crawl_review(batch_id)
+
+    @api.get("/crawls/{batch_id}/review/images/{image_id}")
+    async def get_crawl_review_image(
+        batch_id: str,
+        image_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        image = container.db.get_crawl_review_image(batch_id, image_id)
+        if image is None:
+            raise ApiError(404, "review_image_not_found", "审核图片不存在")
+        root = Path(image["output_dir"]).resolve()
+        candidates = []
+        if image.get("final_relative_path"):
+            candidates.append(str(image["final_relative_path"]))
+        candidates.append(str(image["relative_path"]))
+        for relative_path in candidates:
+            try:
+                target = resolve_review_file(root, relative_path)
+            except ValueError:
+                continue
+            if target.is_file():
+                return FileResponse(target)
+        raise ApiError(404, "review_image_not_found", "审核图片文件不存在")
+
     @api.post("/crawls/{batch_id}/cancel")
     async def cancel_crawl(batch_id: str, container: ServiceContainer = Depends(get_service)):
         batch, task_ids = container.db.request_cancel_crawl_batch(batch_id)
@@ -1241,6 +1601,81 @@ def create_app(
         container.ordered_crawls.notify()
         container.db.finish_crawl_batch_if_ready(batch_id)
         return container.db.get_crawl_batch(batch_id)
+
+    @api.post("/crawls/{batch_id}/retry", status_code=202)
+    async def retry_crawl_failed(
+        batch_id: str,
+        body: RetryRequest,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        batch = container.db.get_crawl_batch(batch_id)
+        if batch is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        # Same guard as /rerun: requeuing failed tasks pulls the batch back to running
+        # and re-downloads into the batch's output_dir. If dedup review is mid-flight it
+        # is scanning/moving that same tree, so the two would corrupt each other.
+        if batch["status"] not in {"succeeded", "completed_with_errors", "cancelled"}:
+            raise ApiError(409, "crawl_not_finished", "批次仍在运行，结束后才能重试失败任务")
+        review = batch.get("review")
+        if review is not None and review.get("status") in _REVIEW_IN_FLIGHT:
+            raise ApiError(409, "review_in_progress", "图片审核进行中，结束后才能重试失败任务")
+        result = container.db.retry_failed_crawl_tasks(
+            batch_id,
+            body.additional_attempts,
+        )
+        if result is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        if not result["retried_count"] and not result.get("replanned_address_count"):
+            raise ApiError(
+                409,
+                "crawl_no_failed_tasks",
+                "批次没有可重新排队的失败任务或待重规划的地址",
+            )
+        container.scheduler.notify()
+        container.ordered_crawls.notify()
+        for address_id in result.get("address_ids", []):
+            container.db.finish_crawl_address_if_terminal(address_id)
+        container.db.finish_crawl_batch_if_ready(batch_id)
+        return {
+            **result,
+            "batch": container.db.get_crawl_batch(batch_id),
+        }
+
+    # Review states in which a background worker is actively scanning or moving the
+    # batch's files. Re-crawling under any of these would race the analysis/apply, so
+    # the rerun endpoint blocks them. A stale finished review (ready/applied/failed/
+    # apply_failed/waiting_for_crawl) does not touch files and must not block.
+    _REVIEW_IN_FLIGHT = {"pending", "analyzing", "applying", "auto_applying"}
+
+    @api.post("/crawls/{batch_id}/rerun", status_code=202)
+    async def rerun_crawl(
+        batch_id: str,
+        body: CrawlRerunRequest,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        batch = container.db.get_crawl_batch(batch_id)
+        if batch is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        if batch["status"] not in {"succeeded", "completed_with_errors", "cancelled"}:
+            raise ApiError(409, "crawl_not_finished", "批次仍在运行，结束后才能重新爬取")
+        review = batch.get("review")
+        if review is not None and review.get("status") in _REVIEW_IN_FLIGHT:
+            raise ApiError(409, "review_in_progress", "图片审核进行中，结束后才能重新爬取")
+        result = container.db.rerun_crawl_batch(
+            batch_id,
+            body.additional_attempts,
+            requeue_succeeded=body.requeue_succeeded,
+        )
+        if result is None:
+            raise ApiError(404, "crawl_not_found", "爬取批次不存在")
+        if result.get("not_terminal"):
+            raise ApiError(409, "crawl_not_finished", "批次仍在运行，结束后才能重新爬取")
+        container.scheduler.notify()
+        container.ordered_crawls.notify()
+        return {
+            **result,
+            "batch": container.db.get_crawl_batch(batch_id),
+        }
 
     @api.get("/tasks")
     async def list_tasks(
@@ -1269,6 +1704,17 @@ def create_app(
 
     @api.post("/tasks/{task_id}/retry", status_code=202)
     async def retry_task(task_id: str, body: RetryRequest, container: ServiceContainer = Depends(get_service)):
+        # A crawl media task retried in isolation would rerun into the batch's output_dir
+        # without ever refreshing the owning address/batch counters (they only settle via
+        # the crawl-level retry/finish paths), leaving the batch stuck showing a failed
+        # task forever. Route these back through /crawls/{id}/retry.
+        crawl_batch_id = container.db.task_crawl_batch_id(task_id)
+        if crawl_batch_id is not None:
+            raise ApiError(
+                409,
+                "task_belongs_to_crawl",
+                f"该任务属于爬取批次，请通过 /crawls/{crawl_batch_id}/retry 重试以保持批次统计一致",
+            )
         try:
             task = container.scheduler.retry(task_id, body.additional_attempts)
         except RuntimeError as exc:

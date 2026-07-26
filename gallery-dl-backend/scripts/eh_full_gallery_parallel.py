@@ -131,13 +131,22 @@ def _create_task(
 
 
 def _task_map(client: TestClient, task_ids: set[str]) -> dict[str, dict[str, Any]]:
-    response = client.get("/api/v1/tasks", params={"limit": 500})
-    response.raise_for_status()
-    return {
-        str(item["id"]): item
-        for item in response.json()["items"]
-        if str(item["id"]) in task_ids
-    }
+    # 后端 limit 硬上限 500 且按 created_at DESC 返回，画廊 >500 图时必须翻页拉全
+    tasks: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while len(tasks) < len(task_ids):
+        response = client.get(
+            "/api/v1/tasks", params={"limit": 500, "offset": offset}
+        )
+        response.raise_for_status()
+        items = response.json()["items"]
+        for item in items:
+            if str(item["id"]) in task_ids:
+                tasks[str(item["id"])] = item
+        if len(items) < 500:
+            break
+        offset += len(items)
+    return tasks
 
 
 def _wait_tasks(
@@ -224,6 +233,8 @@ def _collect_image_pages(
                         f"画廊索引提前结束: collected={len(image_pages)}, expected={expected}"
                     )
                 page_index += 1
+                # EH 对零间隔连抓列表页会封 IP，页间强制限速
+                time.sleep(1.5)
             expected_numbers = set(range(1, expected + 1))
             missing = sorted(expected_numbers.difference(image_pages))
             if missing:
@@ -236,6 +247,9 @@ def _collect_image_pages(
         finally:
             if proxy_fault:
                 container.proxy.release(lease_id, proxy_fault=True, reason=last_error)
+        if attempt < attempts:
+            # 失败后退避再换节点重试，避免连续请求触发 EH 风控
+            time.sleep(2.0 * attempt)
     raise RuntimeError(f"画廊索引获取失败: {last_error}")
 
 
@@ -403,10 +417,13 @@ def run(
                     json={"additional_attempts": 2},
                 )
                 response.raise_for_status()
+            # 首轮可能已耗尽 download_deadline，recovery 轮保底 120s，
+            # 否则 _wait_tasks 立即超时会取消刚 retry 的任务且不落 report.json
+            recovery_deadline = max(download_deadline, time.time() + 120.0)
             retried, retry_active = _wait_tasks(
                 client,
                 failed,
-                deadline=download_deadline,
+                deadline=recovery_deadline,
                 progress_label=f"recovery-{recovery_used}",
             )
             tasks.update(retried)
@@ -534,7 +551,9 @@ def main() -> int:
         and report["downloaded_images"] == report["gallery"]["expected_images"]
         and not report["missing_pages"]
         and not report["duplicate_pages"]
-        and report["observed_max_active"] == args.concurrency
+        # 小画廊或健康节点不足时物理并发到不了 --concurrency，按期望图数取下限
+        and report["observed_max_active"]
+        >= min(args.concurrency, report["gallery"]["expected_images"])
     )
     return 0 if success else 2
 

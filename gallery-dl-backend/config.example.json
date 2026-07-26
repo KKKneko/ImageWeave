@@ -57,6 +57,19 @@
     "max_logs_per_task": 5000,
     "retry_jitter_seconds": 0.5
   },
+  "dedup": {
+    "enabled": true,
+    "python_executable": "",
+    "worker_script": "../dedup_review_worker.py",
+    "core_script": "../差分去除_优化版.py",
+    "model_dir": "../.models",
+    "device": "auto",
+    "workers": 8,
+    "poll_interval_seconds": 1,
+    "shutdown_grace_seconds": 10,
+    "no_sscd": false,
+    "no_dino": false
+  },
   "default_site_policy": {
     "max_concurrency": 20,
     "retry_limit": 2,
@@ -68,6 +81,7 @@
     "http_timeout": 30,
     "gallery_retries": 2,
     "task_timeout_seconds": 0,
+    "download_stall_timeout_seconds": 180,
     "extra_args": []
   }
 }

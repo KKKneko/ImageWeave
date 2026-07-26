@@ -31,6 +31,7 @@ class SitePolicy(BaseModel):
     http_timeout: float = Field(default=30.0, ge=1.0, le=3600.0)
     gallery_retries: int = Field(default=2, ge=0, le=50)
     task_timeout_seconds: float = Field(default=0.0, ge=0.0, le=604800.0)
+    download_stall_timeout_seconds: float = Field(default=180.0, ge=0.0, le=604800.0)
     eh_download: EHDownloadOptions | None = None
     extra_args: list[str] = Field(default_factory=list, max_length=128)
 
@@ -157,9 +158,9 @@ class SearchRequest(SearchSourceOptions):
 
     keyword: str = Field(min_length=1, max_length=1000)
     sites: list[str] = Field(
-        default_factory=lambda: ["danbooru", "twitter", "pixiv", "exhentai"],
+        default_factory=lambda: ["danbooru", "twitter", "pixiv", "exhentai", "pawchive"],
         min_length=1,
-        max_length=4,
+        max_length=5,
     )
     limit: int = Field(default=20, ge=1, le=200)
     source_options: dict[str, SearchSourceOptions] = Field(default_factory=dict, max_length=8)
@@ -275,8 +276,43 @@ class CrawlRequest(BaseModel):
         return self
 
 
+class ReviewGroupSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str = Field(min_length=1, max_length=128)
+    selected_image_ids: list[str] = Field(default_factory=list, max_length=100000)
+
+    @field_validator("selected_image_ids")
+    @classmethod
+    def unique_image_ids(cls, values: list[str]) -> list[str]:
+        normalized = [str(value).strip() for value in values]
+        if any(not value or len(value) > 128 for value in normalized):
+            raise ValueError("selected_image_ids 包含无效 ID")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("selected_image_ids 不得重复")
+        return normalized
+
+
+class ReviewDecisions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[ReviewGroupSelection] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_groups(self):
+        group_ids = [group.group_id for group in self.groups]
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("groups 不得包含重复组")
+        return self
+
+
 class RetryRequest(BaseModel):
     additional_attempts: int = Field(default=1, ge=1, le=20)
+
+
+class CrawlRerunRequest(BaseModel):
+    additional_attempts: int = Field(default=1, ge=1, le=20)
+    requeue_succeeded: bool = False
 
 
 class ProxyStartRequest(BaseModel):

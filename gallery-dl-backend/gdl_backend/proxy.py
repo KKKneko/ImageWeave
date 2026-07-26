@@ -28,6 +28,16 @@ class ProxyPoolConflict(ProxyPoolError):
     pass
 
 
+class ProxyPoolUnavailable(ProxyPoolError):
+    """The mihomo transport core failed to start, so the pool could not start.
+
+    Callers must NOT treat this as "no free node right now": task flows are
+    required to surface a reminder and terminate instead of silently falling
+    back to a direct connection. Every other not-running state keeps the
+    original acquire() contract (return None: prefer degrades to direct,
+    required retries)."""
+
+
 @dataclass(slots=True)
 class ProxyLease:
     task_id: str
@@ -94,6 +104,7 @@ class ProxyPoolAdapter:
         self._generation = 0
         self._running = False
         self._last_error = ""
+        self._core_start_error = ""
         self._source_summary: dict[str, Any] = {
             "subscriptions": 0,
             "source_nodes": 0,
@@ -169,11 +180,20 @@ class ProxyPoolAdapter:
         parsed_nodes: list[ParsedProxyNode] = []
         warnings: list[str] = []
         if self.settings.subscription_urls:
-            remote_nodes, remote_warnings = fetch_subscriptions(
-                self.settings.subscription_urls,
-                timeout=self.settings.subscription_timeout_seconds,
-                max_workers=min(8, max(1, len(self.settings.subscription_urls))),
-            )
+            try:
+                remote_nodes, remote_warnings = fetch_subscriptions(
+                    self.settings.subscription_urls,
+                    timeout=self.settings.subscription_timeout_seconds,
+                    max_workers=min(8, max(1, len(self.settings.subscription_urls))),
+                )
+            except ValueError as exc:
+                # fetch_subscriptions raises when every subscription fails. Only abort if
+                # subscriptions are the sole source; with a node_file / inline_nodes
+                # fallback configured, degrade to a warning so those still get a chance
+                # (start() raises later if the whole pool ends up empty).
+                if not self.settings.node_file and not self.settings.inline_nodes:
+                    raise
+                remote_nodes, remote_warnings = [], [self._safe_warning(exc)]
             parsed_nodes.extend(remote_nodes)
             warnings.extend(remote_warnings)
         if self.settings.node_file:
@@ -244,6 +264,9 @@ class ProxyPoolAdapter:
                 self._transport_core = None
                 self._running = False
                 self._generation += 1
+                # Each start attempt owns the marker: it only survives (and only
+                # hard-fails acquire) while the LAST attempt died on core startup.
+                self._core_start_error = ""
             if old_pool is not None:
                 old_pool.close()
             if old_core is not None:
@@ -261,28 +284,42 @@ class ProxyPoolAdapter:
                         base_port=self.settings.transport_core_base_port,
                         start_timeout_seconds=self.settings.transport_core_start_timeout_seconds,
                     )
-                    core_endpoints = new_core.start(core_candidates)
-                    for endpoint in core_endpoints:
-                        tags = set(
-                            self._node_tags(
-                                endpoint.name,
-                                endpoint.source_protocol,
-                                endpoint.source_host,
+                    try:
+                        core_endpoints = new_core.start(core_candidates)
+                    except Exception as exc:
+                        # Tunnel nodes were selected, so mihomo is mandatory: a
+                        # core startup failure fails the whole pool start instead
+                        # of silently dropping the tunnel nodes and continuing.
+                        # The marker survives until the next start() attempt so
+                        # acquire() hard-fails (callers remind + terminate tasks
+                        # rather than falling back to direct connections).
+                        with self._lock:
+                            self._core_start_error = redact_text(
+                                f"隧道核心启动失败：{exc}", limit=500
                             )
-                        )
-                        tags.update({"http", "transport-core", endpoint.source_protocol})
-                        records.append(
-                            _NodeRecord(
-                                id=endpoint.id,
-                                name=endpoint.name,
-                                protocol="http",
-                                endpoint=endpoint.local_http,
-                                tags=sorted(tags),
+                        raise
+                    else:
+                        for endpoint in core_endpoints:
+                            tags = set(
+                                self._node_tags(
+                                    endpoint.name,
+                                    endpoint.source_protocol,
+                                    endpoint.source_host,
+                                )
                             )
-                        )
-                    summary["core_nodes"] = len(core_endpoints)
-                    summary["pool_nodes"] = len(records)
-                    summary["skipped_nodes"] += max(0, len(core_candidates) - len(core_endpoints))
+                            tags.update({"http", "transport-core", endpoint.source_protocol})
+                            records.append(
+                                _NodeRecord(
+                                    id=endpoint.id,
+                                    name=endpoint.name,
+                                    protocol="http",
+                                    endpoint=endpoint.local_http,
+                                    tags=sorted(tags),
+                                )
+                            )
+                        summary["core_nodes"] = len(core_endpoints)
+                        summary["pool_nodes"] = len(records)
+                        summary["skipped_nodes"] += max(0, len(core_candidates) - len(core_endpoints))
                 if not records:
                     raise ProxyPoolError("节点源中未解析出可直接使用的 HTTP/HTTPS/SOCKS 代理")
                 self._set_records(records)
@@ -384,10 +421,16 @@ class ProxyPoolAdapter:
         nodes = self._node_rows()
         with self._lock:
             transport_core = self._transport_core
+            core_start_error = self._core_start_error
         core_status = (
             transport_core.status()
             if transport_core is not None
-            else {"enabled": self.settings.transport_core_enabled, "running": False, "listeners": 0}
+            else {
+                "enabled": self.settings.transport_core_enabled,
+                "running": False,
+                "listeners": 0,
+                "last_error": core_start_error,
+            }
         )
         return {
             "enabled": self.settings.enabled,
@@ -529,6 +572,16 @@ class ProxyPoolAdapter:
                 allowed_records: list[_NodeRecord] = []
             else:
                 if not self._running or self._pool is None:
+                    # Only a mihomo core startup failure hard-fails here: callers
+                    # must remind and terminate instead of silently going direct.
+                    # Every other not-running state (never started / stopped /
+                    # other start failure) keeps the original contract — return
+                    # None so prefer degrades to direct and required retries.
+                    if self._core_start_error:
+                        raise ProxyPoolUnavailable(
+                            f"代理池未启动：{self._core_start_error}；"
+                            "请修复传输核心后在 WebUI 重新启动代理池"
+                        )
                     return None
                 pool = self._pool
                 generation = self._generation

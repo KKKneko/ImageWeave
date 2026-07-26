@@ -5,6 +5,7 @@ const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selec
 
 const TERMINAL_BATCH = new Set(["succeeded", "completed_with_errors", "cancelled"]);
 const TERMINAL_TASK = new Set(["succeeded", "failed", "cancelled"]);
+const SETTLED_REVIEW = new Set(["not_started", "waiting_for_crawl", "ready", "applied", "failed", "apply_failed", "disabled"]);
 const PIXIV_OAUTH_ACTIVE = new Set([
   "starting",
   "starting_browser",
@@ -13,15 +14,19 @@ const PIXIV_OAUTH_ACTIVE = new Set([
   "exchanging",
 ]);
 const TASK_DISPLAY_LIMIT = 1000;
+const REVIEW_PAGE_LIMIT = 8;
 const SITE_NAMES = {
   danbooru: "Danbooru",
   twitter: "X / Twitter",
   pixiv: "Pixiv",
   exhentai: "EH",
+  pawchive: "Pawchive",
 };
 const STATUS_NAMES = {
   queued: "等待",
   pending: "待处理",
+  waiting_for_crawl: "等待手动启动",
+  not_started: "去重未开始",
   planning: "规划中",
   starting: "启动中",
   running: "运行中",
@@ -31,6 +36,13 @@ const STATUS_NAMES = {
   cancelling: "取消中",
   cancelled: "已取消",
   completed_with_errors: "完成但有错误",
+  analyzing: "去重分析中",
+  auto_applying: "严格自动整理中",
+  ready: "待审核",
+  applying: "正在应用",
+  applied: "审核已应用",
+  apply_failed: "部分处理失败",
+  disabled: "审核未启用",
 };
 const AUTH_STATE_NAMES = {
   ready: "公开访问就绪",
@@ -49,7 +61,10 @@ const EVIDENCE_NAMES = {
   character_tag_exact_match: "character tag 精确匹配",
   keyword_gallery_search_only: "仅关键词画廊命中",
   keyword_gallery_search: "站内关键词画廊候选",
+  keyword_creator_search: "站内画师目录命中",
   danbooru_artist_url: "Danbooru 人工维护主页",
+  danbooru_alias_search: "Danbooru 别名扩搜命中",
+  danbooru_alias_name_match: "Danbooru 别名精确匹配",
 };
 const EH_TAG_NAMESPACE_ALIASES = {
   a: "artist",
@@ -103,6 +118,19 @@ const state = {
   browserLoginSessions: new Map(),
   browserLoginPollers: new Map(),
   authPromptedSites: new Set(),
+  review: {
+    batchId: "",
+    summary: null,
+    groups: [],
+    kind: "",
+    offset: 0,
+    limit: REVIEW_PAGE_LIMIT,
+    total: 0,
+    loading: false,
+    loaded: false,
+    dirty: false,
+    requestToken: 0,
+  },
 };
 
 function node(tag, className = "", text = "") {
@@ -656,6 +684,76 @@ async function proxyAction(element, path, body, label) {
   });
 }
 
+const TAG_CATEGORY_NAMES = {
+  artist: "画师",
+  character: "角色",
+  copyright: "作品",
+  general: "标签",
+  meta: "meta",
+};
+
+let keywordSuggestTimer = 0;
+let keywordSuggestSeq = 0;
+
+function hideKeywordSuggest() {
+  const box = $("#keywordSuggest");
+  box.hidden = true;
+  box.replaceChildren();
+}
+
+async function loadKeywordSuggest() {
+  const query = $("#keyword").value.trim();
+  if (query.length < 2) {
+    hideKeywordSuggest();
+    return;
+  }
+  const seq = ++keywordSuggestSeq;
+  let payload;
+  try {
+    payload = await api(
+      `/api/v1/search/autocomplete?q=${encodeURIComponent(query)}&limit=10`,
+    );
+  } catch {
+    if (seq === keywordSuggestSeq) hideKeywordSuggest();
+    return;
+  }
+  if (seq !== keywordSuggestSeq || $("#keyword").value.trim() !== query) return;
+  const items = payload.items || [];
+  if (!items.length) {
+    hideKeywordSuggest();
+    return;
+  }
+  const box = $("#keywordSuggest");
+  box.replaceChildren(
+    ...items.map((item) => {
+      const row = node("button", "suggest-item");
+      row.type = "button";
+      const badge = node(
+        "span",
+        `suggest-badge ${item.category || "general"}`,
+        TAG_CATEGORY_NAMES[item.category] || item.category || "标签",
+      );
+      const label = node("span", "suggest-label", item.label || item.value);
+      row.append(badge, label);
+      if (item.antecedent) {
+        row.append(node("span", "suggest-alias", `别名 ${item.antecedent}`));
+      }
+      if (item.post_count) {
+        row.append(node("span", "suggest-count", `${item.post_count} 图`));
+      }
+      row.addEventListener("mousedown", (event) => {
+        // mousedown 先于输入框 blur，保证点击可靠选中
+        event.preventDefault();
+        $("#keyword").value = item.value;
+        hideKeywordSuggest();
+        $("#keyword").focus();
+      });
+      return row;
+    }),
+  );
+  box.hidden = false;
+}
+
 function searchPayload() {
   const sites = $$('input[name="site"]:checked').map((item) => item.value);
   if (!sites.length) throw new Error("至少选择一个搜索来源。");
@@ -896,9 +994,15 @@ function renderSearchResults() {
       meta.textContent += ` · 筛选显示 ${visibleAddresses.length}/${selectableCount}`;
     }
     if (data.preview_count) meta.textContent += ` · 标题/封面 ${data.preview_count}`;
+    if (Array.isArray(data.alias_keywords) && data.alias_keywords.length) {
+      meta.textContent += ` · Danbooru 别名扩搜：${data.alias_keywords.join("、")}`;
+    }
     if (data.proxy?.used) meta.textContent += ` · 搜索代理 ${data.proxy.name || data.proxy.node_id || "已使用"}`;
     card.append(meta);
     if (data.error) card.append(node("p", "source-error", data.error.message || String(data.error)));
+    (data.enrichment_errors || []).forEach((item) => {
+      card.append(node("p", "source-error", `${item.stage || "enrichment"}：${item.message || ""}`));
+    });
 
     const searchHref = safeExternalUrl(data.search_url);
     if (searchHref) {
@@ -1055,6 +1159,26 @@ function selectedAddressCount() {
   return state.sources.reduce((sum, source) => sum + source.addresses.filter((item) => item.selected).length, 0);
 }
 
+function resetReviewState(batchId = "") {
+  state.review = {
+    batchId,
+    summary: null,
+    groups: [],
+    kind: "",
+    offset: 0,
+    limit: REVIEW_PAGE_LIMIT,
+    total: 0,
+    loading: false,
+    loaded: false,
+    dirty: false,
+    requestToken: state.review.requestToken + 1,
+  };
+}
+
+function reviewSettled(review) {
+  return SETTLED_REVIEW.has(review?.status);
+}
+
 function ehDownloadOptions() {
   const imageMode = $('input[name="ehImageMode"]:checked')?.value || "original";
   return {
@@ -1146,6 +1270,7 @@ async function startCrawl() {
       state.activeBatch = batch;
       state.activeBatchTasks = [];
       state.lastPollError = "";
+      resetReviewState(batch.id);
       sessionStorage.setItem("gdl.activeBatch", batch.id);
       appendLog(`顺序批次 ${shortId(batch.id)} 已创建。`, "success");
       renderBatch(batch, []);
@@ -1214,6 +1339,7 @@ async function refreshActiveBatch() {
     return;
   }
   const batchId = state.activeBatchId;
+  if (state.review.batchId !== batchId) resetReviewState(batchId);
   if (state.refreshingBatchId === batchId) return;
   state.refreshingBatchId = batchId;
   const requestToken = ++state.batchRequestToken;
@@ -1223,18 +1349,43 @@ async function refreshActiveBatch() {
       api(`/api/v1/crawls/${encodeURIComponent(batchId)}/tasks?limit=${TASK_DISPLAY_LIMIT}`),
     ]);
     if (requestToken !== state.batchRequestToken || state.activeBatchId !== batchId) return;
+    const previousReviewStatus = state.review.summary?.status || "";
     state.activeBatch = batch;
+    state.review.summary = batch.review || (
+      TERMINAL_BATCH.has(batch.status) ? { batch_id: batch.id, status: "not_started" } : null
+    );
     state.lastPollError = "";
     const tasks = taskPage.items || [];
     state.activeBatchTasks = tasks;
     renderBatch(batch, tasks);
+    const reviewStatus = state.review.summary?.status || "";
+    if (
+      TERMINAL_BATCH.has(batch.status)
+      && ["ready", "applying", "applied", "apply_failed"].includes(reviewStatus)
+      && (!state.review.loaded || previousReviewStatus !== reviewStatus)
+    ) {
+      await loadReviewPage(true);
+      if (requestToken !== state.batchRequestToken || state.activeBatchId !== batchId) return;
+    }
     await promptTaskAuthFailures(tasks);
-    if (TERMINAL_BATCH.has(batch.status)) {
+    if (TERMINAL_BATCH.has(batch.status) && reviewSettled(state.review.summary)) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
     }
   } catch (error) {
     if (requestToken !== state.batchRequestToken || state.activeBatchId !== batchId) return;
+    if (error.status === 404) {
+      // The batch no longer exists (e.g. the backend DB was reset while a stale id was
+      // restored from sessionStorage). Drop it and stop polling instead of hammering a
+      // 404 every 1.5s forever.
+      state.activeBatchId = "";
+      state.activeBatch = null;
+      sessionStorage.removeItem("gdl.activeBatch");
+      state.lastPollError = "";
+      appendLog("批次不存在，已停止自动刷新。", "error");
+      syncPolling();
+      return;
+    }
     const message = formatError(error);
     if (message !== state.lastPollError) appendLog(`刷新批次：${message}`, "error");
     state.lastPollError = message;
@@ -1262,7 +1413,32 @@ function renderBatch(batch, tasks) {
   $("#emptyBatch").classList.add("hidden");
   $("#batchView").classList.remove("hidden");
   $("#cancelBatch").disabled = Boolean(pollError) || TERMINAL_BATCH.has(batch.status);
-  $("#rawBatchResponse").textContent = pretty({ batch, tasks });
+  const resumable = Boolean(batch.resumable);
+  const retryButton = $("#retryFailedBatch");
+  retryButton.classList.toggle("hidden", !resumable);
+  retryButton.disabled = Boolean(pollError) || !resumable;
+  // Re-crawl is offered for ANY terminal batch (independent of resumable): it re-plans
+  // every address against the original dirs, skipping already-succeeded images.
+  const terminal = TERMINAL_BATCH.has(batch.status);
+  const rerunButton = $("#rerunBatch");
+  rerunButton.classList.toggle("hidden", !terminal);
+  rerunButton.disabled = Boolean(pollError) || !terminal;
+  // Only stringify the raw batch+tasks payload (up to ~1000 task objects, MB-scale)
+  // when the raw block is actually expanded; doing it every 1.5s poll while collapsed
+  // was pure CPU/GC churn and also nuked any text the user had selected in it.
+  const rawBlock = $("#rawBatchResponse");
+  const rawDetails = rawBlock.closest("details");
+  if (rawDetails && !rawDetails.dataset.bound) {
+    rawDetails.dataset.bound = "1";
+    rawDetails.addEventListener("toggle", () => {
+      if (rawDetails.open && state.activeBatch) {
+        rawBlock.textContent = pretty({ batch: state.activeBatch, tasks: state.activeBatchTasks });
+      }
+    });
+  }
+  if (rawDetails?.open) {
+    rawBlock.textContent = pretty({ batch, tasks });
+  }
   const current = batch.current;
   const terminalCount = Number(batch.succeeded_task_count || 0)
     + Number(batch.failed_task_count || 0)
@@ -1358,12 +1534,379 @@ function renderBatch(batch, tasks) {
       rows.append(row);
     });
   }
+  renderReviewWorkspace(batch);
+}
+
+function reviewStatusKind(status) {
+  if (["ready", "applied"].includes(status)) return "good";
+  if (["pending", "analyzing", "auto_applying", "applying", "apply_failed"].includes(status)) return "warn";
+  if (status === "failed") return "bad";
+  return "neutral";
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function renderReviewWorkspace(batch = state.activeBatch) {
+  const panel = $("#reviewPanel");
+  if (!batch || !TERMINAL_BATCH.has(batch.status)) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  const review = state.review.summary || batch.review || { status: "not_started" };
+  const status = review.status || "not_started";
+  const statusText = STATUS_NAMES[status] || status;
+  setPill($("#reviewStatus"), reviewStatusKind(status), statusText);
+
+  const stats = $("#reviewStats");
+  stats.replaceChildren();
+  if (review.total_image_count !== undefined) {
+    stats.append(
+      stat("全部图片", review.total_image_count || 0),
+      stat("严格自动组", review.automatic_group_count || 0),
+      stat("严格自动淘汰", review.automatic_rejected_image_count || 0),
+      stat("重复组", review.duplicate_group_count || 0),
+      stat("当前保留", review.selected_image_count || 0),
+      stat("已确认组", `${review.decided_group_count || 0} / ${review.total_group_count || 0}`),
+      stat("读取失败", review.unreadable_image_count || 0),
+    );
+    if (status === "applied" || status === "apply_failed") {
+      stats.append(stat("已移出 / 失败", `${review.rejected_image_count || 0} / ${review.failed_image_count || 0}`));
+    }
+  }
+
+  const error = $("#reviewError");
+  error.textContent = review.error || "";
+  error.classList.toggle("hidden", !review.error);
+  $("#reviewLoading").classList.toggle("hidden", !state.review.loading);
+  $("#reviewStart").classList.toggle(
+    "hidden",
+    !["not_started", "waiting_for_crawl"].includes(status),
+  );
+
+  const canList = ["ready", "applying", "applied", "apply_failed"].includes(status);
+  $("#reviewControls").classList.toggle("hidden", !canList);
+  $(".review-page-actions").classList.toggle("hidden", status !== "ready");
+  $$("[data-review-kind]").forEach((tab) => {
+    const active = tab.dataset.reviewKind === state.review.kind;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+    tab.disabled = state.review.loading;
+  });
+
+  renderReviewGroups(status);
+  const footerVisible = canList || status === "failed";
+  $("#reviewFooter").classList.toggle("hidden", !footerVisible);
+  $("#reviewRetry").classList.toggle("hidden", status !== "failed");
+  $("#reviewSave").classList.toggle("hidden", status !== "ready");
+  $("#reviewApply").classList.toggle("hidden", !["ready", "apply_failed"].includes(status));
+  $("#reviewApply").textContent = status === "apply_failed" ? "重试应用结果" : "应用审核结果";
+  $("#reviewSave").disabled = !state.review.groups.length || state.review.loading;
+  const allGroupsDecided = Number(review.decided_group_count || 0) >= Number(review.total_group_count || 0);
+  $("#reviewApply").disabled = state.review.loading || (status === "ready" && !allGroupsDecided);
+  $("#reviewPrevious").disabled = state.review.loading || state.review.offset <= 0;
+  $("#reviewNext").disabled = state.review.loading
+    || state.review.offset + state.review.limit >= state.review.total;
+  const start = state.review.total ? state.review.offset + 1 : 0;
+  const end = Math.min(state.review.offset + state.review.groups.length, state.review.total);
+  $("#reviewPageSummary").textContent = `${start}–${end} / ${state.review.total}`;
+}
+
+function renderReviewGroups(status) {
+  const root = $("#reviewGroups");
+  root.replaceChildren();
+  if (!state.review.loaded || state.review.loading) return;
+  if (!state.review.groups.length) {
+    const empty = node("div", "empty-state");
+    empty.append(node("strong", "", "当前筛选没有图片组"));
+    root.append(empty);
+    return;
+  }
+
+  state.review.groups.forEach((group) => {
+    const section = node("section", `review-group ${group.kind || "single"}`);
+    const header = node("div", "review-group-header");
+    const identity = node("div", "review-group-identity");
+    const kindNames = { duplicate: "重复组", single: "独立图片", unreadable: "读取失败" };
+    identity.append(
+      node("strong", "", `组 ${group.ordinal}`),
+      node("span", `review-kind ${group.kind || "single"}`, kindNames[group.kind] || group.kind),
+      node("span", "muted review-group-count", `${group.selected_image_count || 0} / ${group.image_count || 0} 保留`),
+    );
+    (group.match_levels || []).forEach((level) => identity.append(chip(level)));
+    if (group.decided) identity.append(node("span", "decision-mark", "已确认"));
+    header.append(identity);
+    if (status === "ready") {
+      const actions = node("div", "review-group-actions");
+      actions.append(
+        button("全留", "ghost compact", () => setReviewGroupSelection(group, "all")),
+        button("全不留", "danger-quiet compact", () => setReviewGroupSelection(group, "none")),
+        button("仅推荐", "ghost compact", () => setReviewGroupSelection(group, "recommended")),
+      );
+      header.append(actions);
+    }
+    section.append(header);
+
+    const grid = node("div", "review-image-grid");
+    (group.images || []).forEach((image) => {
+      const card = node("article", `review-image${image.selected ? " selected" : " rejected"}`);
+      const media = node("div", "review-image-media");
+      const preview = document.createElement("img");
+      preview.src = image.url;
+      preview.alt = image.relative_path;
+      preview.loading = "lazy";
+      preview.decoding = "async";
+      const fallback = node("span", "review-image-fallback", image.readable ? "预览失败" : "读取失败");
+      fallback.classList.add("hidden");
+      preview.addEventListener("error", () => {
+        preview.classList.add("hidden");
+        fallback.classList.remove("hidden");
+      });
+      media.append(preview, fallback);
+      if (image.recommended) media.append(node("span", "recommendation-flag", "质量推荐"));
+      card.append(media);
+
+      const copy = node("div", "review-image-copy");
+      const path = node("code", "review-image-path", image.relative_path);
+      path.title = image.relative_path;
+      const metadata = image.metadata || {};
+      const dimensions = metadata.w && metadata.h ? `${metadata.w}×${metadata.h}` : "尺寸未知";
+      const facts = [dimensions, metadata.format || "未知格式", formatBytes(metadata.size)];
+      if (metadata.jpeg_quality !== null && metadata.jpeg_quality !== undefined) {
+        facts.push(`约 Q${metadata.jpeg_quality}`);
+      }
+      copy.append(path, node("span", "review-image-facts", facts.join(" · ")));
+      if (metadata.sharpness !== undefined || metadata.noise_sigma !== undefined) {
+        copy.append(node(
+          "span",
+          "review-image-facts",
+          `细节 ${Number(metadata.sharpness || 0).toFixed(1)} · 噪声 ${Number(metadata.noise_sigma || 0).toFixed(2)}`,
+        ));
+      }
+      const metrics = metadata.review_metrics;
+      if (metrics) {
+        const metricParts = [metrics.candidate_level || "候选"];
+        if (metrics.sscd_similarity !== null && metrics.sscd_similarity !== undefined) {
+          metricParts.push(`SSCD ${Number(metrics.sscd_similarity).toFixed(3)}`);
+        }
+        if (metrics.dino_similarity !== null && metrics.dino_similarity !== undefined) {
+          metricParts.push(`DINO ${Number(metrics.dino_similarity).toFixed(3)}`);
+        }
+        copy.append(node("span", "review-image-metrics", metricParts.join(" · ")));
+      }
+
+      const selection = node("label", "review-selection");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = Boolean(image.selected);
+      checkbox.disabled = status !== "ready";
+      checkbox.addEventListener("change", () => {
+        image.selected = checkbox.checked;
+        group.selected_image_count = (group.images || []).filter((item) => item.selected).length;
+        group.decided = false;
+        state.review.dirty = true;
+        card.classList.toggle("selected", image.selected);
+        card.classList.toggle("rejected", !image.selected);
+        $(".review-group-count", section).textContent = `${group.selected_image_count} / ${group.image_count} 保留`;
+        $(".decision-mark", section)?.remove();
+      });
+      selection.append(checkbox, node("span", "", "保留"));
+      copy.append(selection);
+      card.append(copy);
+      grid.append(card);
+    });
+    section.append(grid);
+    root.append(section);
+  });
+}
+
+function setReviewGroupSelection(group, mode) {
+  (group.images || []).forEach((image) => {
+    image.selected = mode === "all" || (mode === "recommended" && image.recommended);
+  });
+  group.selected_image_count = (group.images || []).filter((image) => image.selected).length;
+  group.decided = false;
+  state.review.dirty = true;
+  renderReviewWorkspace();
+}
+
+function setReviewPageSelection(mode) {
+  state.review.groups.forEach((group) => {
+    (group.images || []).forEach((image) => {
+      image.selected = mode === "all" || (mode === "recommended" && image.recommended);
+    });
+    group.selected_image_count = (group.images || []).filter((image) => image.selected).length;
+    group.decided = false;
+  });
+  state.review.dirty = true;
+  renderReviewWorkspace();
+}
+
+async function loadReviewPage(force = false) {
+  if (!state.activeBatchId || state.review.loading) return false;
+  if (!force && state.review.loaded) return true;
+  const batchId = state.activeBatchId;
+  const requestedKind = state.review.kind;
+  const requestedOffset = state.review.offset;
+  const requestToken = ++state.review.requestToken;
+  state.review.loading = true;
+  renderReviewWorkspace();
+  const kind = state.review.kind ? `&kind=${encodeURIComponent(state.review.kind)}` : "";
+  try {
+    const payload = await api(
+      `/api/v1/crawls/${encodeURIComponent(batchId)}/review?limit=${state.review.limit}&offset=${state.review.offset}${kind}`,
+    );
+    if (
+      requestToken !== state.review.requestToken
+      || batchId !== state.activeBatchId
+      || requestedKind !== state.review.kind
+      || requestedOffset !== state.review.offset
+    ) return false;
+    state.review.summary = payload;
+    state.review.groups = payload.groups?.items || [];
+    state.review.total = Number(payload.groups?.total || 0);
+    state.review.offset = Number(payload.groups?.offset || 0);
+    state.review.loaded = true;
+    state.review.dirty = false;
+    return true;
+  } catch (error) {
+    if (requestToken === state.review.requestToken) {
+      appendLog(`读取图片审核：${formatError(error)}`, "error");
+    }
+    return false;
+  } finally {
+    if (requestToken === state.review.requestToken) {
+      state.review.loading = false;
+      renderReviewWorkspace();
+    }
+  }
+}
+
+async function persistReviewPage(logResult = true) {
+  if (state.review.summary?.status !== "ready" || !state.review.groups.length) return true;
+  const batchId = state.activeBatchId;
+  const requestToken = state.review.requestToken;
+  const groups = state.review.groups;
+  try {
+    const payload = {
+      groups: groups.map((group) => ({
+        group_id: group.id,
+        selected_image_ids: (group.images || []).filter((image) => image.selected).map((image) => image.id),
+      })),
+    };
+    const summary = await api(
+      `/api/v1/crawls/${encodeURIComponent(batchId)}/review/decisions`,
+      { method: "PUT", body: payload },
+    );
+    if (
+      batchId !== state.activeBatchId
+      || requestToken !== state.review.requestToken
+      || groups !== state.review.groups
+    ) return false;
+    state.review.summary = summary;
+    groups.forEach((group) => { group.decided = true; });
+    state.review.dirty = false;
+    if (logResult) appendLog("本页审核选择已保存。", "success");
+    renderReviewWorkspace();
+    return true;
+  } catch (error) {
+    appendLog(`保存审核选择：${formatError(error)}`, "error");
+    return false;
+  }
+}
+
+async function switchReviewKind(kind) {
+  if (state.review.loading) return;
+  if (state.review.dirty && !(await persistReviewPage(false))) return;
+  state.review.kind = kind;
+  state.review.offset = 0;
+  state.review.loaded = false;
+  state.review.groups = [];
+  await loadReviewPage(true);
+}
+
+async function moveReviewPage(direction) {
+  if (state.review.loading) return;
+  if (state.review.dirty && !(await persistReviewPage(false))) return;
+  const nextOffset = Math.max(0, state.review.offset + direction * state.review.limit);
+  if (nextOffset >= state.review.total && direction > 0) return;
+  state.review.offset = nextOffset;
+  state.review.loaded = false;
+  state.review.groups = [];
+  await loadReviewPage(true);
+}
+
+async function applyReviewSelection() {
+  const status = state.review.summary?.status;
+  if (status === "ready" && !(await persistReviewPage(false))) return;
+  const summary = state.review.summary || {};
+  const rejected = Math.max(0, Number(summary.total_image_count || 0) - Number(summary.selected_image_count || 0));
+  const automatic = Number(summary.automatic_rejected_image_count || 0);
+  if (!window.confirm(`严格自动淘汰 ${automatic} 张；最终保留 ${summary.selected_image_count || 0} 张，共移出 ${rejected} 张？`)) return;
+  await withBusy($("#reviewApply"), "应用中…", async () => {
+    try {
+      state.review.summary = await api(
+        `/api/v1/crawls/${encodeURIComponent(state.activeBatchId)}/review/apply`,
+        { method: "POST", body: {} },
+      );
+      state.review.loaded = false;
+      appendLog("审核结果已应用。", state.review.summary.status === "applied" ? "success" : "error");
+      await loadReviewPage(true);
+      await refreshActiveBatch();
+    } catch (error) {
+      appendLog(`应用审核结果：${formatError(error)}`, "error");
+    }
+  });
+}
+
+async function startReviewAnalysis() {
+  await withBusy($("#reviewStart"), "排队中…", async () => {
+    try {
+      state.review.summary = await api(
+        `/api/v1/crawls/${encodeURIComponent(state.activeBatchId)}/review/start`,
+        { method: "POST", body: {} },
+      );
+      state.review.groups = [];
+      state.review.loaded = false;
+      appendLog("去重分析已显式启动。", "success");
+      renderReviewWorkspace();
+      syncPolling();
+      await refreshActiveBatch();
+    } catch (error) {
+      appendLog(`启动去重分析：${formatError(error)}`, "error");
+    }
+  });
+}
+
+async function retryReviewAnalysis() {
+  await withBusy($("#reviewRetry"), "重试中…", async () => {
+    try {
+      state.review.summary = await api(
+        `/api/v1/crawls/${encodeURIComponent(state.activeBatchId)}/review/retry`,
+        { method: "POST", body: {} },
+      );
+      state.review.groups = [];
+      state.review.loaded = false;
+      appendLog("去重分析已重新排队。", "success");
+      syncPolling();
+      await refreshActiveBatch();
+    } catch (error) {
+      appendLog(`重试去重分析：${formatError(error)}`, "error");
+    }
+  });
 }
 
 function syncPolling() {
   clearInterval(state.pollTimer);
   state.pollTimer = null;
-  if ($("#autoPoll").checked && state.activeBatchId && !TERMINAL_BATCH.has(state.activeBatch?.status)) {
+  const crawlFinished = TERMINAL_BATCH.has(state.activeBatch?.status);
+  const reviewFinished = reviewSettled(state.review.summary);
+  if ($("#autoPoll").checked && state.activeBatchId && (!crawlFinished || !reviewFinished)) {
     state.pollTimer = setInterval(refreshActiveBatch, 1500);
   }
 }
@@ -1384,6 +1927,54 @@ async function cancelActiveBatch() {
       await loadRecentBatches(true);
     } catch (error) {
       appendLog(`取消批次：${formatError(error)}`, "error");
+    }
+  });
+}
+
+async function retryFailedBatch() {
+  if (!state.activeBatchId || !state.activeBatch || !TERMINAL_BATCH.has(state.activeBatch.status)) return;
+  if (!window.confirm("重新排队失败图片并重新规划未完成的地址，已成功文件会自动跳过。")) return;
+  await withBusy($("#retryFailedBatch"), "补齐中…", async () => {
+    try {
+      const result = await api(`/api/v1/crawls/${encodeURIComponent(state.activeBatchId)}/retry`, {
+        method: "POST",
+        body: { additional_attempts: 2 },
+      });
+      state.activeBatch = result.batch;
+      state.lastPollError = "";
+      const replanned = Number(result.replanned_address_count || 0);
+      const parts = [`已重新排队 ${result.retried_count || 0} 个失败图片任务`];
+      if (replanned) parts.push(`重新规划 ${replanned} 个地址`);
+      appendLog(`${parts.join("，")}。`, "success");
+      syncPolling();
+      await refreshActiveBatch();
+      await loadRecentBatches(true);
+    } catch (error) {
+      appendLog(`补齐失败下载：${formatError(error)}`, "error");
+    }
+  });
+}
+
+async function rerunActiveBatch() {
+  if (!state.activeBatchId || !state.activeBatch || !TERMINAL_BATCH.has(state.activeBatch.status)) return;
+  if (!window.confirm("将按原批次、原目录重新规划全部地址：已成功的图片不会重复下载，只补新增与失败/取消的内容。继续？")) return;
+  await withBusy($("#rerunBatch"), "重新排队…", async () => {
+    try {
+      const result = await api(`/api/v1/crawls/${encodeURIComponent(state.activeBatchId)}/rerun`, {
+        method: "POST",
+        body: {},
+      });
+      state.activeBatch = result.batch;
+      state.lastPollError = "";
+      appendLog(
+        `已重新排队 ${result.requeued_task_count || 0} 个任务，重新规划 ${result.replanned_address_count || 0} 个地址。`,
+        "success",
+      );
+      syncPolling();
+      await refreshActiveBatch();
+      await loadRecentBatches(true);
+    } catch (error) {
+      appendLog(`重新爬取：${formatError(error)}`, "error");
     }
   });
 }
@@ -1410,6 +2001,14 @@ function bindEvents() {
   $("#startPixivOAuth").addEventListener("click", (event) => startPixivOAuth(event.currentTarget));
   $("#cancelPixivOAuth").addEventListener("click", (event) => cancelPixivOAuth(event.currentTarget));
   $("#searchForm").addEventListener("submit", runSearch);
+  $("#keyword").addEventListener("input", () => {
+    clearTimeout(keywordSuggestTimer);
+    keywordSuggestTimer = setTimeout(loadKeywordSuggest, 300);
+  });
+  $("#keyword").addEventListener("blur", hideKeywordSuggest);
+  $("#keyword").addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideKeywordSuggest();
+  });
   $("#selectAll").addEventListener("click", () => {
     const showWeak = weakEvidenceVisible();
     state.sources.forEach((source) => source.addresses.forEach((item) => {
@@ -1445,6 +2044,8 @@ function bindEvents() {
   $("#ehGpPolicy").addEventListener("change", updateSelection);
   $("#startCrawl").addEventListener("click", startCrawl);
   $("#refreshBatch").addEventListener("click", refreshActiveBatch);
+  $("#retryFailedBatch").addEventListener("click", retryFailedBatch);
+  $("#rerunBatch").addEventListener("click", rerunActiveBatch);
   $("#cancelBatch").addEventListener("click", cancelActiveBatch);
   $("#loadBatch").addEventListener("click", async () => {
     const selected = $("#recentBatches").value;
@@ -1453,11 +2054,26 @@ function bindEvents() {
     state.activeBatch = null;
     state.activeBatchTasks = [];
     state.lastPollError = "";
+    resetReviewState(selected);
     sessionStorage.setItem("gdl.activeBatch", selected);
     await refreshActiveBatch();
     syncPolling();
   });
   $("#autoPoll").addEventListener("change", syncPolling);
+  $$("[data-review-kind]").forEach((element) => {
+    element.addEventListener("click", () => switchReviewKind(element.dataset.reviewKind || ""));
+  });
+  $("#reviewKeepPage").addEventListener("click", () => setReviewPageSelection("all"));
+  $("#reviewDropPage").addEventListener("click", () => setReviewPageSelection("none"));
+  $("#reviewRecommendedPage").addEventListener("click", () => setReviewPageSelection("recommended"));
+  $("#reviewPrevious").addEventListener("click", () => moveReviewPage(-1));
+  $("#reviewNext").addEventListener("click", () => moveReviewPage(1));
+  $("#reviewSave").addEventListener("click", (event) => {
+    withBusy(event.currentTarget, "保存中…", () => persistReviewPage(true));
+  });
+  $("#reviewApply").addEventListener("click", applyReviewSelection);
+  $("#reviewStart").addEventListener("click", startReviewAnalysis);
+  $("#reviewRetry").addEventListener("click", retryReviewAnalysis);
   $("#clearLog").addEventListener("click", () => $("#eventLog").replaceChildren());
   $("#proxyStart").addEventListener("click", (event) => proxyAction(event.currentTarget, "/api/v1/proxy/start", { force_refresh: true }, "启动代理池"));
   $("#proxyReload").addEventListener("click", (event) => proxyAction(event.currentTarget, "/api/v1/proxy/reload", { force_refresh: true }, "重载代理节点"));

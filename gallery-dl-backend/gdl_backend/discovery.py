@@ -16,7 +16,7 @@ from curl_cffi import requests as curl_requests
 
 from .classifier import FailureDecision, classify_result
 from .gallery import GalleryRunner
-from .proxy import ProxyLease, ProxyPoolAdapter
+from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
 from .redaction import redact_text
 from .schemas import ProxyMode, SitePolicy
 
@@ -36,6 +36,8 @@ class SearchSiteSpec:
             return "https://danbooru.donmai.us/posts?" + urlencode({"tags": keyword})
         if self.site == "exhentai":
             return "https://e-hentai.org/?" + urlencode({"f_search": keyword})
+        if self.site == "pawchive":
+            return "https://pawchive.pw/artists?" + urlencode({"q": keyword})
         raise ValueError(f"未注册关键词搜索站点: {self.site}")
 
 
@@ -67,6 +69,13 @@ SITE_SPECS: tuple[SearchSiteSpec, ...] = (
         "gallery",
         "child",
         "E-Hentai 公开搜索可直接使用；ExHentai 使用 Cookie",
+    ),
+    SearchSiteSpec(
+        "pawchive",
+        ("pawchive",),
+        "account",
+        "child",
+        "公开 API 与文件下载无需登录",
     ),
 )
 
@@ -156,15 +165,19 @@ def _danbooru_json_request(
     proxy_url: str | None,
     timeout: float,
 ) -> Any:
-    """Read Danbooru JSON with a browser TLS fingerprint.
+    """Read Danbooru JSON with gallery-dl-backend's own honest User-Agent.
 
-    Danbooru may put its JSON endpoints behind a Cloudflare browser check.  The
-    ordinary gallery-dl/requests path remains the primary path; this request is
-    the backend-owned fallback for that check and still uses the selected pool
-    lease when one is present.
+    Danbooru's API policy forbids impersonating a browser, so this request
+    identifies the backend honestly, matching upstream gallery-dl whose Danbooru
+    extractor queries ``posts.json`` with its ``gallery-dl/<version>``
+    User-Agent (``DanbooruExtractor.useragent = util.USERAGENT_GALLERYDL``).
+    The ordinary gallery-dl/requests path remains the primary path; this request
+    is the backend-owned fallback that still uses the selected pool lease when
+    one is present.
     """
 
     session = curl_requests.Session(trust_env=False)
+    session.headers["User-Agent"] = "gallery-dl-backend/0.3"
     try:
         response = session.get(
             url,
@@ -172,7 +185,6 @@ def _danbooru_json_request(
             proxy=proxy_url,
             timeout=max(1.0, float(timeout)),
             allow_redirects=False,
-            impersonate="chrome",
         )
         status_code = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status_code < 400:
@@ -215,7 +227,7 @@ def search_site(site: str) -> SearchSiteSpec:
         return _SITE_INDEX[key]
     except KeyError as exc:
         raise ValueError(
-            "site 当前支持 x/twitter、pixiv、danbooru、eh/exhentai"
+            "site 当前支持 x/twitter、pixiv、danbooru、eh/exhentai、pawchive"
         ) from exc
 
 
@@ -635,6 +647,101 @@ def _exhentai_queue_candidate(
     }, []
 
 
+_PAWCHIVE_ROOT = "https://pawchive.pw"
+_PAWCHIVE_FILE_PREFIX = "https://file.pawchive.pw/data/"
+
+
+def _pawchive_thumbnail(media_url: str | None) -> str | None:
+    """Map a file-server original to its cached thumbnail for previews."""
+    if not media_url:
+        return media_url
+    if media_url.startswith(_PAWCHIVE_FILE_PREFIX):
+        return (
+            "https://img.pawchive.pw/thumbnail/data/"
+            + media_url[len(_PAWCHIVE_FILE_PREFIX):]
+        )
+    return media_url
+
+
+def _pawchive_candidate(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Post candidate from a creator-listing Directory message."""
+    post_id = _text(data.get("id"), 100)
+    service = _text(data.get("service"), 50)
+    user = _text(data.get("user"), 100)
+    if not post_id or not service or not user:
+        return None, []
+    media_count = _integer(data.get("count"))
+    if media_count is not None and media_count <= 0:
+        # Every attachment of the post is still deferred on the site; there is
+        # nothing to download, so an image task would just succeed empty.
+        return None, []
+    profile_url = f"{_PAWCHIVE_ROOT}/{service}/user/{user}"
+    author = {
+        "site": "pawchive",
+        "id": user,
+        "name": _text(data.get("username"), 300),
+        "url": profile_url,
+        "works_url": profile_url,
+    }
+    return {
+        "id": post_id,
+        "site": "pawchive",
+        "kind": "post",
+        "title": _text(data.get("title"), 300) or f"Post {post_id}",
+        "url": f"{profile_url}/post/{post_id}",
+        "download_url": f"{profile_url}/post/{post_id}",
+        "thumbnail_url": None,
+        "media_count": media_count,
+        "author": author,
+        "metadata": {
+            "service": service,
+            "published": _text(data.get("published"), 100),
+        },
+    }, [author]
+
+
+def _pawchive_queue_candidate(
+    url: str, data: dict[str, Any]
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Creator candidate from an /artists search Queue message."""
+    creator_id = _text(data.get("id"), 100)
+    service = _text(data.get("service"), 50)
+    if not creator_id or not service:
+        return None, []
+    if data.get("ever_imported") is False:
+        # /api/v1/creators mixes locally imported creators with stubs synced
+        # from kemono's directory; stub profile/post endpoints 404 on
+        # pawchive, so they cannot be crawled.
+        return None, []
+    profile_url = f"{_PAWCHIVE_ROOT}/{service}/user/{creator_id}"
+    name = _text(data.get("name"), 300)
+    return {
+        "id": f"{service}:{creator_id}",
+        "site": "pawchive",
+        "kind": "account",
+        "title": name or f"{service}/{creator_id}",
+        "url": url or profile_url,
+        "download_url": profile_url,
+        "thumbnail_url": f"{_PAWCHIVE_ROOT}/icons/{service}/{creator_id}",
+        "media_count": None,
+        "author": {
+            "site": "pawchive",
+            "id": creator_id,
+            "name": name,
+            "url": profile_url,
+            "works_url": profile_url,
+        },
+        "metadata": {
+            "service": service,
+            "favorited": _integer(data.get("favorited")),
+            "updated": _integer(data.get("updated")),
+            "ever_imported": bool(data.get("ever_imported")),
+        },
+    }, []
+
+
 def parse_discovery_output(
     site: str,
     stdout: str,
@@ -699,11 +806,15 @@ def parse_discovery_output(
                 add(*_danbooru_candidate(data))
             elif site == "exhentai":
                 add(*_exhentai_directory_candidate(data, source_url))
+            elif site == "pawchive":
+                add(*_pawchive_candidate(data))
         elif message_type == 6 and len(message) >= 3 and isinstance(message[-1], dict):
             if site == "exhentai":
                 add(*_exhentai_queue_candidate(str(message[1]), message[-1]))
             elif site == "danbooru":
                 add(*_danbooru_artist_queue(str(message[1]), message[-1]))
+            elif site == "pawchive":
+                add(*_pawchive_queue_candidate(str(message[1]), message[-1]))
         elif message_type == 3 and len(message) >= 3 and isinstance(message[-1], dict):
             data = message[-1]
             item_id = data.get("tweet_id") if site == "twitter" else data.get("id")
@@ -716,10 +827,17 @@ def parse_discovery_output(
                     media_urls = candidate.setdefault("media_urls", [])
                     if media_url not in media_urls:
                         media_urls.append(media_url)
+                if site == "pawchive":
+                    media_url = _pawchive_thumbnail(media_url)
                 if media_url and not candidate.get("thumbnail_url"):
                     candidate["thumbnail_url"] = media_url
 
-    if errors:
+    # DataJob returns exit 0 even when an extractor raises mid-run (a (-1, {...})
+    # message), so `errors` can be non-empty on an otherwise successful enumeration.
+    # Only fail hard when nothing was parsed — a late transient error (rate limit /
+    # token expiry on page 280/300) must not throw away the 280 candidates already
+    # collected. With candidates present, treat the errors as a soft partial result.
+    if errors and not candidates:
         raise DiscoveryError(
             "extractor_error",
             redact_text(errors[0], limit=1000),
@@ -734,6 +852,139 @@ def _tag_key(value: str) -> str:
 
 def _identity_key(value: Any) -> str:
     return _tag_key(str(value or "").strip().lstrip("@"))
+
+
+_DANBOORU_ALIAS_CAP = 4
+
+_DANBOORU_TAG_CATEGORY_NAMES = {
+    0: "general",
+    1: "artist",
+    3: "copyright",
+    4: "character",
+    5: "meta",
+}
+
+
+def danbooru_alias_terms(
+    artist_result: dict[str, Any] | None,
+    keyword: str,
+    cap: int = _DANBOORU_ALIAS_CAP,
+) -> list[str]:
+    """Alias search terms for `keyword` from Danbooru's curated artist directory.
+
+    Only artists whose primary name, one of their other_names, or their
+    group_name matches the keyword exactly (identity-normalized) contribute
+    aliases; a directory result produced by a fuzzy/substring query must not
+    leak another artist's aliases into the expansion.  Non-ASCII aliases are
+    ordered first: EH gallery titles and Fanbox/Patreon creator names usually
+    carry the Japanese variant, so they matter more once `cap` truncates.
+    """
+    keyword_key = _identity_key(keyword)
+    if not keyword_key or not isinstance(artist_result, dict):
+        return []
+    terms: list[str] = []
+    seen_keys: set[str] = {keyword_key}
+    for author in artist_result.get("authors") or []:
+        if not isinstance(author, dict):
+            continue
+        name = str(author.get("name") or "").strip()
+        other_names = [
+            str(value).strip()
+            for value in author.get("other_names") or []
+            if str(value).strip()
+        ]
+        alias_keys = {_identity_key(value) for value in other_names}
+        if (
+            keyword_key != _identity_key(name)
+            and keyword_key not in alias_keys
+            and keyword_key != _identity_key(author.get("group_name"))
+        ):
+            continue
+        display = str(author.get("display_name") or "").strip() or name.replace(
+            "_", " "
+        )
+        for term in (display, *other_names):
+            # Single-character aliases (e.g. 毛) are too broad for a site
+            # search — they burn a request and return unrelated noise.
+            if len(term) < 2:
+                continue
+            term_key = _identity_key(term)
+            if not term_key or term_key in seen_keys:
+                continue
+            seen_keys.add(term_key)
+            terms.append(term)
+    terms.sort(key=lambda term: term.isascii())
+    return terms[: max(0, int(cap))]
+
+
+def merge_alias_search_results(
+    keyword: str,
+    primary: dict[str, Any],
+    alias_results: list[tuple[str, dict[str, Any]]],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    """Fold alias-search evidence into the primary keyword's search result.
+
+    Candidates are deduplicated by site-level id (URL as fallback) with the
+    primary keyword's hits kept first; every surviving candidate records the
+    terms that found it in `matched_keywords` so the evidence layer can tell
+    direct hits from alias-only hits.
+    """
+    merged = dict(primary)
+    candidates: list[dict[str, Any]] = []
+    by_key: dict[str, dict[str, Any]] = {}
+    authors: list[dict[str, Any]] = []
+    author_keys: set[str] = set()
+
+    def fold_candidates(term: str, result: dict[str, Any]) -> None:
+        for item in result.get("candidates") or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(
+                item.get("id") or item.get("download_url") or item.get("url") or ""
+            )
+            if not key:
+                continue
+            existing = by_key.get(key)
+            if existing is None:
+                copy = dict(item)
+                copy["matched_keywords"] = [term]
+                by_key[key] = copy
+                candidates.append(copy)
+                continue
+            matched = existing.setdefault("matched_keywords", [])
+            if term not in matched:
+                matched.append(term)
+
+    def fold_authors(result: dict[str, Any]) -> None:
+        for author in result.get("authors") or []:
+            if not isinstance(author, dict):
+                continue
+            key = str(
+                author.get("works_url") or author.get("url") or author.get("name") or ""
+            )
+            if not key or key in author_keys:
+                continue
+            author_keys.add(key)
+            authors.append(author)
+
+    fold_candidates(keyword, primary)
+    fold_authors(primary)
+    attempts = int(primary.get("attempts") or 0)
+    for term, result in alias_results:
+        fold_candidates(term, result)
+        fold_authors(result)
+        attempts += int(result.get("attempts") or 0)
+
+    candidates = candidates[: max(0, int(limit))]
+    merged["candidates"] = candidates
+    merged["candidate_count"] = len(candidates)
+    merged["authors"] = authors
+    merged["author_count"] = len(authors)
+    merged["attempts"] = attempts
+    merged["alias_keywords"] = [term for term, _ in alias_results]
+    return merged
 
 
 def canonical_gallery_address(site: str, url: str) -> str:
@@ -771,6 +1022,15 @@ def canonical_gallery_address(site: str, url: str) -> str:
             query = urlencode({"tags": tags})
     elif spec.site == "exhentai" and re.match(r"^/g/\d+/[0-9a-f]{10}$", path, re.I):
         path += "/"
+    elif spec.site == "pawchive" and host in {
+        "pawchive.pw",
+        "www.pawchive.pw",
+        "pawchive.st",
+        "www.pawchive.st",
+    }:
+        host = "pawchive.pw"
+        if re.match(r"^/[^/]+/user/[^/]+(?:/post/[^/]+)?$", path):
+            query = ""
     return urlunsplit(("https", host, path or "/", query, ""))
 
 
@@ -856,6 +1116,53 @@ def discovery_addresses(
                     ][:5],
                 }
             )
+        return addresses
+
+    if spec.site == "pawchive":
+        keyword_key = _identity_key(keyword)
+        alias_keys = {
+            _identity_key(term)
+            for term in result.get("alias_keywords") or []
+            if _identity_key(term)
+        }
+        for candidate in candidates:
+            if candidate.get("kind") != "account":
+                continue
+            metadata = (
+                candidate.get("metadata")
+                if isinstance(candidate.get("metadata"), dict)
+                else {}
+            )
+            name = str(candidate.get("title") or "").strip()
+            name_key = _identity_key(name)
+            exact = bool(keyword_key and name_key == keyword_key)
+            alias_exact = bool(not exact and name_key and name_key in alias_keys)
+            if exact:
+                reasons = ["account_name_exact_match"]
+            elif alias_exact:
+                reasons = ["danbooru_alias_name_match"]
+            else:
+                reasons = ["keyword_creator_search"]
+            entry = {
+                "id": f"pawchive:account:{candidate.get('id')}",
+                "address_type": "account",
+                "label": name or str(candidate.get("id")),
+                "url": str(
+                    candidate.get("download_url") or candidate.get("url")
+                ),
+                "profile_url": candidate.get("url"),
+                "thumbnail_url": candidate.get("thumbnail_url"),
+                "media_count": candidate.get("media_count"),
+                "metadata": metadata,
+                "confidence": "verified" if exact or alias_exact else "site_search",
+                "evidence_reasons": reasons,
+            }
+            matched_terms = [
+                str(term) for term in candidate.get("matched_keywords") or []
+            ]
+            if matched_terms:
+                entry["matched_keywords"] = matched_terms
+            add(entry)
         return addresses
 
     if spec.site == "danbooru":
@@ -989,23 +1296,39 @@ def discovery_addresses(
                 seen.add(url)
         return addresses
 
+    keyword_key = _identity_key(keyword)
+    alias_keys = {
+        _identity_key(term)
+        for term in result.get("alias_keywords") or []
+        if _identity_key(term)
+    }
     for candidate in candidates:
         url = str(candidate.get("download_url") or candidate.get("url") or "").strip()
         if not url:
             continue
-        add(
-            {
-                "id": f"exhentai:gallery:{candidate.get('id') or url}",
-                "address_type": "gallery",
-                "label": candidate.get("title") or f"Gallery {candidate.get('id')}",
-                "url": url,
-                "thumbnail_url": candidate.get("thumbnail_url"),
-                "media_count": candidate.get("media_count"),
-                "metadata": candidate.get("metadata") or {},
-                "confidence": "site_search",
-                "evidence_reasons": ["keyword_gallery_search"],
-            }
-        )
+        matched_terms = [
+            str(term) for term in candidate.get("matched_keywords") or []
+        ]
+        matched_keys = {_identity_key(term) for term in matched_terms}
+        reasons: list[str] = []
+        if not matched_terms or (keyword_key and keyword_key in matched_keys):
+            reasons.append("keyword_gallery_search")
+        if alias_keys and matched_keys & alias_keys:
+            reasons.append("danbooru_alias_search")
+        entry = {
+            "id": f"exhentai:gallery:{candidate.get('id') or url}",
+            "address_type": "gallery",
+            "label": candidate.get("title") or f"Gallery {candidate.get('id')}",
+            "url": url,
+            "thumbnail_url": candidate.get("thumbnail_url"),
+            "media_count": candidate.get("media_count"),
+            "metadata": candidate.get("metadata") or {},
+            "confidence": "site_search",
+            "evidence_reasons": reasons or ["keyword_gallery_search"],
+        }
+        if matched_terms:
+            entry["matched_keywords"] = matched_terms
+        add(entry)
     return addresses
 
 
@@ -1129,6 +1452,12 @@ class DiscoveryService:
                                 probe_before_use=policy.probe_before_use,
                                 probe_url=policy.probe_url,
                             )
+                    except ProxyPoolUnavailable as exc:
+                        raise DiscoveryError(
+                            "proxy_unavailable",
+                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                            details={"attempts": attempt},
+                        ) from exc
                     except Exception as exc:
                         last_error = redact_text(exc, limit=1000)
                         if mode == "required":
@@ -1209,31 +1538,68 @@ class DiscoveryService:
         proxy_mode: ProxyMode | None,
     ) -> dict[str, Any]:
         search_url = search_site("danbooru").search_url(keyword)
-        payload, proxy_info, attempts = await self._danbooru_api_json(
-            "https://danbooru.donmai.us/posts.json",
-            params={"tags": keyword, "limit": min(max(1, int(limit)), 200)},
-            policy=policy,
-            proxy_mode=proxy_mode,
-        )
-        if not isinstance(payload, list):
-            raise DiscoveryError(
-                "danbooru_api_protocol",
-                "Danbooru posts API 返回结构无效",
-            )
+        requested = max(1, int(limit))
         candidates: list[dict[str, Any]] = []
         authors: list[dict[str, Any]] = []
+        candidate_ids: set[str] = set()
         author_keys: set[str] = set()
-        for row in payload[:limit]:
-            if not isinstance(row, dict):
-                continue
-            candidate, row_authors = _danbooru_candidate(row)
-            if candidate is not None:
-                candidates.append(candidate)
-            for author in row_authors:
-                key = str(author.get("works_url") or author.get("name") or "")
-                if key and key not in author_keys:
-                    author_keys.add(key)
-                    authors.append(author)
+        before_id: int | None = None
+        proxy_info: dict[str, Any] = {}
+        attempts = 0
+
+        while len(candidates) < requested:
+            page_limit = min(200, requested - len(candidates))
+            params: dict[str, Any] = {"tags": keyword, "limit": page_limit}
+            if before_id is not None:
+                params["page"] = f"b{before_id}"
+            payload, proxy_info, page_attempts = await self._danbooru_api_json(
+                "https://danbooru.donmai.us/posts.json",
+                params=params,
+                policy=policy,
+                proxy_mode=proxy_mode,
+            )
+            attempts += page_attempts
+            if not isinstance(payload, list):
+                raise DiscoveryError(
+                    "danbooru_api_protocol",
+                    "Danbooru posts API 返回结构无效",
+                )
+            if not payload:
+                break
+
+            page_ids: list[int] = []
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                post_id = _integer(row.get("id"))
+                if post_id is not None:
+                    page_ids.append(post_id)
+                candidate, row_authors = _danbooru_candidate(row)
+                if candidate is not None and candidate["id"] not in candidate_ids:
+                    candidate_ids.add(candidate["id"])
+                    candidates.append(candidate)
+                for author in row_authors:
+                    key = str(author.get("works_url") or author.get("name") or "")
+                    if key and key not in author_keys:
+                        author_keys.add(key)
+                        authors.append(author)
+                if len(candidates) >= requested:
+                    break
+
+            if len(payload) < page_limit or len(candidates) >= requested:
+                break
+            if not page_ids:
+                raise DiscoveryError(
+                    "danbooru_api_protocol",
+                    "Danbooru posts API 分页缺少帖子 ID",
+                )
+            next_before_id = min(page_ids)
+            if before_id is not None and next_before_id >= before_id:
+                raise DiscoveryError(
+                    "danbooru_api_protocol",
+                    "Danbooru posts API 分页游标没有前进",
+                )
+            before_id = next_before_id
         return {
             "site": "danbooru",
             "keyword": keyword,
@@ -1244,7 +1610,7 @@ class DiscoveryService:
             "authors": authors,
             "proxy": proxy_info,
             "attempts": attempts,
-            "transport": "danbooru_api_browser_fingerprint",
+            "transport": "danbooru_api_honest_ua",
         }
 
     async def _search_danbooru_artists_api(
@@ -1256,7 +1622,9 @@ class DiscoveryService:
         proxy_mode: ProxyMode | None,
     ) -> dict[str, Any]:
         parts = [part for part in re.split(r"\s+", keyword.strip()) if part]
-        pattern = "*".join(parts)
+        # No wildcards: see search_danbooru_artists — they trigger HTTP 500
+        # database timeouts on Danbooru's artist table.
+        pattern = " ".join(parts)
         search_url = "https://danbooru.donmai.us/artists?" + urlencode(
             {"search[any_name_matches]": pattern}
         )
@@ -1291,7 +1659,7 @@ class DiscoveryService:
             "authors": authors,
             "proxy": proxy_info,
             "attempts": attempts,
-            "transport": "danbooru_api_browser_fingerprint",
+            "transport": "danbooru_api_honest_ua",
         }
 
     async def search(
@@ -1328,20 +1696,47 @@ class DiscoveryService:
         except DiscoveryError:
             if spec.site != "danbooru":
                 raise
-            return await self._search_danbooru_posts_api(
-                keyword=keyword,
-                limit=limit,
-                policy=policy,
-                proxy_mode=proxy_mode,
+            return await self._bounded_search_fallback(
+                self._search_danbooru_posts_api(
+                    keyword=keyword,
+                    limit=limit,
+                    policy=policy,
+                    proxy_mode=proxy_mode,
+                ),
+                timeout_seconds,
+                "Danbooru 帖子分页发现超时",
             )
         if spec.site == "danbooru" and not result.get("candidate_count"):
-            return await self._search_danbooru_posts_api(
-                keyword=keyword,
-                limit=limit,
-                policy=policy,
-                proxy_mode=proxy_mode,
+            return await self._bounded_search_fallback(
+                self._search_danbooru_posts_api(
+                    keyword=keyword,
+                    limit=limit,
+                    policy=policy,
+                    proxy_mode=proxy_mode,
+                ),
+                timeout_seconds,
+                "Danbooru 帖子分页发现超时",
             )
         return result
+
+    @staticmethod
+    async def _bounded_search_fallback(
+        coro: Awaitable[dict[str, Any]],
+        timeout_seconds: float,
+        message: str,
+    ) -> dict[str, Any]:
+        # The Danbooru-native API fallbacks have only per-request timeouts; without an
+        # overall bound the caller's timeout_seconds is silently dropped and a slow API
+        # can hold /search open for pages×(retries+1)×http_timeout. Mirror the inline
+        # bound used on discover_url's shortcut path (raise a uniform discovery_failed).
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise DiscoveryError(
+                "discovery_failed",
+                message,
+                details={"timeout_seconds": timeout_seconds},
+            ) from exc
 
     async def enrich_exhentai_previews(
         self,
@@ -1375,57 +1770,64 @@ class DiscoveryService:
             return result
 
         mode: ProxyMode = proxy_mode or policy.proxy_mode
-        attempts = max(1, policy.retry_limit + 1)
-        tried: set[str] = set()
-        last_error = "EH 画廊预览资料读取失败"
-        rows: list[dict[str, Any]] | None = None
+        request_timeout = max(
+            1.0,
+            min(float(policy.http_timeout), float(timeout_seconds)),
+        )
 
-        for attempt in range(1, attempts + 1):
-            operation_id = f"eh-preview-{uuid.uuid4().hex}"
-            lease: ProxyLease | None = None
-            proxy_fault = False
-            try:
-                if mode != "direct":
-                    try:
-                        lease = await asyncio.to_thread(
-                            self.proxy.acquire,
-                            operation_id,
-                            node_tags=policy.node_tags,
-                            exclude_ids=tried,
-                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
-                            probe_before_use=policy.probe_before_use,
-                            probe_url=policy.probe_url,
-                        )
-                    except Exception as exc:
-                        if mode == "required":
+        async def fetch_batch(batch: list[tuple[int, str]]) -> list[dict[str, Any]]:
+            # e-hentai's gdata API temp-bans an IP after a few rapid requests, so
+            # each ≤25-gid batch takes its own proxy lease; consecutive batches
+            # therefore ride different pool nodes instead of hammering one IP.
+            attempts = max(1, policy.retry_limit + 1)
+            tried: set[str] = set()
+            last_error = "EH 画廊预览资料读取失败"
+
+            for attempt in range(1, attempts + 1):
+                operation_id = f"eh-preview-{uuid.uuid4().hex}"
+                lease: ProxyLease | None = None
+                proxy_fault = False
+                try:
+                    if mode != "direct":
+                        try:
+                            lease = await asyncio.to_thread(
+                                self.proxy.acquire,
+                                operation_id,
+                                node_tags=policy.node_tags,
+                                exclude_ids=tried,
+                                allowed_ids=getattr(policy, "allowed_proxy_ids", None),
+                                probe_before_use=policy.probe_before_use,
+                                probe_url=policy.probe_url,
+                            )
+                        except ProxyPoolUnavailable as exc:
                             raise DiscoveryError(
-                                "proxy_unavailable", redact_text(exc, limit=1000)
+                                "proxy_unavailable",
+                                f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
                             ) from exc
-                    if lease is None and mode == "required":
-                        raise DiscoveryError(
-                            "proxy_unavailable",
-                            "当前没有符合 EH 预览查询策略的健康代理节点",
-                        )
+                        except Exception as exc:
+                            if mode == "required":
+                                raise DiscoveryError(
+                                    "proxy_unavailable", redact_text(exc, limit=1000)
+                                ) from exc
+                        if lease is None and mode == "required":
+                            raise DiscoveryError(
+                                "proxy_unavailable",
+                                "当前没有符合 EH 预览查询策略的健康代理节点",
+                            )
 
-                def request_previews() -> list[dict[str, Any]]:
-                    session = requests.Session()
-                    session.headers["User-Agent"] = "gallery-dl-backend/0.3"
-                    proxies = (
-                        {"http": lease.endpoint, "https": lease.endpoint}
-                        if lease
-                        else None
-                    )
-                    request_timeout = max(
-                        1.0,
-                        min(float(policy.http_timeout), float(timeout_seconds)),
-                    )
-                    items: list[dict[str, Any]] = []
-                    for offset in range(0, len(pairs), 25):
+                    def request_batch() -> list[dict[str, Any]]:
+                        session = requests.Session()
+                        session.headers["User-Agent"] = "gallery-dl-backend/0.3"
+                        proxies = (
+                            {"http": lease.endpoint, "https": lease.endpoint}
+                            if lease
+                            else None
+                        )
                         response = session.post(
                             "https://api.e-hentai.org/api.php",
                             json={
                                 "method": "gdata",
-                                "gidlist": [list(pair) for pair in pairs[offset : offset + 25]],
+                                "gidlist": [list(pair) for pair in batch],
                                 "namespace": 1,
                             },
                             proxies=proxies,
@@ -1443,52 +1845,53 @@ class DiscoveryService:
                         metadata = payload.get("gmetadata")
                         if not isinstance(metadata, list):
                             raise ValueError("EH gdata API 缺少 gmetadata")
-                        items.extend(item for item in metadata if isinstance(item, dict))
-                    return items
+                        return [item for item in metadata if isinstance(item, dict)]
 
-                rows = await asyncio.to_thread(request_previews)
-                break
-            except DiscoveryError:
-                raise
-            except Exception as exc:
-                last_error = redact_text(exc, limit=1000)
-                decision = classify_result(1, last_error)
-                response = getattr(exc, "response", None)
-                status_code = _integer(getattr(response, "status_code", None))
-                transient_request = isinstance(
-                    exc,
-                    (requests.Timeout, requests.ConnectionError),
-                ) or bool(
-                    status_code
-                    and (status_code in {408, 425, 429} or status_code >= 500)
-                )
-                proxy_fault = decision.proxy_fault
-                if lease is not None and proxy_fault:
-                    tried.add(lease.node_id)
-                if not decision.retryable and not proxy_fault and not transient_request:
-                    break
-            finally:
-                if lease is not None:
-                    try:
-                        await asyncio.to_thread(
-                            self.proxy.release,
-                            operation_id,
-                            proxy_fault=proxy_fault,
-                            reason=last_error if proxy_fault else "",
-                        )
-                    except Exception:
-                        pass
-            if attempt < attempts and policy.backoff_base_seconds:
-                await asyncio.sleep(
-                    min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0)
-                )
+                    return await asyncio.to_thread(request_batch)
+                except DiscoveryError:
+                    raise
+                except Exception as exc:
+                    last_error = redact_text(exc, limit=1000)
+                    decision = classify_result(1, last_error)
+                    response = getattr(exc, "response", None)
+                    status_code = _integer(getattr(response, "status_code", None))
+                    transient_request = isinstance(
+                        exc,
+                        (requests.Timeout, requests.ConnectionError),
+                    ) or bool(
+                        status_code
+                        and (status_code in {408, 425, 429} or status_code >= 500)
+                    )
+                    proxy_fault = decision.proxy_fault
+                    if lease is not None and proxy_fault:
+                        tried.add(lease.node_id)
+                    if not decision.retryable and not proxy_fault and not transient_request:
+                        break
+                finally:
+                    if lease is not None:
+                        try:
+                            await asyncio.to_thread(
+                                self.proxy.release,
+                                operation_id,
+                                proxy_fault=proxy_fault,
+                                reason=last_error if proxy_fault else "",
+                            )
+                        except Exception:
+                            pass
+                if attempt < attempts and policy.backoff_base_seconds:
+                    await asyncio.sleep(
+                        min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0)
+                    )
 
-        if rows is None:
             raise DiscoveryError(
                 "exhentai_preview_lookup_failed",
                 last_error,
                 details={"attempts": attempts},
             )
+
+        rows: list[dict[str, Any]] = []
+        for offset in range(0, len(pairs), 25):
+            rows.extend(await fetch_batch(pairs[offset : offset + 25]))
 
         row_by_id = {
             str(item.get("gid")): item
@@ -1531,6 +1934,8 @@ class DiscoveryService:
             enriched["metadata"]["gallery_token"] = candidate_metadata.get(
                 "gallery_token"
             )
+            if candidate.get("matched_keywords"):
+                enriched["matched_keywords"] = candidate["matched_keywords"]
             enriched_candidates.append(enriched)
             preview_count += 1
             for author in authors:
@@ -1549,6 +1954,62 @@ class DiscoveryService:
         result["preview_missing_count"] = len(enriched_candidates) - preview_count
         return result
 
+    async def danbooru_autocomplete(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        policy: SitePolicy,
+        proxy_mode: ProxyMode | None,
+    ) -> dict[str, Any]:
+        """Danbooru's search-box autocomplete: prefix-fuzzy tag lookup.
+
+        This is the only artist lookup that still supports fuzzy matching —
+        wildcard any_name_matches queries now die to the server-side 3s
+        statement timeout.  It prefix-matches tag names and translated
+        other_names; `antecedent` reports which alias a row was matched by.
+        """
+        payload, proxy_info, attempts = await self._danbooru_api_json(
+            "https://danbooru.donmai.us/autocomplete.json",
+            params={
+                "search[query]": query,
+                "search[type]": "tag_query",
+                "version": 1,
+                "limit": min(max(1, int(limit)), 20),
+            },
+            policy=policy,
+            proxy_mode=proxy_mode,
+        )
+        if not isinstance(payload, list):
+            raise DiscoveryError(
+                "danbooru_api_protocol",
+                "Danbooru autocomplete 返回结构无效",
+            )
+        items: list[dict[str, Any]] = []
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            value = _text(row.get("value"), 300)
+            if not value:
+                continue
+            category = _integer(row.get("category"))
+            items.append(
+                {
+                    "value": value,
+                    "label": _text(row.get("label"), 300) or value.replace("_", " "),
+                    "match_type": _text(row.get("type"), 50),
+                    "antecedent": _text(row.get("antecedent"), 300),
+                    "category": _DANBOORU_TAG_CATEGORY_NAMES.get(category, "general"),
+                    "post_count": _integer(row.get("post_count")),
+                }
+            )
+        return {
+            "query": query,
+            "items": items,
+            "proxy": proxy_info,
+            "attempts": attempts,
+        }
+
     async def search_danbooru_artists(
         self,
         *,
@@ -1562,11 +2023,12 @@ class DiscoveryService:
         timeout_seconds: float,
     ) -> dict[str, Any]:
         parts = [part for part in re.split(r"\s+", keyword.strip()) if part]
-        # Leading and trailing wildcards make Danbooru's artist directory scan
-        # the entire table and currently trigger a database timeout.  Keeping
-        # only inter-word wildcards retains multi-word matching without that
-        # pathological query.
-        pattern = "*".join(parts)
+        # Any wildcard — even between words — now makes Danbooru's artist
+        # directory scan the whole table and fail with HTTP 500
+        # (ActiveRecord::QueryCanceled).  A plain query is an exact match on
+        # name/other_names/group_name with space/underscore normalized
+        # server-side, which is all the alias expansion needs.
+        pattern = " ".join(parts)
         url = "https://danbooru.donmai.us/artists?" + urlencode(
             {"search[any_name_matches]": pattern}
         )
@@ -1586,18 +2048,26 @@ class DiscoveryService:
                 timeout_seconds=timeout_seconds,
             )
         except DiscoveryError:
-            return await self._search_danbooru_artists_api(
-                keyword=keyword,
-                limit=limit,
-                policy=policy,
-                proxy_mode=proxy_mode,
+            return await self._bounded_search_fallback(
+                self._search_danbooru_artists_api(
+                    keyword=keyword,
+                    limit=limit,
+                    policy=policy,
+                    proxy_mode=proxy_mode,
+                ),
+                timeout_seconds,
+                "Danbooru 画师检索超时",
             )
         if not result.get("author_count"):
-            return await self._search_danbooru_artists_api(
-                keyword=keyword,
-                limit=limit,
-                policy=policy,
-                proxy_mode=proxy_mode,
+            return await self._bounded_search_fallback(
+                self._search_danbooru_artists_api(
+                    keyword=keyword,
+                    limit=limit,
+                    policy=policy,
+                    proxy_mode=proxy_mode,
+                ),
+                timeout_seconds,
+                "Danbooru 画师检索超时",
             )
         return result
 
@@ -1679,6 +2149,11 @@ class DiscoveryService:
                                 probe_before_use=policy.probe_before_use,
                                 probe_url=policy.probe_url,
                             )
+                    except ProxyPoolUnavailable as exc:
+                        raise DiscoveryError(
+                            "proxy_unavailable",
+                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                        ) from exc
                     except Exception as exc:
                         if mode == "required":
                             raise DiscoveryError("proxy_unavailable", redact_text(exc, limit=1000)) from exc
@@ -1832,10 +2307,41 @@ class DiscoveryService:
         values = validate_discovery_args(extra_args)
         if spec.site == "pixiv":
             values = _pixiv_first_media_args(values)
+        if (
+            spec.site == "danbooru"
+            and keyword is None
+            and not values
+            and not any((credentials_ref, cookies_file, config_file))
+        ):
+            parsed = urlsplit(url)
+            tags = (parse_qs(parsed.query).get("tags") or [""])[0].strip()
+            if parsed.path.rstrip("/") == "/posts" and tags:
+                try:
+                    return await asyncio.wait_for(
+                        self._search_danbooru_posts_api(
+                            keyword=tags,
+                            limit=limit,
+                            policy=policy,
+                            proxy_mode=proxy_mode,
+                        ),
+                        timeout=timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise DiscoveryError(
+                        "discovery_failed",
+                        "Danbooru 帖子分页发现超时",
+                        details={"timeout_seconds": timeout_seconds},
+                    ) from exc
         if range_kind is None:
             if spec.site == "exhentai" and re.search(r"/(?:g|s|mpv)/", url):
                 range_kind = "file"
                 limit = 1
+            elif spec.site == "pawchive" and not urlsplit(url).path.startswith(
+                "/artists"
+            ):
+                # Creator/post/listing addresses enumerate one Directory per
+                # post; only the /artists creator search yields Queue children.
+                range_kind = "post"
             else:
                 range_kind = spec.search_range
         range_option = {
@@ -1843,7 +2349,15 @@ class DiscoveryService:
             "post": "--post-range",
             "child": "--child-range",
         }[range_kind]
-        protocol_args = ["--dump-json", range_option, f"1-{limit}", *values]
+        range_limit = limit
+        if spec.site == "pawchive" and range_kind == "child":
+            # The creator directory is ~80% kemono-synced stubs that rank high
+            # on the shared favorited sort but 404 locally; the parser drops
+            # them (ever_imported=false), so widen the enumeration window to
+            # keep `limit` real candidates reachable. Queue messages are pure
+            # in-process output — no extra site requests.
+            range_limit = limit * 10
+        protocol_args = ["--dump-json", range_option, f"1-{range_limit}", *values]
         mode: ProxyMode = proxy_mode or policy.proxy_mode
         attempts = max(1, policy.retry_limit + 1)
         tried: set[str] = set()
@@ -1867,6 +2381,11 @@ class DiscoveryService:
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
+                    except ProxyPoolUnavailable as exc:
+                        raise DiscoveryError(
+                            "proxy_unavailable",
+                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                        ) from exc
                     except Exception as exc:
                         if mode == "required":
                             raise DiscoveryError(

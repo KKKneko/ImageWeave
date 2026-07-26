@@ -12,7 +12,7 @@ from .config import SchedulerSettings
 from .database import Database, TERMINAL_STATUSES
 from .gallery import GalleryRunner
 from .process_control import terminate_stale_process
-from .proxy import ProxyLease, ProxyPoolAdapter
+from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
 from .redaction import redact_text
 from .schemas import TaskPolicy
 
@@ -166,12 +166,55 @@ class TaskScheduler:
         total = 0
         for path in root.rglob("*"):
             try:
+                if path.is_file() and not path.name.lower().endswith(".part") and not path.name.startswith(".gdl-activity-"):
+                    count += 1
+                    total += path.stat().st_size
+            except OSError:
+                continue
+        return count, total
+
+    @staticmethod
+    def _artifact_from_output(line: str, output_dir: str) -> Path | None:
+        value = str(line or "").strip()
+        if value.startswith("# "):
+            value = value[2:].strip()
+        if not value:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            return None
+        try:
+            resolved = path.resolve()
+            root = Path(output_dir).resolve()
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                return None
+        except (OSError, ValueError):
+            return None
+        if resolved.name.lower().endswith(".part") or resolved.name.startswith(".gdl-activity-"):
+            return None
+        return resolved
+
+    @staticmethod
+    def _artifact_totals(paths: set[Path]) -> tuple[int, int]:
+        count = 0
+        total = 0
+        for path in paths:
+            try:
                 if path.is_file():
                     count += 1
                     total += path.stat().st_size
             except OSError:
                 continue
         return count, total
+
+    @staticmethod
+    def _artifact_size(path: Path) -> int | None:
+        try:
+            if path.is_file():
+                return int(path.stat().st_size)
+        except OSError:
+            return None
+        return None
 
     async def _execute(self, task_id: str) -> None:
         attempt_id = ""
@@ -182,15 +225,37 @@ class TaskScheduler:
         task: dict[str, Any] | None = None
         policy: TaskPolicy | None = None
         auth_failure_context = ""
+        task_artifacts: set[Path] = set()
+        artifact_progress = {"count": 0, "bytes": 0, "last_write": 0.0}
         try:
             attempt = self.db.begin_attempt(task_id)
             attempt_id = attempt["id"]
             attempt_no = int(attempt["attempt_no"])
             task = attempt["task"]
             policy = self._policy(task)
-
             async def log(stream: str, line: str) -> None:
                 self.db.append_log(task_id, attempt_id, stream, line)
+                if stream == "stdout" and task is not None:
+                    artifact = self._artifact_from_output(line, task["output_dir"])
+                    if artifact is not None and artifact not in task_artifacts:
+                        task_artifacts.add(artifact)
+                        # Stat only the newly seen file and accumulate, instead of
+                        # re-stat'ing the whole set on every output line (that was
+                        # O(N²) stats + N DB writes for a multi-file task). Throttle
+                        # the DB write to ~1/s; the finally block recomputes the exact
+                        # total once at the end.
+                        size = await asyncio.to_thread(self._artifact_size, artifact)
+                        if size is not None:
+                            artifact_progress["count"] += 1
+                            artifact_progress["bytes"] += size
+                            now = time.monotonic()
+                            if now - artifact_progress["last_write"] >= 1.0:
+                                artifact_progress["last_write"] = now
+                                self.db.update_artifacts(
+                                    task_id,
+                                    artifact_progress["count"],
+                                    artifact_progress["bytes"],
+                                )
 
             async def started(pid: int, marker: str) -> None:
                 self.db.set_process(task_id, attempt_id, pid, marker)
@@ -209,6 +274,19 @@ class TaskScheduler:
                         probe_before_use=policy.probe_before_use,
                         probe_url=policy.probe_url,
                     )
+                except ProxyPoolUnavailable as exc:
+                    # mihomo core startup failure must never degrade to a direct
+                    # connection, not even in prefer mode: remind and terminate
+                    # the task (non-retryable) until the core is fixed and the
+                    # pool restarted. Other acquire errors keep the branch below.
+                    decision = FailureDecision(
+                        "proxy_unavailable",
+                        False,
+                        False,
+                        f"代理不可用，任务已终止（不会回退直连）：{redact_text(exc, limit=500)}",
+                    )
+                    await log("backend", decision.message)
+                    raise _ExecutionFinished
                 except Exception as exc:
                     if proxy_mode == "required":
                         raise
@@ -231,39 +309,28 @@ class TaskScheduler:
                 raise _ExecutionFinished
 
             extra_args = [*policy.extra_args, *(task.get("extra_args") or [])]
-            progress_stop = asyncio.Event()
-
-            async def monitor_artifacts() -> None:
-                while not progress_stop.is_set():
-                    count, total = await asyncio.to_thread(self._scan_artifacts, task["output_dir"])
-                    self.db.update_artifacts(task_id, count, total)
-                    try:
-                        await asyncio.wait_for(progress_stop.wait(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        pass
-
-            progress_task = asyncio.create_task(monitor_artifacts(), name=f"artifact-monitor-{task_id}")
-            try:
-                result = await self.gallery.run(
-                    task_id,
-                    url=task["url"],
-                    output_dir=task["output_dir"],
-                    proxy_url=lease.endpoint if lease else None,
-                    http_timeout=policy.http_timeout,
-                    gallery_retries=policy.gallery_retries,
-                    task_timeout=policy.task_timeout_seconds,
-                    cookies_file=task.get("cookies_file"),
-                    config_file=task.get("config_file"),
-                    credentials_ref=task.get("credentials_ref"),
-                    extra_args=extra_args,
-                    on_line=log,
-                    on_started=started,
-                    site=task["site"],
-                    eh_download=policy.eh_download,
-                )
-            finally:
-                progress_stop.set()
-                await asyncio.gather(progress_task, return_exceptions=True)
+            result = await self.gallery.run(
+                task_id,
+                url=task["url"],
+                output_dir=task["output_dir"],
+                proxy_url=lease.endpoint if lease else None,
+                http_timeout=policy.http_timeout,
+                gallery_retries=policy.gallery_retries,
+                task_timeout=policy.task_timeout_seconds,
+                stall_timeout=(
+                    policy.download_stall_timeout_seconds
+                    if task["site"] == "exhentai"
+                    else 0.0
+                ),
+                cookies_file=task.get("cookies_file"),
+                config_file=task.get("config_file"),
+                credentials_ref=task.get("credentials_ref"),
+                extra_args=extra_args,
+                on_line=log,
+                on_started=started,
+                site=task["site"],
+                eh_download=policy.eh_download,
+            )
             exit_code = result.exit_code
             auth_failure_context = result.output_tail
             latest = self.db.get_task(task_id)
@@ -277,6 +344,22 @@ class TaskScheduler:
                     cancelled=cancelled,
                     timed_out=result.timed_out,
                 )
+                # gallery-dl's exit status is an OR-accumulated bitmask, so a multi-file
+                # task that saved most files but failed on one still exits with bit 4 set
+                # and classifies as a non-retryable extraction_error — silently dropping
+                # the missing files. A non-empty task_artifacts (parsed from stdout during
+                # the run) means some files did land = partial success, so upgrade to a
+                # bounded retry (capped by max_attempts): gallery-dl skips already-saved
+                # files and re-fetches only what is missing. Zero artifacts = a pure
+                # extraction failure that downloaded nothing, which stays terminal.
+                if (
+                    decision.error_class == "extraction_error"
+                    and not decision.retryable
+                    and task_artifacts
+                ):
+                    decision = FailureDecision(
+                        "extraction_partial", True, decision.proxy_fault, decision.message
+                    )
         except _ExecutionFinished:
             pass
         except asyncio.CancelledError:
@@ -352,8 +435,8 @@ class TaskScheduler:
             proxy_node_id=lease.node_id if lease else None,
             proxy_endpoint=redact_text(lease.endpoint, limit=500) if lease else None,
         )
-        if task is not None:
-            count, total = await asyncio.to_thread(self._scan_artifacts, task["output_dir"])
+        if task is not None and task_artifacts:
+            count, total = await asyncio.to_thread(self._artifact_totals, task_artifacts)
             self.db.update_artifacts(task_id, count, total)
 
         latest = self.db.get_task(task_id)
@@ -377,7 +460,14 @@ class TaskScheduler:
             tried.append(lease.node_id)
         if decision.retryable and attempt_no < max_attempts:
             base = policy.backoff_base_seconds if policy else 2.0
-            delay = base * (2 ** max(0, attempt_no - 1))
+            # A manual retry round pins backoff_anchor_attempt to the attempt_count it
+            # inherited, so this round's exponent restarts at 0 instead of compounding
+            # the task's whole history. Automatic requeues leave the anchor untouched,
+            # so retries within a single round keep escalating. The exponential term is
+            # then capped so a deep sequence can never schedule an absurd delay.
+            anchor = int((latest or task or {}).get("backoff_anchor_attempt", 0) or 0)
+            exponent = max(0, attempt_no - 1 - anchor)
+            delay = min(base * (2 ** exponent), self.settings.retry_backoff_cap_seconds)
             delay += random.uniform(0.0, self.settings.retry_jitter_seconds)
             self.db.requeue_task(
                 task_id,

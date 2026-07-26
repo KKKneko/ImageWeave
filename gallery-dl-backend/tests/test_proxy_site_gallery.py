@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import subprocess
@@ -101,6 +102,7 @@ class SiteAndGalleryTests(unittest.TestCase):
                     gp_policy="stop",
                 ),
             )
+            self.assertNotIn("--no-part", eh_original)
             self.assertIn("extractor.exhentai.original=true", eh_original)
             self.assertIn("extractor.exhentai.gp=stop", eh_original)
             eh_resample = runner.build_command(
@@ -121,8 +123,52 @@ class SiteAndGalleryTests(unittest.TestCase):
             )
             self.assertIn("extractor.exhentai.original=false", eh_resample)
             self.assertNotIn("extractor.exhentai.gp=resized", eh_resample)
+            eh_without_options = runner.build_command(
+                marker="eh-default",
+                url="https://e-hentai.org/s/aaaaaaaaaa/123-1",
+                output_dir=str(Path(tmp) / "eh-default"),
+                proxy_url=None,
+                http_timeout=10,
+                gallery_retries=1,
+                cookies_file=None,
+                config_file=None,
+                extra_args=["--range", "1"],
+                site="exhentai",
+            )
+            self.assertNotIn("--no-part", eh_without_options)
             with self.assertRaises(ValueError):
                 runner.validate_args(["--cache-file", "other.sqlite3"])
+
+    def test_gallery_runner_task_timeout_still_applies_without_stall_watchdog(self):
+        async def run_timeout() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                settings = make_settings(root)
+                settings.gallery.terminate_grace_seconds = 0.2
+                runner = GalleryRunner(settings.gallery, settings.project_dir)
+                with patch.object(
+                    runner,
+                    "build_command",
+                    return_value=[sys.executable, "-c", "import time; time.sleep(5)"],
+                ):
+                    result = await runner.run(
+                        "timeout-test",
+                        url="https://example.com/",
+                        output_dir=str(root / "out"),
+                        proxy_url=None,
+                        http_timeout=1,
+                        gallery_retries=0,
+                        task_timeout=0.3,
+                        cookies_file=None,
+                        config_file=None,
+                        credentials_ref=None,
+                        extra_args=[],
+                        on_line=lambda *_: asyncio.sleep(0),
+                        on_started=lambda *_: asyncio.sleep(0),
+                    )
+                self.assertTrue(result.timed_out)
+
+        asyncio.run(run_timeout())
 
     def test_worker_entry_loads_local_gallery_source(self):
         command = [

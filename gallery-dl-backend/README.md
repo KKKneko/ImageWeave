@@ -3,7 +3,10 @@
 这是一个 FastAPI 后端，用于统一搜索图库地址、按选择顺序建立图片任务，并通过独立
 代理租约运行 gallery-dl：
 
-- `../gallery-dl-codeberg` 保持为上游 Git submodule，并始终通过独立子进程调用；
+- `../gallery-dl-codeberg` 保持为上游 Git submodule，源码树不做任何本地修改，
+  并始终通过独立子进程调用；后端需要的两处行为差异（跨尝试稳定的 `.part` 命名、
+  EH 卡死检测心跳）由 `gdl_backend/worker_patches.py` 在 worker 进程内以运行时
+  补丁实现，上游接口变化时补丁自动跳过并在任务日志输出 `[gdl-backend-patch]` 告警；
 - `gdl_backend/` 负责搜索、规划、调度、授权、代理池和状态持久化；
 - `/ui/` 提供随后端打包的静态操作界面，无需单独构建前端。
 
@@ -20,16 +23,19 @@
 
 ## 主要能力
 
-- 搜索 Danbooru 与 E-Hentai/ExHentai，并从 Danbooru 画师资料补充已验证的 X/Pixiv 账号；
+- 搜索 Danbooru、E-Hentai/ExHentai 与 Pawchive，并从 Danbooru 画师资料补充已验证的 X/Pixiv 账号；
+- EH 与 Pawchive 搜索自动携带 Danbooru 画师条目的别名（`other_names`，中日文/罗马字变体）扩搜并合并去重，弥补两站缺少人工链接维护导致的漏检；
+- 关键词输入框提供 Danbooru autocomplete 前缀补全（`GET /api/v1/search/autocomplete?q=`），可用画师任意别名前缀（如“柠檬静”）解析出正式 artist tag，由用户自行确认选用，不做静默替换；
 - 按来源和地址顺序执行批次，当前地址内部采用图片级并发；
 - 利用 Danbooru `source` 在同一批次内预去重，后续 Pixiv/X 作品在建任务前跳过；
 - 使用 SQLite/WAL 持久化任务、尝试、事件、日志、租约和批次进度；
 - 导入原生 HTTP/HTTPS/SOCKS 代理及常见机场订阅格式；
 - 通过 Mihomo 将 VLESS、VMess、Trojan、Shadowsocks、Hysteria、TUIC 等节点桥接为本地 HTTP 出口；
 - 对每个新地址执行站点探活，图片任务全程固定一个代理节点；
-- 托管 X、Pixiv、EH 的项目专属浏览器授权，Danbooru 公共抓取无需登录；
+- 托管 X、Pixiv、EH 的项目专属浏览器授权，Danbooru 与 Pawchive 公共抓取无需登录；
 - 为 EH/EHX 批次显式选择 `fullimg` 原图或 1280 查看图，并控制 GP 响应时停止或降级；
 - 支持任务取消、失败重试、重启恢复、文件清单和幂等提交。
+- 聚合批次结束后可独立启动 L0-L2 去重；严格自动组先淘汰，剩余图片进入分组人工审核。
 
 具体进程边界、状态机、搜索证据规则和代理选择算法见
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)。
@@ -128,6 +134,7 @@ python -m gdl_backend --config .\config.json
 2. 在“站点登录授权”中完成所需站点登录。
 3. 输入关键词搜索来源，核对候选和弱证据，并调整来源/地址顺序。
 4. 设置单地址图片并发数，提交批次并查看地址与图片任务状态。
+5. 批次结束后按需启动去重，再审核剩余重复组与独立图片，保存选择并应用整理结果。
 
 界面直接调用下述 API；搜索归并、执行顺序、代理租约和任务状态均以后端数据库为准。
 
@@ -139,6 +146,7 @@ python -m gdl_backend --config .\config.json
 | Pixiv | 项目专属 Chrome OAuth | 后端专用 gallery-dl cache |
 | EH | 项目专属 Chrome 登录 | E-Hentai/ExHentai Cookie |
 | Danbooru | 公共 API | 无需登录 |
+| Pawchive | 公共 API | 无需登录 |
 
 X、Pixiv 和 EH 共用项目目录中的持久 Chrome Profile，但每次授权使用独立标签页。后端只
 管理这个 Profile，不读取用户日常浏览器数据。搜索、规划或下载实际返回认证错误后，凭证
@@ -174,6 +182,13 @@ GET  /api/v1/crawls
 GET  /api/v1/crawls/{batch_id}
 GET  /api/v1/crawls/{batch_id}/tasks
 POST /api/v1/crawls/{batch_id}/cancel
+POST /api/v1/crawls/{batch_id}/retry
+GET  /api/v1/crawls/{batch_id}/review
+POST /api/v1/crawls/{batch_id}/review/start
+PUT  /api/v1/crawls/{batch_id}/review/decisions
+POST /api/v1/crawls/{batch_id}/review/apply
+POST /api/v1/crawls/{batch_id}/review/retry
+GET  /api/v1/crawls/{batch_id}/review/images/{image_id}
 
 POST /api/v1/tasks
 GET  /api/v1/tasks
@@ -196,7 +211,7 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 ```json
 {
   "keyword": "artist name",
-  "sites": ["danbooru", "x", "pixiv", "eh"],
+  "sites": ["danbooru", "x", "pixiv", "eh", "pawchive"],
   "limit": 20,
   "proxy_mode": "required"
 }
@@ -207,7 +222,9 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 - `addresses[]` 保存默认可选的已验证账号/标签地址和 EH 画廊候选；
 - `weak_evidence[]` 保存 Danbooru 仅别名匹配、尚未闭环的画师候选；
 - `related_profiles` 保存 Danbooru 人工维护的其他平台主页；
-- EH 候选带标题、封面、页数和按官方 namespace 分组的 `tag_facets[]`。
+- EH 候选带标题、封面、页数和按官方 namespace 分组的 `tag_facets[]`；
+- Pawchive 候选来自站内创作者目录（名称包含匹配，按收藏数排序），
+  已过滤本站从未导入的 kemono 同步空壳条目。
 
 详细匹配与过滤规则见
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#跨来源发现与选择)。
@@ -265,15 +282,34 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 还受全局调度上限限制，`max_tasks` 限制整个批次的媒体任务规模。
 地址详情中的 `pre_dedup_skipped_count` 记录在建立任务前按来源键跳过的媒体任务数；这些项不会进入 `task_count` 或任务列表。
 
+爬取和去重是两个独立的可选环节。批次进入终态后保持“去重未开始”，只有
+`POST review/start` 或 WebUI 的“开始去重分析”会建立任务；读取详情、载入历史批次和服务启动
+都不会触发分析。启动后，`dedup` 管理器使用仓库根目录的独立 `.venv` 和 `.models` 分析实际
+下载文件。原脚本判定的 L0 完全相同组和严格 L1 压缩/重编码/重采样组沿用其 complete-link
+分组和质量 winner，非 winner 自动移入 `duplicates/`；自动 keeper、L1/L2 人工候选、独立图
+及解码失败图进入审核。`review/decisions` 以组为单位保存 `selected_image_ids`，空数组表示整组
+不保留；`review/apply` 将人工未选图片及其同名 `.txt` 移入批次根目录的 `duplicates/`，并保留
+原相对目录层级。严格自动淘汰也同步移动同名 `.txt`。应用前要求所有人工组均已确认，分析、
+自动整理和应用状态均持久化，可在服务重启后恢复或重试。
+
 EH/EHX 来源的 `eh_download.image_mode` 接受 `original` 或 `resample`。原图模式下，
 `gp_policy=stop` 保持严格原图并在 GP 响应时停止，`gp_policy=resized` 允许 gallery-dl
-降级为 1280 查看图。WebUI 默认提交 `original + stop`。
+降级为 1280 查看图。WebUI 默认提交 `original + stop`。EH 图片任务还使用
+`download_stall_timeout_seconds` 作为单进程无进展保护，超时会结束当前尝试并按任务的
+`max_attempts` 自动换代理重试；已存在的完整文件仍由 gallery-dl 跳过。
+批次终态若仍有失败图片，可调用 `POST /api/v1/crawls/{batch_id}/retry`（或 WebUI 的“补齐失败下载”），
+只重新排队失败任务，不会重跑成功任务。
 
 ### 代理策略
 
 - `direct`：始终直连；
 - `prefer`：有健康节点时使用代理，代理池降级时直连；
 - `required`：必须取得健康节点，否则按站点策略重试。
+
+例外：节点源包含需要 mihomo 传输核心的隧道节点时，核心启动失败会使代理池启动直接报错
+（不再丢弃隧道节点降级续跑）；该状态下 `prefer` 与 `required` 任务立即终止并在任务日志
+中提醒，不会回退直连，修复核心后在 WebUI 重新启动代理池再重试。其余场景（代理池被停止、
+未启动或运行中暂无可租节点）行为不变。
 
 站点策略可配置并发、重试、探活地址、节点标签和任务超时。完整字段由
 `PUT /api/v1/sites/policies/{site}` 的 Swagger 模型定义。

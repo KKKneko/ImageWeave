@@ -202,10 +202,17 @@ def _connect_response_succeeded(header_block: bytes) -> bool:
     return 200 <= int(parts[1]) <= 299
 
 
+# Idle window before a tunnelled connection is torn down. Kept generous: media
+# downloads through a rate-limited/queued upstream can legitimately go minutes
+# between chunks, and a 30s cutoff dropped those mid-transfer, forcing gallery-dl
+# retries. Threads are daemon, so a truly-dead peer is still reclaimed on shutdown.
+_RELAY_IDLE_TIMEOUT_SECONDS = 300.0
+
+
 def _relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
     while sockets:
-        readable, _, _ = select.select(sockets, [], [], 30.0)
+        readable, _, _ = select.select(sockets, [], [], _RELAY_IDLE_TIMEOUT_SECONDS)
         if not readable:
             return
         for source in readable:

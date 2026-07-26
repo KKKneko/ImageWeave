@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 import requests
 
 from .classifier import classify_result
-from .proxy import ProxyLease, ProxyPoolAdapter
+from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
 from .redaction import redact_text
 from .schemas import ProxyMode, SitePolicy
 from .source_keys import candidate_source_key, source_key_from_url
@@ -153,6 +153,16 @@ class CrawlPlanner:
                     planner_proxies.append(proxy_info)
             else:
                 count = max(1, int(item.get("media_count") or 1))
+                # media_count comes straight from an untrusted extractor payload; a
+                # candidate claiming e.g. page_count=10**9 would otherwise build a
+                # billion CrawlUnit objects before the post-loop max_tasks check at
+                # the bottom ever runs, exhausting memory. Bound it up front.
+                if len(units) + count > max_tasks:
+                    raise CrawlPlanError(
+                        "crawl_plan_too_large",
+                        f"规划任务数超过 max_tasks={max_tasks}",
+                        details={"planned": len(units) + count, "max_tasks": max_tasks},
+                    )
                 media_urls: list[str] = []
                 if site == "twitter" and isinstance(item.get("media_urls"), list):
                     media_urls = list(
@@ -243,6 +253,11 @@ class CrawlPlanner:
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
+                    except ProxyPoolUnavailable as exc:
+                        raise CrawlPlanError(
+                            "proxy_unavailable",
+                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                        ) from exc
                     except Exception as exc:
                         if proxy_mode == "required":
                             raise CrawlPlanError(
@@ -274,11 +289,18 @@ class CrawlPlanner:
                             page_url,
                             proxies=proxies,
                             timeout=policy.http_timeout,
-                            allow_redirects=False,
+                            allow_redirects=True,
                         )
-                        if 300 <= response.status_code < 400:
-                            raise ValueError("AuthenticationError: EH 登录状态失效，画廊索引发生重定向")
                         response.raise_for_status()
+                        # ExHentai 对失效/无效登录返回“空白页”：HTTP 200、body 为空、且响应头
+                        # 缺少 Cache-Control——而非重定向。镜像上游 gallery-dl
+                        # (gallery_dl/extractor/exhentai.py ExhentaiExtractor.request) 的判据：
+                        #   if "Cache-Control" not in response.headers and not response.content:
+                        #       raise AuthorizationError()
+                        # 判定放在 raise_for_status 之后，使 4xx/5xx（可能同样是空 body）按 HTTP
+                        # 状态归类，与上游先由 Extractor.request 处理状态、再做空白页判定一致。
+                        if "Cache-Control" not in response.headers and not response.content:
+                            raise ValueError("AuthorizationError: ExHentai 登录已失效（返回空白页）")
                         page_title, page_total, page_links = _parse_eh_index(
                             response.text,
                             normalized,

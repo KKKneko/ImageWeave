@@ -33,6 +33,11 @@ Danbooru 公共抓取标记为无需登录。搜索和爬取请求未显式覆�
 写入持久失效标记；调度器跳过仍引用该文件的排队任务，重新登录原子更新 Cookie 和元数据后
 下一轮调度自动继续。
 
+`DedupReviewManager` 在主进程中维护持久审核队列，但特征提取和模型推理由仓库根目录
+`.venv` 启动 `dedup_review_worker.py` 独立完成。worker 直接复用 `差分去除_优化版.py` 的
+L0-L2 分析和 `.models/embeddings.sqlite3` 缓存，只把审核清单写回运行目录；模型阶段不移动
+下载文件。服务同一时间只运行一个模型分析进程，退出时终止子进程，重启后重新认领中断任务。
+
 单站清理只删除后端导出的 Cookie 或 Pixiv Token。独立的共享 Profile 清理接口会先取消全部授权
 会话并关闭 Chrome 宿主，再删除整个 `shared/` 目录；导出凭证仍由站点接口分别管理。
 
@@ -50,7 +55,30 @@ Clash YAML 隧道节点由 `TunnelTransportCore` 管理一个项目内核心子�
 - EH：保留通用站内搜索；Queue 消息形成具体 `/g/GID/TOKEN/` 画廊地址，再以一次或
   多次 gdata 批量请求补齐标题、封面、页数和标签。所有站内命中都进入默认可选地址，
   后端将标签汇总为官方 namespace `tag_facets[]`；WebUI 在候选行内直接展示封面、标题和
-  标签，并提供分组包含/排除过滤和原图/1280 下载选择，由用户结合预览判断。
+  标签，并提供分组包含/排除过滤和原图/1280 下载选择，由用户结合预览判断；
+- Pawchive：使用上游 gallery-dl 自带的 pawchive 提取器枚举 `/artists?q=` 创作者目录
+  （名称包含匹配、按收藏数排序）。目录约八成是 kemono 同步、本站从未导入的空壳
+  （`ever_imported=false`，profile/posts 均 404），解析层丢弃这些条目，为此枚举窗口按
+  `limit×10` 放大；名称与关键词精确一致的候选标记 `verified`，其余进入 `site_search`。
+  公共 API 与 `file.pawchive.pw` 文件下载均无需登录。
+
+Danbooru artists API 的通配模糊查询（`any_name_matches` 带 `*`）已因服务端 3 秒语句
+超时（按账号等级 3/6/9s，Member 与匿名同档）全部失败，后端画师目录查询因此固定
+为无通配精确匹配（服务端归一空格/下划线，匹配 name/other_names/group_name）。模糊
+需求由 `GET /api/v1/search/autocomplete?q=` 承接：它代理 Danbooru 搜索框的
+autocomplete 接口（`search[type]=tag_query`，前缀匹配主名与翻译别名，`antecedent`
+标注命中别名，category 区分画师/角色/作品），WebUI 关键词框防抖 300ms 请求并渲染
+下拉，由用户点选确认后回填正式 tag——补全只作展示，绝不静默改写搜索词。
+
+EH 与 Pawchive 没有 Danbooru 那样的人工画师链接维护，画师常以中日文/罗马字等
+别名存在，仅按输入关键词检索会漏掉本来存在的画师。搜索这两个来源时，后端会
+预取一次 Danbooru 画师目录（与 danbooru 来源共享同一次查询，最多等待 30s，
+失败或超时自动降级为原始行为并记入 `enrichment_errors`），从主名或
+`other_names` 与关键词精确一致的条目提取至多 4 个别名，与主关键词并行执行站
+内搜索后按候选 id 去重合并（主词命中排前，合并结果按 `limit` 截断）。候选记录
+`matched_keywords`；证据规则为：EH 仅别名命中的画廊标 `danbooru_alias_search`，
+Pawchive 创作者名与别名精确一致时按 `danbooru_alias_name_match` 升为
+`verified`。来源级 `alias_keywords[]` 会在响应与 WebUI 中展示实际使用的别名。
 
 `POST /api/v1/search` 可以一次查询多个来源，并始终按请求顺序返回 `sources[]`。
 响应的 `sources[].addresses[]` 保存默认可选的已验证账号/标签地址与 EH 站内画廊候选，
@@ -98,7 +126,10 @@ Danbooru artist tag 还会查询 `artists.json` 与 `artist_urls.json`，把人�
   不参与预去重。匹配兼容 Pixiv 新旧作品页、Pixiv 原图直链以及 `x.com` / `twitter.com`
   状态页变体；
 - EH 画廊：读取索引中的 `/s/TOKEN/GID-NUM`，每张图片建立 `--range 1` 任务；来源级
-  `eh_download` 随地址持久化，并写入每个图片任务的策略。
+  `eh_download` 随地址持久化，并写入每个图片任务的策略；
+- Pawchive 账号：以 `--post-range` 枚举创作者帖子，每帖读取上游提取器给出的可下载
+  文件数 `count`（站点未导入的 deferred 附件不计入）；单文件帖子建立整帖任务，多文件
+  帖子按 `--range N` 拆分为逐文件任务，全部为 0 的帖子直接跳过。
 
 搜索、账号/标签枚举和 EH 索引规划使用短期代理租约；每个图片下载任务再独立获取
 一个全程粘性的代理租约。Mihomo 隧道节点与原生 HTTP/HTTPS/SOCKS 节点对上层使用
@@ -116,6 +147,23 @@ queued → starting → running → succeeded
 
 每次 `running` 都会生成一条 attempts 记录。代理租约在启动 gallery-dl 前持久化，并在任意结束路径的 `finally` 中释放。
 
+图片审核状态独立于爬取终态：
+
+```text
+未建立 → pending → analyzing → auto_applying → ready → applying → applied
+                       └→ failed                         └→ apply_failed → applying
+```
+
+爬取终态不建立审核记录。只有显式调用 `review/start` 才创建 `pending`；读取新建或历史批次、
+服务启动和爬取状态迁移均为只读，不会隐式启动模型。
+
+worker 直接保留原脚本 `auto_groups` 中的组类型、winner 和原因。L0 完全相同组及通过原脚本
+严格门槛的 L1 压缩/重编码/重采样组继续采用 complete-link 阻断相似链，并使用原
+`choose_quality_winner` 择优。`auto_applying` 按记录逐张移动非 winner 及同名 `.txt`；每次移动
+前持久化目标路径，进程中断后可继续。自动 winner、L1/L2 人工候选、所有独立图片与读取失败
+图片组成完整人工组。每张剩余图片初始为保留，人工组允许空选择；`applying` 再移动人工未选
+文件。自动组不计入人工确认总数。
+
 ## SQLite 表
 
 - `tasks`：任务状态、站点、输出目录、重试与错误摘要；
@@ -130,6 +178,9 @@ queued → starting → running → succeeded
 - `crawl_task_source_keys`：图片任务与 Pixiv/X 稳定来源键的持久化映射，用于批次内预去重。
 - `crawl_address_proxy_probes`：每个地址最近一次站点探活目标、时间及汇总；
 - `crawl_address_proxy_nodes`：每个地址通过站点探活的节点集合。
+- `crawl_reviews`：批次去重分析、人工审核和应用结果的状态与汇总；
+- `crawl_review_groups`：重复组、独立图片组、读取失败组及人工确认状态；
+- `crawl_review_images`：每张图片的相对路径、质量元数据、保留选择和最终位置。
 
 数据库启用 WAL、foreign_keys、busy_timeout 和 NORMAL synchronous。
 
@@ -167,3 +218,12 @@ queued → starting → running → succeeded
   `extractor.exhentai.gp`，浏览器请求仍不能提交任意 `--option`；
 - 子进程 stdout/stderr 统一采集到 SQLite。
 - 元数据子进程达到输出或时间上限后，管道收尾也有独立时限，残留 reader 会被取消。
+- 子模块源码树保持上游原样。`worker_entry` 在导入 gallery-dl 后应用
+  `gdl_backend/worker_patches.py` 的两个运行时补丁：`PathFormat.part_enable`
+  重置陈旧 `temppath`，使 `.part` 命名恒为 `<目标路径>.part`，被杀的尝试可在
+  下一次尝试用 HTTP Range 续传；`HttpDownloader.receive`/`_receive_rate` 包装
+  写入循环，向 `GDL_ACTIVITY_STARTED_FILE`/`GDL_ACTIVITY_FILE` 触发心跳供父进程
+  的 EH 卡死看门狗观测（同地址媒体任务共享输出目录，目录 mtime 无法区分单任务
+  进度，故必须由子进程逐任务上报）。每个补丁先校验上游签名，不匹配时打印
+  `[gdl-backend-patch]` 告警并退回上游原生行为：心跳缺失只会使卡死看门狗不触发，
+  下载本身不受影响。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pickle
 import re
 import shutil
 import sqlite3
@@ -35,7 +36,7 @@ from .managed_browser import (
 from .process_control import terminate_process
 
 
-SUPPORTED_AUTH_SITES = ("danbooru", "twitter", "pixiv", "exhentai")
+SUPPORTED_AUTH_SITES = ("danbooru", "twitter", "pixiv", "exhentai", "pawchive")
 COOKIE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "twitter": ("auth_token", "ct0"),
     "exhentai": ("ipb_member_id", "ipb_pass_hash"),
@@ -147,6 +148,10 @@ class AuthManager:
         self._browser_host: ManagedBrowserHost | None = None
         self._active_authorization_id = ""
         self._profile_resetting = False
+        # mtime-keyed memo for _cookie_status: the scheduler calls managed_credentials_available
+        # for up to 200 queued tasks every 0.5s poll, and each call parsed the cookie jar from
+        # disk on the event loop. Cache by file mtime so an unchanged jar is parsed once.
+        self._cookie_status_cache: dict[str, tuple[float | None, dict[str, Any]]] = {}
         self._ensure_cache()
         if settings.gallery.migrate_default_auth:
             self._migrate_default_pixiv_cache()
@@ -205,16 +210,36 @@ class AuthManager:
         now = int(time.time())
         try:
             with closing(sqlite3.connect(cache_file)) as db:
-                row = db.execute(
-                    "SELECT 1 FROM data WHERE "
+                rows = db.execute(
+                    "SELECT value FROM data WHERE "
                     "key LIKE 'gallery_dl.extractor.pixiv._refresh_token_cache-%' "
-                    "AND value IS NOT NULL AND length(value) > 2 "
-                    "AND (expires = 0 OR expires > ?) LIMIT 1",
+                    "AND value IS NOT NULL AND (expires = 0 OR expires > ?)",
                     (now,),
-                ).fetchone()
-            return row is not None
+                ).fetchall()
         except sqlite3.Error:
             return False
+        # A cache miss for pixiv (no refresh token) is not empty: upstream's cache
+        # decorator stores the func's return value, and `_refresh_token_cache` returns
+        # None, so gallery-dl writes pickle.dumps(None) — a 4-byte blob with expires=0.
+        # The old `length(value) > 2` test treated that as a valid token, so an
+        # unauthenticated pixiv run made GET /auth report "authorized" forever. Decode
+        # each row and require an actual non-empty string token instead. Real tokens are
+        # pickled bytes; fall back to plain text for older/manually-written rows.
+        for (value,) in rows:
+            token: Any = None
+            if isinstance(value, (bytes, bytearray)):
+                try:
+                    token = pickle.loads(value)
+                except Exception:
+                    try:
+                        token = bytes(value).decode("utf-8", "strict")
+                    except Exception:
+                        token = None
+            else:
+                token = value
+            if isinstance(token, str) and token.strip():
+                return True
+        return False
 
     @staticmethod
     def _cleanup_oauth_cache(cache_file: Path) -> None:
@@ -394,6 +419,18 @@ class AuthManager:
 
     def _cookie_status(self, site: str) -> dict[str, Any]:
         path = self._cookie_path(site)
+        try:
+            mtime = path.stat().st_mtime if path.is_file() else None
+        except OSError:
+            mtime = None
+        cached = self._cookie_status_cache.get(site)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        result = self._compute_cookie_status(site, path)
+        self._cookie_status_cache[site] = (mtime, result)
+        return result
+
+    def _compute_cookie_status(self, site: str, path: Path) -> dict[str, Any]:
         required = set(COOKIE_REQUIREMENTS.get(site, ()))
         if not path.is_file():
             return {
@@ -468,6 +505,17 @@ class AuthManager:
                 "state": "ready",
                 "authorized": True,
                 "summary": "公开 API 已就绪，画师和角色标签抓取无需登录。",
+                "actions": [],
+            }
+
+        if site == "pawchive":
+            return {
+                "site": site,
+                "label": "Pawchive",
+                "method": "anonymous",
+                "state": "ready",
+                "authorized": True,
+                "summary": "公开 API 与文件下载已就绪，画师搜索和抓取无需登录。",
                 "actions": [],
             }
 

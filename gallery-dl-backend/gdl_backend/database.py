@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import threading
 import time
@@ -14,6 +15,7 @@ from .redaction import redact_data, redact_text
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 ACTIVE_STATUSES = {"starting", "running", "cancelling"}
+TERMINAL_BATCH_STATUSES = {"succeeded", "completed_with_errors", "cancelled"}
 
 
 class Database:
@@ -58,6 +60,7 @@ class Database:
                 proxy_mode TEXT NOT NULL,
                 max_attempts INTEGER NOT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                backoff_anchor_attempt INTEGER NOT NULL DEFAULT 0,
                 next_run_at REAL NOT NULL,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -189,6 +192,7 @@ class Database:
                 started_at REAL,
                 finished_at REAL,
                 last_error TEXT NOT NULL DEFAULT '',
+                planning_error TEXT NOT NULL DEFAULT '',
                 UNIQUE(batch_id, source_order, address_order)
             );
             CREATE INDEX IF NOT EXISTS idx_crawl_addresses_batch_order
@@ -234,7 +238,73 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_crawl_address_proxy_nodes_address
                 ON crawl_address_proxy_nodes(address_id);
 
-            UPDATE meta SET value='3' WHERE key='schema_version';
+            CREATE TABLE IF NOT EXISTS crawl_reviews (
+                batch_id TEXT PRIMARY KEY REFERENCES crawl_batches(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                total_image_count INTEGER NOT NULL DEFAULT 0,
+                total_group_count INTEGER NOT NULL DEFAULT 0,
+                duplicate_group_count INTEGER NOT NULL DEFAULT 0,
+                unreadable_image_count INTEGER NOT NULL DEFAULT 0,
+                automatic_group_count INTEGER NOT NULL DEFAULT 0,
+                automatic_rejected_image_count INTEGER NOT NULL DEFAULT 0,
+                kept_image_count INTEGER NOT NULL DEFAULT 0,
+                rejected_image_count INTEGER NOT NULL DEFAULT 0,
+                failed_image_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                analysis_log_path TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                ready_at REAL,
+                applied_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_reviews_status
+                ON crawl_reviews(status, created_at);
+
+            CREATE TABLE IF NOT EXISTS crawl_review_groups (
+                batch_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                match_levels_json TEXT NOT NULL DEFAULT '[]',
+                reason TEXT NOT NULL DEFAULT '',
+                decided INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(batch_id, id),
+                UNIQUE(batch_id, ordinal),
+                FOREIGN KEY(batch_id) REFERENCES crawl_reviews(batch_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_review_groups_order
+                ON crawl_review_groups(batch_id, kind, ordinal);
+
+            CREATE TABLE IF NOT EXISTS crawl_review_images (
+                batch_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                readable INTEGER NOT NULL DEFAULT 1,
+                recommended INTEGER NOT NULL DEFAULT 0,
+                selected INTEGER NOT NULL DEFAULT 1,
+                disposition TEXT NOT NULL DEFAULT 'pending',
+                final_relative_path TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(batch_id, id),
+                UNIQUE(batch_id, relative_path),
+                FOREIGN KEY(batch_id, group_id)
+                    REFERENCES crawl_review_groups(batch_id, id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_review_images_group
+                ON crawl_review_images(batch_id, group_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_crawl_review_images_selection
+                ON crawl_review_images(batch_id, selected, disposition);
+
+            UPDATE meta SET value='7' WHERE key='schema_version';
             """
         )
         address_columns = {
@@ -251,7 +321,35 @@ class Database:
                 "ALTER TABLE crawl_addresses ADD COLUMN "
                 "pre_dedup_skipped_count INTEGER NOT NULL DEFAULT 0"
             )
-        self._conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        if "planning_error" not in address_columns:
+            self._conn.execute(
+                "ALTER TABLE crawl_addresses ADD COLUMN "
+                "planning_error TEXT NOT NULL DEFAULT ''"
+            )
+        review_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(crawl_reviews)").fetchall()
+        }
+        if "automatic_group_count" not in review_columns:
+            self._conn.execute(
+                "ALTER TABLE crawl_reviews ADD COLUMN "
+                "automatic_group_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "automatic_rejected_image_count" not in review_columns:
+            self._conn.execute(
+                "ALTER TABLE crawl_reviews ADD COLUMN "
+                "automatic_rejected_image_count INTEGER NOT NULL DEFAULT 0"
+            )
+        task_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "backoff_anchor_attempt" not in task_columns:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN "
+                "backoff_anchor_attempt INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -260,10 +358,29 @@ class Database:
             try:
                 yield self._conn
             except Exception:
-                self._conn.execute("ROLLBACK")
+                # Never let a rollback error (e.g. SQLite already auto-rolled-back,
+                # "no transaction is active") replace the original exception the
+                # caller is trying to classify.
+                if self._conn.in_transaction:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
                 raise
             else:
-                self._conn.execute("COMMIT")
+                try:
+                    self._conn.execute("COMMIT")
+                except sqlite3.Error:
+                    # A failed COMMIT (disk full, I/O error) otherwise leaves the
+                    # shared connection stuck inside the transaction, so every later
+                    # BEGIN IMMEDIATE fails with "cannot start a transaction within a
+                    # transaction" until the process restarts. Roll back and re-raise.
+                    if self._conn.in_transaction:
+                        try:
+                            self._conn.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    raise
 
     @staticmethod
     def _task(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -318,6 +435,39 @@ class Database:
                 data.pop(key, None)
         return data
 
+    @staticmethod
+    def _crawl_review(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return dict(row)
+
+    @staticmethod
+    def _crawl_review_group(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["match_levels"] = json.loads(data.pop("match_levels_json") or "[]")
+        except Exception:
+            data["match_levels"] = []
+            data.pop("match_levels_json", None)
+        data["decided"] = bool(data.get("decided"))
+        return data
+
+    @staticmethod
+    def _crawl_review_image(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+        except Exception:
+            data["metadata"] = {}
+            data.pop("metadata_json", None)
+        for key in ("readable", "recommended", "selected"):
+            data[key] = bool(data.get(key))
+        return data
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -340,7 +490,10 @@ class Database:
                     "SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)
                 ).fetchone()
                 if existing is not None:
-                    return self._task(existing), False  # type: ignore[return-value]
+                    # Return the same shape as the normal create path (get_task attaches
+                    # latest_attempt/lease); a bare _task() row here would make a
+                    # concurrent same-key request receive a task dict missing those keys.
+                    return self.get_task(str(existing["id"])), False  # type: ignore[return-value]
             task_id = str(values.get("id") or uuid.uuid4())
             conn.execute(
                 """
@@ -662,18 +815,240 @@ class Database:
                 return None
             if row["status"] not in TERMINAL_STATUSES:
                 raise RuntimeError("仅终态任务支持重新排队")
-            max_attempts = int(row["attempt_count"]) + max(1, int(additional_attempts))
+            prior_attempts = int(row["attempt_count"])
+            max_attempts = prior_attempts + max(1, int(additional_attempts))
             conn.execute(
                 """
                 UPDATE tasks SET status='queued', cancel_requested=0, next_run_at=?,
-                    finished_at=NULL, updated_at=?, max_attempts=?, pid=NULL,
-                    process_marker=NULL, exit_code=NULL, last_error_class='', last_error='',
+                    started_at=NULL, finished_at=NULL, updated_at=?, max_attempts=?,
+                    pid=NULL, process_marker=NULL, exit_code=NULL, backoff_anchor_attempt=?,
                     tried_proxy_ids_json='[]', version=version+1 WHERE id=?
                 """,
-                (now, now, max_attempts, task_id),
+                (now, now, max_attempts, prior_attempts, task_id),
             )
             self._event(conn, task_id, "manually_retried", {"max_attempts": max_attempts})
             return self._task(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+    def _requeue_crawl_batch_tasks(
+        self,
+        conn: sqlite3.Connection,
+        batch_id: str,
+        *,
+        statuses: tuple[str, ...],
+        extra: int,
+        now: float,
+        event_payload: dict[str, Any],
+    ) -> list[str]:
+        """Requeue every media task of a batch whose status is in ``statuses``.
+
+        Shared by retry (failed/cancelled only) and rerun (also succeeded when asked).
+        Anchors the backoff exponent to the prior attempt_count and grows the budget by
+        ``extra``, without blanking last_error. Returns the requeued task ids in order.
+        """
+        placeholders = ",".join("?" for _ in statuses)
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.attempt_count
+            FROM crawl_address_tasks cat
+            JOIN crawl_addresses ca ON ca.id=cat.address_id
+            JOIN tasks t ON t.id=cat.task_id
+            WHERE ca.batch_id=? AND t.status IN ({placeholders})
+            ORDER BY ca.source_order, ca.address_order, cat.sequence_no
+            """,
+            (batch_id, *statuses),
+        ).fetchall()
+        task_ids = [str(row["id"]) for row in rows]
+        for row in rows:
+            task_id = str(row["id"])
+            prior_attempts = int(row["attempt_count"])
+            max_attempts = prior_attempts + extra
+            conn.execute(
+                f"""
+                UPDATE tasks SET status='queued', cancel_requested=0, next_run_at=?,
+                    started_at=NULL, finished_at=NULL, updated_at=?, max_attempts=?,
+                    pid=NULL, process_marker=NULL, exit_code=NULL,
+                    backoff_anchor_attempt=?, tried_proxy_ids_json='[]',
+                    version=version+1 WHERE id=? AND status IN ({placeholders})
+                """,
+                (now, now, max_attempts, prior_attempts, task_id, *statuses),
+            )
+            conn.execute("DELETE FROM leases WHERE task_id=?", (task_id,))
+            self._event(
+                conn,
+                task_id,
+                "manually_retried",
+                {**event_payload, "max_attempts": max_attempts},
+            )
+        return task_ids
+
+    def retry_failed_crawl_tasks(
+        self,
+        batch_id: str,
+        additional_attempts: int = 1,
+    ) -> dict[str, Any] | None:
+        """Requeue only failed media tasks in a finished crawl batch."""
+        now = time.time()
+        extra = max(1, int(additional_attempts))
+        with self._transaction() as conn:
+            batch = conn.execute(
+                "SELECT id FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                return None
+            task_ids = self._requeue_crawl_batch_tasks(
+                conn,
+                batch_id,
+                statuses=("failed", "cancelled"),
+                extra=extra,
+                now=now,
+                event_payload={"batch_id": batch_id},
+            )
+            address_rows = conn.execute(
+                """
+                SELECT DISTINCT ca.id
+                FROM crawl_address_tasks cat
+                JOIN crawl_addresses ca ON ca.id=cat.address_id
+                JOIN tasks t ON t.id=cat.task_id
+                WHERE ca.batch_id=? AND t.status='queued'
+                """,
+                (batch_id,),
+            ).fetchall()
+            address_ids = [str(row["id"]) for row in address_rows]
+            for address_id in address_ids:
+                conn.execute(
+                    """
+                    UPDATE crawl_addresses SET status='running', finished_at=NULL,
+                        updated_at=?, last_error='' WHERE id=? AND status IN ('failed','cancelled')
+                    """,
+                    (now, address_id),
+                )
+            replanned_rows = conn.execute(
+                """
+                SELECT id FROM crawl_addresses
+                WHERE batch_id=? AND planning_error != ''
+                ORDER BY source_order, address_order
+                """,
+                (batch_id,),
+            ).fetchall()
+            replanned_address_ids = [str(row["id"]) for row in replanned_rows]
+            for address_id in replanned_address_ids:
+                # Reset to a clean pending state so the OrderedCrawlManager re-plans the
+                # whole address. Existing crawl_address_tasks stay linked: re-planning is
+                # idempotent (same enqueue key) and gallery-dl skips downloaded files, so
+                # succeeded units are not re-fetched, only missing units are added.
+                conn.execute(
+                    """
+                    UPDATE crawl_addresses SET status='pending', planning_error='',
+                        last_error='', started_at=NULL, finished_at=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (now, address_id),
+                )
+            if task_ids or replanned_address_ids:
+                conn.execute(
+                    """
+                    UPDATE crawl_batches SET status='running', cancel_requested=0,
+                        finished_at=NULL, updated_at=?, last_error='' WHERE id=?
+                    """,
+                    (now, batch_id),
+                )
+            self._refresh_crawl_batch_counts(conn, batch_id)
+        return {
+            "batch_id": batch_id,
+            "retried_count": len(task_ids),
+            "task_ids": task_ids,
+            "address_ids": address_ids,
+            "replanned_address_count": len(replanned_address_ids),
+            "replanned_address_ids": replanned_address_ids,
+        }
+
+    def rerun_crawl_batch(
+        self,
+        batch_id: str,
+        additional_attempts: int = 1,
+        requeue_succeeded: bool = False,
+    ) -> dict[str, Any] | None:
+        """Re-open a finished crawl batch in place.
+
+        Resets every address back to 'pending' so the OrderedCrawlManager re-plans them
+        against the SAME position-based output dirs, requeues failed and cancelled media
+        tasks (also succeeded when ``requeue_succeeded``), and reactivates the batch.
+        Succeeded tasks are kept as-is by default, so idempotent re-enqueue returns them
+        with zero re-execution and only new / failed units are downloaded. Existing task
+        links and proxy-probe rows are preserved. Returns None for an unknown batch and
+        ``{"batch_id":..., "not_terminal": True}`` when the batch is not yet finished.
+        """
+        now = time.time()
+        extra = max(1, int(additional_attempts))
+        terminal_batch = {"succeeded", "completed_with_errors", "cancelled"}
+        # finish_crawl_address_as_pre_deduplicated marks addresses 'succeeded', so the
+        # resettable set is exactly the terminal address statuses (nothing distinct).
+        terminal_address = ("succeeded", "failed", "cancelled")
+        statuses = (
+            ("failed", "cancelled", "succeeded")
+            if requeue_succeeded
+            else ("failed", "cancelled")
+        )
+        with self._transaction() as conn:
+            batch = conn.execute(
+                "SELECT status FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                return None
+            if str(batch["status"]) not in terminal_batch:
+                return {"batch_id": batch_id, "not_terminal": True}
+            task_ids = self._requeue_crawl_batch_tasks(
+                conn,
+                batch_id,
+                statuses=statuses,
+                extra=extra,
+                now=now,
+                event_payload={"batch_id": batch_id, "rerun": True},
+            )
+            address_placeholders = ",".join("?" for _ in terminal_address)
+            address_rows = conn.execute(
+                f"""
+                SELECT id FROM crawl_addresses
+                WHERE batch_id=? AND status IN ({address_placeholders})
+                ORDER BY source_order, address_order
+                """,
+                (batch_id, *terminal_address),
+            ).fetchall()
+            replanned_address_ids = [str(row["id"]) for row in address_rows]
+            conn.execute(
+                f"""
+                UPDATE crawl_addresses SET status='pending', planning_error='',
+                    last_error='', started_at=NULL, finished_at=NULL, updated_at=?
+                WHERE batch_id=? AND status IN ({address_placeholders})
+                """,
+                (now, batch_id, *terminal_address),
+            )
+            conn.execute(
+                """
+                UPDATE crawl_batches SET status='running', cancel_requested=0,
+                    finished_at=NULL, last_error='', updated_at=? WHERE id=?
+                """,
+                (now, batch_id),
+            )
+            # A rerun changes the batch's file set, so any existing review manifest is
+            # stale — and there is otherwise no path to re-analyze it (retry only accepts
+            # 'failed', start only a not_started batch). Drop the review entirely so the
+            # re-finished batch can be analyzed fresh. In-flight reviews are blocked from
+            # rerun at the API layer (_REVIEW_IN_FLIGHT).
+            conn.execute("DELETE FROM crawl_review_images WHERE batch_id=?", (batch_id,))
+            conn.execute("DELETE FROM crawl_review_groups WHERE batch_id=?", (batch_id,))
+            conn.execute("DELETE FROM crawl_reviews WHERE batch_id=?", (batch_id,))
+            self._refresh_crawl_batch_counts(conn, batch_id)
+        return {
+            "batch_id": batch_id,
+            "requeued_task_count": len(task_ids),
+            "task_ids": task_ids,
+            "replanned_address_count": len(replanned_address_ids),
+            "replanned_address_ids": replanned_address_ids,
+            "requeue_succeeded": bool(requeue_succeeded),
+        }
 
     def set_lease(self, task_id: str, attempt_id: str, node_id: str, endpoint: str, site: str) -> None:
         now = time.time()
@@ -708,7 +1083,11 @@ class Database:
                 (task_id, attempt_id, time.time(), stream, safe),
             )
             log_id = int(cur.lastrowid)
-            if log_id % 100 == 0:
+            # Prune probabilistically rather than on `log_id % 100`: log_id is a global
+            # AUTOINCREMENT, so two tasks writing in lockstep can leave one always on odd
+            # ids that never hit the modulo, growing its logs past max_logs_per_task.
+            # A per-insert 1% chance keeps every task bounded regardless of interleaving.
+            if random.random() < 0.01:
                 conn.execute(
                     """
                     DELETE FROM task_logs WHERE task_id=? AND id NOT IN (
@@ -908,6 +1287,22 @@ class Database:
         batch["current"] = current
         batch["execution_order"] = "source_then_address"
         batch["lease_model"] = "one-media-task-one-node"
+        # A terminal batch can be resumed when there is failed/cancelled media work to
+        # requeue, or an address whose planning never completed (planning_error set) and
+        # so needs re-planning. Computed from already-loaded rows — no extra query.
+        terminal_batch = {"succeeded", "completed_with_errors", "cancelled"}
+        has_planning_gap = any(
+            str((address or {}).get("planning_error") or "") for address in addresses
+        )
+        batch["resumable"] = bool(
+            batch["status"] in terminal_batch
+            and (
+                int(batch.get("failed_task_count") or 0) > 0
+                or int(batch.get("cancelled_task_count") or 0) > 0
+                or has_planning_gap
+            )
+        )
+        batch["review"] = self.get_crawl_review(batch_id)
         return batch
 
     def list_crawl_batches(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
@@ -920,6 +1315,675 @@ class Database:
                 (max(1, min(int(limit), 500)), max(0, int(offset))),
             ).fetchall()
             return [self._crawl_batch(row) for row in rows]  # type: ignore[misc]
+
+    def get_crawl_review(self, batch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM crawl_reviews WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            review = self._crawl_review(row)
+            if review is None:
+                return None
+            image_counts = self._conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN selected=1 THEN 1 ELSE 0 END) AS selected_count,
+                    SUM(CASE WHEN disposition='kept' THEN 1 ELSE 0 END) AS kept_count,
+                    SUM(CASE WHEN disposition='rejected' THEN 1 ELSE 0 END) AS rejected_count,
+                    SUM(CASE WHEN disposition='failed' THEN 1 ELSE 0 END) AS failed_count
+                FROM crawl_review_images WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            decided = self._conn.execute(
+                """
+                SELECT COUNT(*) FROM crawl_review_groups
+                WHERE batch_id=? AND decided=1 AND kind NOT LIKE 'auto_%'
+                """,
+                (batch_id,),
+            ).fetchone()[0]
+        review["selected_image_count"] = int(image_counts["selected_count"] or 0)
+        review["kept_image_count"] = int(image_counts["kept_count"] or review["kept_image_count"] or 0)
+        review["rejected_image_count"] = int(
+            image_counts["rejected_count"] or review["rejected_image_count"] or 0
+        )
+        review["failed_image_count"] = int(
+            image_counts["failed_count"] or review["failed_image_count"] or 0
+        )
+        review["decided_group_count"] = int(decided or 0)
+        return review
+
+    def start_crawl_review(self, batch_id: str) -> dict[str, Any]:
+        now = time.time()
+        with self._transaction() as conn:
+            batch = conn.execute(
+                "SELECT status FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise KeyError(batch_id)
+            if batch["status"] not in {"succeeded", "completed_with_errors", "cancelled"}:
+                raise RuntimeError("爬取批次结束后才能启动去重分析")
+            conn.execute(
+                """
+                INSERT INTO crawl_reviews(batch_id, status, created_at, updated_at)
+                VALUES (?, 'pending', ?, ?)
+                ON CONFLICT(batch_id) DO UPDATE SET status='pending', updated_at=?, error=''
+                WHERE crawl_reviews.status='waiting_for_crawl'
+                """,
+                (batch_id, now, now, now),
+            )
+        review = self.get_crawl_review(batch_id)
+        if review is None:
+            raise RuntimeError("去重分析任务建立后读取失败")
+        return review
+
+    def recover_crawl_reviews(self) -> int:
+        now = time.time()
+        with self._transaction() as conn:
+            analyzing = conn.execute(
+                """
+                UPDATE crawl_reviews SET status='pending', updated_at=?,
+                    error='服务重启，重新执行去重分析'
+                WHERE status='analyzing'
+                """,
+                (now,),
+            ).rowcount
+            applying = conn.execute(
+                """
+                UPDATE crawl_reviews SET status='apply_failed', updated_at=?,
+                    error='服务重启，需重试应用审核结果'
+                WHERE status='applying'
+                """,
+                (now,),
+            ).rowcount
+            return int(analyzing + applying)
+
+    def claim_next_crawl_review(self) -> dict[str, Any] | None:
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT cr.batch_id, cb.output_dir FROM crawl_reviews cr
+                JOIN crawl_batches cb ON cb.id=cr.batch_id
+                WHERE cr.status='pending'
+                  AND cb.status IN ('succeeded','completed_with_errors','cancelled')
+                ORDER BY cb.finished_at, cb.created_at LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            updated = conn.execute(
+                """
+                UPDATE crawl_reviews SET status='analyzing', started_at=?, updated_at=?,
+                    ready_at=NULL, applied_at=NULL, error=''
+                WHERE batch_id=? AND status='pending'
+                """,
+                (now, now, row["batch_id"]),
+            )
+            if not updated.rowcount:
+                return None
+            return {"batch_id": str(row["batch_id"]), "output_dir": str(row["output_dir"])}
+
+    def next_crawl_review_automatic(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT cr.batch_id, cb.output_dir FROM crawl_reviews cr
+                JOIN crawl_batches cb ON cb.id=cr.batch_id
+                WHERE cr.status='auto_applying'
+                ORDER BY cr.updated_at, cr.created_at LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": str(row["batch_id"]),
+                "output_dir": str(row["output_dir"]),
+            }
+
+    def requeue_crawl_review(self, batch_id: str) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_reviews SET status='pending', updated_at=?, error=''
+                WHERE batch_id=? AND status='analyzing'
+                """,
+                (time.time(), batch_id),
+            )
+
+    def fail_crawl_review(self, batch_id: str, error: str, *, log_path: str = "") -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_reviews SET status='failed', error=?, analysis_log_path=?,
+                    updated_at=? WHERE batch_id=? AND status='analyzing'
+                """,
+                (redact_text(error, limit=4000), log_path, time.time(), batch_id),
+            )
+
+    def retry_crawl_review(self, batch_id: str) -> bool:
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT status FROM crawl_reviews WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] != "failed":
+                raise RuntimeError("当前审核分析状态不允许重试")
+            conn.execute("DELETE FROM crawl_review_groups WHERE batch_id=?", (batch_id,))
+            conn.execute(
+                """
+                UPDATE crawl_reviews SET status='pending', total_image_count=0,
+                    total_group_count=0, duplicate_group_count=0, unreadable_image_count=0,
+                    automatic_group_count=0, automatic_rejected_image_count=0,
+                    kept_image_count=0, rejected_image_count=0, failed_image_count=0,
+                    error='', updated_at=?, started_at=NULL, ready_at=NULL, applied_at=NULL
+                WHERE batch_id=?
+                """,
+                (now, batch_id),
+            )
+            return True
+
+    def replace_crawl_review_manifest(
+        self,
+        batch_id: str,
+        manifest: dict[str, Any],
+        *,
+        log_path: str = "",
+    ) -> None:
+        groups = list(manifest.get("groups") or [])
+        automatic_groups = list(manifest.get("auto_groups") or [])
+        now = time.time()
+        with self._transaction() as conn:
+            review = conn.execute(
+                "SELECT status FROM crawl_reviews WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if review is None or review["status"] != "analyzing":
+                raise RuntimeError("审核任务未处于分析状态")
+            conn.execute("DELETE FROM crawl_review_groups WHERE batch_id=?", (batch_id,))
+            image_count = 0
+            duplicate_count = 0
+            unreadable_count = 0
+            automatic_rejected_count = 0
+            seen_group_ids: set[str] = set()
+            seen_image_ids: set[str] = set()
+            seen_paths: set[str] = set()
+
+            def insert_group(
+                group_id: str,
+                ordinal: int,
+                kind: str,
+                match_levels: list[Any],
+                reason: str,
+                *,
+                decided: bool,
+            ) -> None:
+                if not group_id or group_id in seen_group_ids:
+                    raise ValueError("审核清单包含空或重复的组 ID")
+                seen_group_ids.add(group_id)
+                conn.execute(
+                    """
+                    INSERT INTO crawl_review_groups(
+                        batch_id, id, ordinal, kind, match_levels_json, reason,
+                        decided, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        group_id,
+                        ordinal,
+                        kind,
+                        json.dumps(match_levels, ensure_ascii=False),
+                        redact_text(reason, limit=1000),
+                        int(decided),
+                        now,
+                        now,
+                    ),
+                )
+
+            def insert_image(
+                group_id: str,
+                image: dict[str, Any],
+                fallback_ordinal: int,
+                *,
+                selected: bool,
+                metadata_extra: dict[str, Any] | None = None,
+            ) -> None:
+                nonlocal image_count, unreadable_count
+                image_id = str(image.get("id") or "").strip()
+                relative_path = str(image.get("relative_path") or "").strip()
+                if not image_id or image_id in seen_image_ids:
+                    raise ValueError("审核清单包含空或重复的图片 ID")
+                if not relative_path or relative_path in seen_paths:
+                    raise ValueError("审核清单包含空或重复的图片路径")
+                seen_image_ids.add(image_id)
+                seen_paths.add(relative_path)
+                metadata = dict(image.get("metadata") or {})
+                if metadata_extra:
+                    metadata.update(metadata_extra)
+                # The worker emits per-image SSCD/DINO similarity as a top-level
+                # review_metrics key; fold it into metadata_json so it survives to the
+                # API (the UI reads image.metadata.review_metrics). Without this the
+                # review cards never showed the similarity scores.
+                if image.get("review_metrics") is not None:
+                    metadata["review_metrics"] = image["review_metrics"]
+                readable = bool(image.get("readable", True))
+                if not readable:
+                    unreadable_count += 1
+                conn.execute(
+                    """
+                    INSERT INTO crawl_review_images(
+                        batch_id, id, group_id, ordinal, relative_path, file_hash,
+                        metadata_json, readable, recommended, selected, disposition,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        image_id,
+                        group_id,
+                        int(image.get("ordinal") or fallback_ordinal),
+                        relative_path,
+                        str(metadata.get("file_hash") or ""),
+                        json.dumps(metadata, ensure_ascii=False, allow_nan=False),
+                        int(readable),
+                        int(bool(image.get("recommended"))),
+                        int(selected),
+                        now,
+                        now,
+                    ),
+                )
+                image_count += 1
+
+            for fallback_ordinal, group in enumerate(groups, 1):
+                group_id = str(group.get("id") or "").strip()
+                kind = str(group.get("kind") or "single")
+                if kind == "duplicate":
+                    duplicate_count += 1
+                items = list(group.get("items") or [])
+                insert_group(
+                    group_id,
+                    int(group.get("ordinal") or fallback_ordinal),
+                    kind,
+                    list(group.get("match_levels") or []),
+                    str(group.get("reason") or ""),
+                    decided=False,
+                )
+                for fallback_image_ordinal, image in enumerate(items, 1):
+                    insert_image(
+                        group_id,
+                        image,
+                        fallback_image_ordinal,
+                        selected=True,
+                    )
+
+            manual_ordinals = [
+                int(group.get("ordinal") or fallback)
+                for fallback, group in enumerate(groups, 1)
+            ]
+            automatic_ordinal = max(manual_ordinals, default=0)
+            for fallback_ordinal, group in enumerate(automatic_groups, 1):
+                group_id = str(group.get("id") or "").strip()
+                automatic_kind = str(group.get("kind") or "")
+                if automatic_kind not in {"exact", "compression"}:
+                    raise ValueError("自动去重组类型无效")
+                winner = dict(group.get("winner") or {})
+                winner_path = str(winner.get("relative_path") or "").strip()
+                rejected_items = list(group.get("rejected_items") or [])
+                if not winner_path or not rejected_items:
+                    raise ValueError("自动去重组缺少保留图或淘汰图")
+                insert_group(
+                    group_id,
+                    automatic_ordinal + fallback_ordinal,
+                    f"auto_{automatic_kind}",
+                    list(group.get("match_levels") or []),
+                    str(group.get("reason") or ""),
+                    decided=True,
+                )
+                for fallback_image_ordinal, image in enumerate(rejected_items, 1):
+                    insert_image(
+                        group_id,
+                        image,
+                        fallback_image_ordinal,
+                        selected=False,
+                        metadata_extra={
+                            "automatic_dedup": {
+                                "kind": automatic_kind,
+                                "winner_relative_path": winner_path,
+                                "reason": str(group.get("reason") or ""),
+                            }
+                        },
+                    )
+                    automatic_rejected_count += 1
+
+            expected_images = int((manifest.get("counts") or {}).get("images") or 0)
+            if expected_images != image_count:
+                raise ValueError("审核清单的总图片计数不一致")
+            next_status = "auto_applying" if automatic_rejected_count else "ready"
+            conn.execute(
+                """
+                UPDATE crawl_reviews SET status=?, total_image_count=?,
+                    total_group_count=?, duplicate_group_count=?, unreadable_image_count=?,
+                    automatic_group_count=?, automatic_rejected_image_count=?,
+                    kept_image_count=0, rejected_image_count=0, failed_image_count=0,
+                    error='', analysis_log_path=?, ready_at=?, updated_at=?
+                WHERE batch_id=?
+                """,
+                (
+                    next_status,
+                    image_count,
+                    len(groups),
+                    duplicate_count,
+                    unreadable_count,
+                    len(automatic_groups),
+                    automatic_rejected_count,
+                    log_path,
+                    now if next_status == "ready" else None,
+                    now,
+                    batch_id,
+                ),
+            )
+
+    def list_crawl_review_groups(
+        self,
+        batch_id: str,
+        *,
+        kind: str | None = None,
+        limit: int = 12,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        where = "batch_id=? AND kind NOT LIKE 'auto_%'"
+        params: list[Any] = [batch_id]
+        if kind:
+            where += " AND kind=?"
+            params.append(kind)
+        page_limit = max(1, min(int(limit), 50))
+        page_offset = max(0, int(offset))
+        with self._lock:
+            total = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM crawl_review_groups WHERE {where}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM crawl_review_groups WHERE {where}
+                ORDER BY ordinal LIMIT ? OFFSET ?
+                """,
+                [*params, page_limit, page_offset],
+            ).fetchall()
+            groups: list[dict[str, Any]] = []
+            for row in rows:
+                group = self._crawl_review_group(row)
+                if group is None:
+                    continue
+                image_rows = self._conn.execute(
+                    """
+                    SELECT * FROM crawl_review_images
+                    WHERE batch_id=? AND group_id=? ORDER BY ordinal
+                    """,
+                    (batch_id, group["id"]),
+                ).fetchall()
+                group["images"] = [
+                    self._crawl_review_image(image_row) for image_row in image_rows
+                ]
+                group["image_count"] = len(group["images"])
+                group["selected_image_count"] = sum(
+                    bool(image and image.get("selected")) for image in group["images"]
+                )
+                groups.append(group)
+        return {"items": groups, "total": total, "limit": page_limit, "offset": page_offset}
+
+    def update_crawl_review_decisions(
+        self,
+        batch_id: str,
+        decisions: list[dict[str, Any]],
+    ) -> None:
+        now = time.time()
+        with self._transaction() as conn:
+            review = conn.execute(
+                "SELECT status FROM crawl_reviews WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if review is None:
+                raise KeyError(batch_id)
+            if review["status"] != "ready":
+                raise RuntimeError("当前审核状态不允许修改选择")
+            seen_groups: set[str] = set()
+            for decision in decisions:
+                group_id = str(decision.get("group_id") or "")
+                if not group_id or group_id in seen_groups:
+                    raise ValueError("审核决策包含空或重复的组 ID")
+                seen_groups.add(group_id)
+                group_row = conn.execute(
+                    "SELECT kind FROM crawl_review_groups WHERE batch_id=? AND id=?",
+                    (batch_id, group_id),
+                ).fetchone()
+                if group_row is None:
+                    raise KeyError(group_id)
+                if str(group_row["kind"] or "").startswith("auto_"):
+                    # Auto-dedup groups are applied by the worker, not the user. Flipping a
+                    # rejected auto-image back to selected would make apply look for a file
+                    # the worker already moved away -> apply_failed + skewed auto counts.
+                    raise ValueError("不能修改自动去重组的选择")
+                rows = conn.execute(
+                    """
+                    SELECT id FROM crawl_review_images WHERE batch_id=? AND group_id=?
+                    """,
+                    (batch_id, group_id),
+                ).fetchall()
+                if not rows:
+                    raise KeyError(group_id)
+                available = {str(row["id"]) for row in rows}
+                selected = {str(value) for value in decision.get("selected_image_ids") or []}
+                if not selected.issubset(available):
+                    raise ValueError("审核决策包含不属于当前组的图片 ID")
+                conn.execute(
+                    """
+                    UPDATE crawl_review_images SET selected=0, updated_at=?
+                    WHERE batch_id=? AND group_id=?
+                    """,
+                    (now, batch_id, group_id),
+                )
+                if selected:
+                    conn.executemany(
+                        """
+                        UPDATE crawl_review_images SET selected=1, updated_at=?
+                        WHERE batch_id=? AND group_id=? AND id=?
+                        """,
+                        [(now, batch_id, group_id, image_id) for image_id in selected],
+                    )
+                conn.execute(
+                    """
+                    UPDATE crawl_review_groups SET decided=1, updated_at=?
+                    WHERE batch_id=? AND id=?
+                    """,
+                    (now, batch_id, group_id),
+                )
+            conn.execute(
+                "UPDATE crawl_reviews SET updated_at=? WHERE batch_id=?",
+                (now, batch_id),
+            )
+
+    def get_crawl_review_image(self, batch_id: str, image_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT cri.*, cb.output_dir FROM crawl_review_images cri
+                JOIN crawl_batches cb ON cb.id=cri.batch_id
+                WHERE cri.batch_id=? AND cri.id=?
+                """,
+                (batch_id, image_id),
+            ).fetchone()
+            return self._crawl_review_image(row)
+
+    def begin_crawl_review_apply(self, batch_id: str) -> bool:
+        with self._transaction() as conn:
+            review = conn.execute(
+                """
+                SELECT cr.status AS status, cb.status AS batch_status
+                FROM crawl_reviews cr JOIN crawl_batches cb ON cb.id=cr.batch_id
+                WHERE cr.batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if review is None or review["status"] not in {"ready", "apply_failed"}:
+                return False
+            # A rerun/retry can pull the batch back to running after the review turned
+            # ready; applying an old manifest then would move files while gallery-dl is
+            # writing the same tree (and re-download whatever we "rejected"). Refuse
+            # unless the batch is terminal again.
+            if review["batch_status"] not in TERMINAL_BATCH_STATUSES:
+                return False
+            undecided = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM crawl_review_groups
+                    WHERE batch_id=? AND decided=0
+                    """,
+                    (batch_id,),
+                ).fetchone()[0]
+            )
+            if undecided:
+                raise RuntimeError(f"还有 {undecided} 个图片组尚未确认")
+            updated = conn.execute(
+                """
+                UPDATE crawl_reviews SET status='applying', error='', updated_at=?
+                WHERE batch_id=? AND status IN ('ready','apply_failed')
+                """,
+                (time.time(), batch_id),
+            )
+            return bool(updated.rowcount)
+
+    def crawl_review_apply_images(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM crawl_review_images WHERE batch_id=?
+                ORDER BY group_id, ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+            return [self._crawl_review_image(row) for row in rows]  # type: ignore[misc]
+
+    def crawl_review_automatic_images(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT cri.* FROM crawl_review_images cri
+                JOIN crawl_review_groups crg
+                    ON crg.batch_id=cri.batch_id AND crg.id=cri.group_id
+                WHERE cri.batch_id=? AND crg.kind LIKE 'auto_%' AND cri.selected=0
+                ORDER BY crg.ordinal, cri.ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+            return [self._crawl_review_image(row) for row in rows]  # type: ignore[misc]
+
+    def finish_crawl_review_automatic(self, batch_id: str) -> dict[str, Any] | None:
+        now = time.time()
+        with self._transaction() as conn:
+            counts = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN cri.disposition='rejected' THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN cri.disposition='failed' THEN 1 ELSE 0 END) AS failed
+                FROM crawl_review_images cri
+                JOIN crawl_review_groups crg
+                    ON crg.batch_id=cri.batch_id AND crg.id=cri.group_id
+                WHERE cri.batch_id=? AND crg.kind LIKE 'auto_%'
+                """,
+                (batch_id,),
+            ).fetchone()
+            rejected = int(counts["rejected"] or 0)
+            failed = int(counts["failed"] or 0)
+            error = f"{failed} 张严格自动淘汰图片处理失败" if failed else ""
+            updated = conn.execute(
+                """
+                UPDATE crawl_reviews SET status='ready', rejected_image_count=?,
+                    failed_image_count=?, error=?, ready_at=?, updated_at=?
+                WHERE batch_id=? AND status='auto_applying'
+                """,
+                (rejected, failed, error, now, now, batch_id),
+            )
+            if not updated.rowcount:
+                return None
+        return self.get_crawl_review(batch_id)
+
+    def stage_crawl_review_image_move(
+        self,
+        batch_id: str,
+        image_id: str,
+        final_relative_path: str,
+    ) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_review_images SET disposition='moving', final_relative_path=?,
+                    error='', updated_at=? WHERE batch_id=? AND id=?
+                """,
+                (final_relative_path, time.time(), batch_id, image_id),
+            )
+
+    def finish_crawl_review_image(
+        self,
+        batch_id: str,
+        image_id: str,
+        disposition: str,
+        *,
+        final_relative_path: str,
+        error: str = "",
+    ) -> None:
+        if disposition not in {"kept", "rejected", "failed"}:
+            raise ValueError("审核图片结果状态无效")
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_review_images SET disposition=?, final_relative_path=?,
+                    error=?, updated_at=? WHERE batch_id=? AND id=?
+                """,
+                (
+                    disposition,
+                    final_relative_path,
+                    redact_text(error, limit=2000),
+                    time.time(),
+                    batch_id,
+                    image_id,
+                ),
+            )
+
+    def finish_crawl_review_apply(self, batch_id: str) -> dict[str, Any] | None:
+        now = time.time()
+        with self._transaction() as conn:
+            counts = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN disposition='kept' THEN 1 ELSE 0 END) AS kept,
+                    SUM(CASE WHEN disposition='rejected' THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN disposition NOT IN ('kept','rejected') THEN 1 ELSE 0 END) AS failed
+                FROM crawl_review_images WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            kept = int(counts["kept"] or 0)
+            rejected = int(counts["rejected"] or 0)
+            failed = int(counts["failed"] or 0)
+            status = "apply_failed" if failed else "applied"
+            error = f"{failed} 张图片处理失败" if failed else ""
+            conn.execute(
+                """
+                UPDATE crawl_reviews SET status=?, kept_image_count=?, rejected_image_count=?,
+                    failed_image_count=?, error=?, updated_at=?, applied_at=? WHERE batch_id=?
+                """,
+                (status, kept, rejected, failed, error, now, now if not failed else None, batch_id),
+            )
+        return self.get_crawl_review(batch_id)
 
     def active_crawl_batch_ids(self) -> list[str]:
         with self._lock:
@@ -1039,6 +2103,32 @@ class Database:
                 )
             return bool(cur.rowcount)
 
+    def task_crawl_batch_id(self, task_id: str) -> str | None:
+        """Return the crawl batch a task belongs to, or None for a standalone task.
+        Used to route task-level retries of crawl media tasks back through the batch
+        endpoint so address/batch counters stay consistent."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT ca.batch_id FROM crawl_address_tasks cat
+                JOIN crawl_addresses ca ON ca.id=cat.address_id
+                WHERE cat.task_id=? LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        return str(row["batch_id"]) if row else None
+
+    def crawl_batch_cancel_requested(self, batch_id: str) -> bool | None:
+        """Cheap cancel-flag read for hot planning loops, avoiding get_crawl_batch's
+        full address + review load. None means the batch no longer exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cancel_requested FROM crawl_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return bool(row["cancel_requested"])
+
     def link_crawl_task(
         self,
         address_id: str,
@@ -1050,13 +2140,38 @@ class Database:
     ) -> None:
         now = time.time()
         with self._transaction() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO crawl_address_tasks(address_id, task_id, sequence_no, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (address_id, task_id, int(sequence_no), now),
-            )
+            # Re-planning re-links this address's tasks. Discovery for artist feeds often
+            # returns new works first, shifting positional sequence numbers, so a fresh
+            # task can request a sequence_no already owned by an older task. INSERT OR
+            # IGNORE would silently drop that link (UNIQUE(address_id, sequence_no)),
+            # leaving the new task invisible to counts / 补齐 / completion tracking.
+            # Instead: keep an existing (address, task) link untouched, take the requested
+            # slot when free, else append at MAX+1.
+            already_linked = conn.execute(
+                "SELECT 1 FROM crawl_address_tasks WHERE address_id=? AND task_id=?",
+                (address_id, task_id),
+            ).fetchone()
+            if already_linked is None:
+                slot_taken = conn.execute(
+                    "SELECT 1 FROM crawl_address_tasks WHERE address_id=? AND sequence_no=?",
+                    (address_id, int(sequence_no)),
+                ).fetchone()
+                if slot_taken is None:
+                    effective_sequence = int(sequence_no)
+                else:
+                    effective_sequence = int(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM crawl_address_tasks WHERE address_id=?",
+                            (address_id,),
+                        ).fetchone()[0]
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO crawl_address_tasks(address_id, task_id, sequence_no, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (address_id, task_id, effective_sequence, now),
+                )
             normalized_key = str(source_key or "").strip()
             if normalized_key:
                 conn.execute(
@@ -1074,21 +2189,20 @@ class Database:
                         now,
                     ),
                 )
-            row = conn.execute(
-                "SELECT batch_id FROM crawl_addresses WHERE id=?",
-                (address_id,),
-            ).fetchone()
-            if row:
-                conn.execute(
-                    """
-                    UPDATE crawl_batches SET task_count=(
-                        SELECT COUNT(*) FROM crawl_address_tasks cat
-                        JOIN crawl_addresses ca ON ca.id=cat.address_id
-                        WHERE ca.batch_id=crawl_batches.id
-                    ), updated_at=? WHERE id=?
-                    """,
-                    (now, row["batch_id"]),
-                )
+            if already_linked is None:
+                # Only a genuinely new link changes the batch total. Increment by one
+                # instead of re-running a full-batch COUNT subquery on every unit — that
+                # made planning an N-unit address O(N²). mark_crawl_address_running
+                # reconciles the exact value once the address is fully planned.
+                row = conn.execute(
+                    "SELECT batch_id FROM crawl_addresses WHERE id=?",
+                    (address_id,),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE crawl_batches SET task_count=task_count+1, updated_at=? WHERE id=?",
+                        (now, row["batch_id"]),
+                    )
 
     def succeeded_danbooru_source_keys(
         self,
@@ -1193,7 +2307,9 @@ class Database:
             self._refresh_crawl_batch_counts(conn, str(row["batch_id"]))
             return True
 
-    def mark_crawl_address_running(self, address_id: str, *, last_error: str = "") -> bool:
+    def mark_crawl_address_running(
+        self, address_id: str, *, last_error: str = "", planning_error: str = ""
+    ) -> bool:
         now = time.time()
         with self._transaction() as conn:
             count = int(
@@ -1207,11 +2323,25 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE crawl_addresses SET status='running', planned_task_count=?, updated_at=?,
-                    last_error=?
+                    last_error=?, planning_error=?
                 WHERE id=? AND status='planning'
                 """,
-                (count, now, redact_text(last_error, limit=2000), address_id),
+                (
+                    count,
+                    now,
+                    redact_text(last_error, limit=2000),
+                    redact_text(planning_error, limit=2000),
+                    address_id,
+                ),
             )
+            if cur.rowcount:
+                # Reconcile the batch counters once per address, now that link_crawl_task
+                # only increments task_count incrementally during planning.
+                batch_row = conn.execute(
+                    "SELECT batch_id FROM crawl_addresses WHERE id=?", (address_id,)
+                ).fetchone()
+                if batch_row:
+                    self._refresh_crawl_batch_counts(conn, str(batch_row["batch_id"]))
             return bool(cur.rowcount)
 
     def reset_crawl_address_planning(self, address_id: str, error: str = "") -> bool:
@@ -1289,6 +2419,15 @@ class Database:
                 ).fetchone()[0]
             )
 
+    def crawl_address_task_count(self, address_id: str) -> int:
+        with self._lock:
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM crawl_address_tasks WHERE address_id=?",
+                    (address_id,),
+                ).fetchone()[0]
+            )
+
     @staticmethod
     def _refresh_crawl_batch_counts(conn: sqlite3.Connection, batch_id: str) -> None:
         counts = conn.execute(
@@ -1346,7 +2485,7 @@ class Database:
             succeeded = statuses.count("succeeded")
             failed = statuses.count("failed")
             cancelled = statuses.count("cancelled")
-            planning_error = str(address["last_error"] or "")
+            planning_error = str(address["planning_error"] or "")
             status = "cancelled" if batch and batch["cancel_requested"] else "succeeded"
             if status != "cancelled" and (failed or cancelled or planning_error):
                 status = "failed"
@@ -1378,9 +2517,15 @@ class Database:
             conn.execute(
                 """
                 UPDATE crawl_addresses SET status='failed', finished_at=?, updated_at=?,
-                    last_error=? WHERE id=? AND status NOT IN ('succeeded','failed','cancelled')
+                    last_error=?, planning_error=? WHERE id=? AND status NOT IN ('succeeded','failed','cancelled')
                 """,
-                (now, now, redact_text(error, limit=2000), address_id),
+                (
+                    now,
+                    now,
+                    redact_text(error, limit=2000),
+                    redact_text(error, limit=2000),
+                    address_id,
+                ),
             )
             conn.execute(
                 "UPDATE crawl_batches SET last_error=?, updated_at=? WHERE id=?",
@@ -1397,6 +2542,11 @@ class Database:
             ).fetchone()
             if batch is None:
                 return False
+            if batch["status"] in TERMINAL_BATCH_STATUSES:
+                # Already finalized. Re-running the finish UPDATE would rewrite
+                # finished_at (which also reshuffles the pending-review claim order)
+                # every time a repeat cancel/retry call lands on a done batch.
+                return True
             rows = conn.execute(
                 "SELECT status FROM crawl_addresses WHERE batch_id=?",
                 (batch_id,),
@@ -1474,7 +2624,8 @@ class Database:
                         SELECT COUNT(*) FROM crawl_address_tasks cat
                         WHERE cat.address_id=crawl_addresses.id
                     ),
-                    last_error='后端重启时地址只完成了部分规划，等待已创建任务结束'
+                    last_error='后端重启时地址只完成了部分规划，等待已创建任务结束',
+                    planning_error='后端重启时地址只完成了部分规划，等待已创建任务结束'
                 WHERE status='planning' AND EXISTS (
                     SELECT 1 FROM crawl_address_tasks cat
                     WHERE cat.address_id=crawl_addresses.id

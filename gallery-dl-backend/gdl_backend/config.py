@@ -25,7 +25,12 @@ def _path(value: str | os.PathLike[str] | None, base: Path, default: Path) -> Pa
 def _paths(values: list[str] | None, base: Path, defaults: list[Path]) -> list[Path]:
     if not values:
         return [p.resolve() for p in defaults]
-    return [_path(value, base, base) for value in values]
+    # Drop empty/whitespace entries: _path("") resolves to `base`, which would silently
+    # widen an allow-list root to the whole config directory (e.g. exposing credentials/).
+    cleaned = [value for value in values if str(value).strip()]
+    if not cleaned:
+        return [p.resolve() for p in defaults]
+    return [_path(value, base, base) for value in cleaned]
 
 
 @dataclass(slots=True)
@@ -119,6 +124,27 @@ class SchedulerSettings:
     shutdown_grace_seconds: float = 15.0
     max_logs_per_task: int = 5000
     retry_jitter_seconds: float = 0.5
+    retry_backoff_cap_seconds: float = 300.0
+
+
+def _default_dedup_python() -> Path:
+    relative = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+    return (WORKSPACE_DIR / ".venv" / relative).resolve()
+
+
+@dataclass(slots=True)
+class DedupSettings:
+    enabled: bool = True
+    python_executable: Path = field(default_factory=_default_dedup_python)
+    worker_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "dedup_review_worker.py").resolve())
+    core_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "差分去除_优化版.py").resolve())
+    model_dir: Path = field(default_factory=lambda: (WORKSPACE_DIR / ".models").resolve())
+    device: str = "auto"
+    workers: int = field(default_factory=lambda: min(8, os.cpu_count() or 1))
+    poll_interval_seconds: float = 1.0
+    shutdown_grace_seconds: float = 10.0
+    no_sscd: bool = False
+    no_dino: bool = False
 
 
 DEFAULT_SITE_POLICY: dict[str, Any] = {
@@ -132,6 +158,7 @@ DEFAULT_SITE_POLICY: dict[str, Any] = {
     "http_timeout": 30.0,
     "gallery_retries": 2,
     "task_timeout_seconds": 0.0,
+    "download_stall_timeout_seconds": 180.0,
     "extra_args": [],
 }
 
@@ -151,6 +178,7 @@ class AppSettings:
     auth: AuthSettings = field(default_factory=AuthSettings)
     proxy: ProxySettings = field(default_factory=ProxySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+    dedup: DedupSettings = field(default_factory=DedupSettings)
     default_site_policy: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SITE_POLICY))
     config_path: Path | None = None
 
@@ -172,6 +200,7 @@ class AppSettings:
         auth_data = dict(data.get("auth") or {})
         proxy_data = dict(data.get("proxy") or {})
         scheduler_data = dict(data.get("scheduler") or {})
+        dedup_data = dict(data.get("dedup") or {})
 
         server = ServerSettings(
             host=str(os.environ.get("GDL_BACKEND_HOST", server_data.get("host", "127.0.0.1"))),
@@ -238,6 +267,38 @@ class AppSettings:
             shutdown_grace_seconds=max(1.0, float(scheduler_data.get("shutdown_grace_seconds", 15.0))),
             max_logs_per_task=max(100, int(scheduler_data.get("max_logs_per_task", 5000))),
             retry_jitter_seconds=max(0.0, float(scheduler_data.get("retry_jitter_seconds", 0.5))),
+            retry_backoff_cap_seconds=max(
+                1.0, float(scheduler_data.get("retry_backoff_cap_seconds", 300.0))
+            ),
+        )
+        dedup = DedupSettings(
+            enabled=bool(dedup_data.get("enabled", True)),
+            python_executable=_path(
+                dedup_data.get("python_executable"),
+                base,
+                _default_dedup_python(),
+            ),
+            worker_script=_path(
+                dedup_data.get("worker_script"),
+                base,
+                WORKSPACE_DIR / "dedup_review_worker.py",
+            ),
+            core_script=_path(
+                dedup_data.get("core_script"),
+                base,
+                WORKSPACE_DIR / "差分去除_优化版.py",
+            ),
+            model_dir=_path(
+                dedup_data.get("model_dir"),
+                base,
+                WORKSPACE_DIR / ".models",
+            ),
+            device=str(dedup_data.get("device", "auto")).strip().lower(),
+            workers=max(1, int(dedup_data.get("workers", min(8, os.cpu_count() or 1)))),
+            poll_interval_seconds=max(0.1, float(dedup_data.get("poll_interval_seconds", 1.0))),
+            shutdown_grace_seconds=max(1.0, float(dedup_data.get("shutdown_grace_seconds", 10.0))),
+            no_sscd=bool(dedup_data.get("no_sscd", False)),
+            no_dino=bool(dedup_data.get("no_dino", False)),
         )
 
         policy = dict(DEFAULT_SITE_POLICY)
@@ -254,6 +315,7 @@ class AppSettings:
             auth=auth,
             proxy=proxy,
             scheduler=scheduler,
+            dedup=dedup,
             default_site_policy=policy,
             config_path=config_path if config_path.is_file() else None,
         )
@@ -285,6 +347,12 @@ class AppSettings:
             raise ValueError("proxy.transport_core_base_port 必须位于 1024..65000")
         if self.proxy.transport_core_start_timeout_seconds <= 0:
             raise ValueError("proxy.transport_core_start_timeout_seconds 必须大于 0")
+        if self.dedup.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("dedup.device 必须是 auto、cpu 或 cuda")
+        if self.dedup.workers < 1:
+            raise ValueError("dedup.workers 必须大于等于 1")
+        if self.dedup.poll_interval_seconds <= 0 or self.dedup.shutdown_grace_seconds <= 0:
+            raise ValueError("去重轮询与退出等待时间必须大于 0")
         digest = self.proxy.transport_core_sha256
         if digest and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
             raise ValueError("proxy.transport_core_sha256 必须是 64 位十六进制 SHA-256")
@@ -312,10 +380,18 @@ class AppSettings:
                 candidate = self.default_output_root / candidate
         else:
             candidate = self.default_output_root / task_id
-        candidate = candidate.resolve()
+        try:
+            candidate = candidate.resolve()
+        except OSError as exc:
+            # Windows raises OSError (WinError 123) on illegal path chars like < > |;
+            # the caller only maps ValueError to a 422, so translate to keep it out of 500s.
+            raise ValueError("输出目录路径无效") from exc
         if not self._inside(candidate, self.allowed_output_roots):
             raise ValueError("输出目录超出 allowed_output_roots")
-        candidate.mkdir(parents=True, exist_ok=True)
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError("无法创建输出目录") from exc
         return candidate
 
     def allowed_file(self, value: str | None, roots: list[Path], label: str) -> Path | None:
@@ -324,7 +400,10 @@ class AppSettings:
         candidate = Path(os.path.expandvars(os.path.expanduser(value)))
         if not candidate.is_absolute():
             candidate = self.project_dir / candidate
-        candidate = candidate.resolve()
+        try:
+            candidate = candidate.resolve()
+        except OSError as exc:
+            raise ValueError(f"{label}路径无效") from exc
         if not self._inside(candidate, roots):
             raise ValueError(f"{label}超出配置的许可目录")
         if not candidate.is_file():
@@ -374,5 +453,16 @@ class AppSettings:
                 "transport_core_base_port": self.proxy.transport_core_base_port,
             },
             "scheduler": asdict(self.scheduler),
+            "dedup": {
+                "enabled": self.dedup.enabled,
+                "python_executable": str(self.dedup.python_executable),
+                "worker_script": str(self.dedup.worker_script),
+                "core_script": str(self.dedup.core_script),
+                "model_dir": str(self.dedup.model_dir),
+                "device": self.dedup.device,
+                "workers": self.dedup.workers,
+                "no_sscd": self.dedup.no_sscd,
+                "no_dino": self.dedup.no_dino,
+            },
             "default_site_policy": dict(self.default_site_policy),
         }

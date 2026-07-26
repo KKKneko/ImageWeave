@@ -25,6 +25,7 @@ def make_settings(root: Path) -> AppSettings:
     settings.server.allow_private_targets = True
     settings.scheduler.poll_interval_seconds = 0.05
     settings.scheduler.retry_jitter_seconds = 0.0
+    settings.dedup.enabled = False
     settings.ensure_directories()
     (root / "credentials").mkdir(parents=True, exist_ok=True)
     return settings
