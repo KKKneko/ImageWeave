@@ -34,7 +34,7 @@ Danbooru 公共抓取标记为无需登录。搜索和爬取请求未显式覆�
 下一轮调度自动继续。
 
 `DedupReviewManager` 在主进程中维护持久审核队列，但特征提取和模型推理由仓库根目录
-`.venv` 启动 `dedup_review_worker.py` 独立完成。worker 直接复用 `差分去除_优化版.py` 的
+`.venv` 启动 `dedup_review_worker.py` 独立完成。worker 直接复用 `dedup_core.py` 的
 L0-L2 分析和 `.models/embeddings.sqlite3` 缓存，只把审核清单写回运行目录；模型阶段不移动
 下载文件。服务同一时间只运行一个模型分析进程，退出时终止子进程，重启后重新认领中断任务。
 

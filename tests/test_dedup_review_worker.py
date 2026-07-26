@@ -7,7 +7,7 @@ import dedup_review_worker as worker
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("dedup_review_test_core", ROOT / "差分去除_优化版.py")
+SPEC = importlib.util.spec_from_file_location("dedup_review_test_core", ROOT / "dedup_core.py")
 CORE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CORE)
 

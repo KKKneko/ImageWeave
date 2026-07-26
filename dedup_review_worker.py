@@ -15,7 +15,7 @@ from typing import Any
 
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
-DEFAULT_CORE_SCRIPT = WORKSPACE_DIR / "差分去除_优化版.py"
+DEFAULT_CORE_SCRIPT = WORKSPACE_DIR / "dedup_core.py"
 DEFAULT_MODEL_DIR = WORKSPACE_DIR / ".models"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
 

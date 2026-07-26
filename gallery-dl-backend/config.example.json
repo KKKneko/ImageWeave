@@ -61,7 +61,7 @@
     "enabled": true,
     "python_executable": "",
     "worker_script": "../dedup_review_worker.py",
-    "core_script": "../差分去除_优化版.py",
+    "core_script": "../dedup_core.py",
     "model_dir": "../.models",
     "device": "auto",
     "workers": 8,

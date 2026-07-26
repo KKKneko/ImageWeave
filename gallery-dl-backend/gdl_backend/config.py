@@ -137,7 +137,7 @@ class DedupSettings:
     enabled: bool = True
     python_executable: Path = field(default_factory=_default_dedup_python)
     worker_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "dedup_review_worker.py").resolve())
-    core_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "差分去除_优化版.py").resolve())
+    core_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "dedup_core.py").resolve())
     model_dir: Path = field(default_factory=lambda: (WORKSPACE_DIR / ".models").resolve())
     device: str = "auto"
     workers: int = field(default_factory=lambda: min(8, os.cpu_count() or 1))
@@ -286,7 +286,7 @@ class AppSettings:
             core_script=_path(
                 dedup_data.get("core_script"),
                 base,
-                WORKSPACE_DIR / "差分去除_优化版.py",
+                WORKSPACE_DIR / "dedup_core.py",
             ),
             model_dir=_path(
                 dedup_data.get("model_dir"),

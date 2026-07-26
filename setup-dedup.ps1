@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
-$scriptPath = Join-Path $root "差分去除_优化版.py"
+$scriptPath = Join-Path $root "dedup_core.py"
 
 $env:HTTP_PROXY = $ProxyUrl
 $env:HTTPS_PROXY = $ProxyUrl

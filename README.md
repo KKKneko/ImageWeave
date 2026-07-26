@@ -57,7 +57,7 @@ SSCD、DINOv2 权重缓存到根目录 `.models`；它与 Linux 快速开始中�
 先模拟扫描：
 
 ```powershell
-python ".\差分去除_优化版.py" "图片目录" --dry-run --move-txt
+python ".\dedup_core.py" "图片目录" --dry-run --move-txt
 ```
 
 确认候选后移除 `--dry-run` 正式处理。脚本会自动切换到同目录 `.venv`，分层规则为：
@@ -70,7 +70,7 @@ python ".\差分去除_优化版.py" "图片目录" --dry-run --move-txt
 使用 `--no-sscd` 或 `--no-dino` 可关闭对应层；完整参数见：
 
 ```powershell
-python ".\差分去除_优化版.py" --help
+python ".\dedup_core.py" --help
 ```
 
 ## 聚合爬图到人工审核
