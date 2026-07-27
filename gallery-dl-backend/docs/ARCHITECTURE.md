@@ -17,9 +17,10 @@ FastAPI 同源挂载 `/ui/` 下的纯 HTML/CSS/JavaScript 测试台。界面直�
 代理池控制面运行在 FastAPI 主进程内：`proxy_sources` 先完成全部机场订阅、节点文件和内联节点的解析，再由 `NativeProxyPool` 管理轮换、原子租约和冷却。导入及探活没有节点数量上限。带认证的 HTTP 上游在租约期间由 `LocalHTTPForwarder` 暴露为随机本地端口，任务结束时同步关闭。普通 HTTP/SOCKS 代理直接交给 gallery-dl。
 
 站点授权控制面由 `AuthManager` 管理。X、Pixiv 与 EH 共用
-`credentials/managed/browser-profiles/shared/` 下的一个持久 Chrome Profile 和一个运行中宿主进程。
-后端以随机且非零的本地 DevTools 端口启动可见浏览器，端口只绑定 `127.0.0.1`；三个站点的授权
-流程串行创建独立标签页，完成、取消或超时后只关闭对应 Target。满足 X/EH 必需 Cookie 后原子写入
+`credentials/managed/browser-profiles/shared/` 下的一个持久 Chrome Profile；宿主进程按授权
+会话的需要启动。后端以随机且非零的本地 DevTools 端口启动可见浏览器，端口只绑定 `127.0.0.1`；
+三个站点的授权流程串行创建独立标签页，会话终结（成功、失败、取消或超时）时先关闭对应
+Target，再整体关闭宿主窗口，不留空白页；登录状态由磁盘 Profile 持久保留，下次授权自动重启宿主。满足 X/EH 必需 Cookie 后原子写入
 `credentials/managed/*.cookies.txt`，共享 Profile 中的 Cookie、本地存储和设备历史继续保留。
 Pixiv OAuth 由受控 gallery-dl 子进程完成，refresh-token
 先写入单次会话的隔离 cache，交换成功后再原子更新后端专用 cache，取消或失败会清理会话 cache；
@@ -40,6 +41,13 @@ L0-L2 分析和 `.models/embeddings.sqlite3` 缓存，只把审核清单写回�
 
 单站清理只删除后端导出的 Cookie 或 Pixiv Token。独立的共享 Profile 清理接口会先取消全部授权
 会话并关闭 Chrome 宿主，再删除整个 `shared/` 目录；导出凭证仍由站点接口分别管理。
+
+授权链路支持独立于抓取代理池的「授权专用代理」：`auth.authorization_proxy` 提供配置默认值，
+`PUT/DELETE /api/v1/auth/proxy` 的运行时设置持久化在托管元数据中并优先生效（空串覆盖表示强制
+直连）。生效时共享 Chrome 以 `--proxy-server` 启动（剥离内嵌凭证、`socks5h` 归一为 `socks5`，
+回环 DevTools 流量不受影响），Pixiv OAuth 子进程追加 `-o proxy=` 覆盖 token 交换；宿主按启动时
+代理记账，会话间宿主已自动关闭，罕见的存活宿主与新代理不一致时也会在下次授权关旧开新。地址校验只接受
+`http/https/socks4/socks5/socks5h` 且带显式端口的 `host:port` 形态。
 
 Clash YAML 隧道节点由 `TunnelTransportCore` 管理一个项目内核心子进程。后端生成一份最小运行配置，每个订阅节点对应一个仅绑定 `127.0.0.1` 的 HTTP listener，并用 listener 的 `proxy` 字段固定到该出站节点。核心只负责协议传输；调度、探活、租约、重试和冷却仍由 Python 控制面负责。
 

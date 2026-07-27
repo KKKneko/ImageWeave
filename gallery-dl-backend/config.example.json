@@ -30,7 +30,8 @@
   "auth": {
     "chrome_executable": "",
     "browser_login_timeout_seconds": 900,
-    "browser_poll_interval_seconds": 1
+    "browser_poll_interval_seconds": 1,
+    "authorization_proxy": ""
   },
   "proxy": {
     "enabled": true,

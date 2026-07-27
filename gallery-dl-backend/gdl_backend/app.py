@@ -44,6 +44,7 @@ from .redaction import redact_text
 from .review import DedupReviewManager, resolve_review_file
 from .scheduler import TaskScheduler
 from .schemas import (
+    AuthProxyUpdate,
     CrawlRerunRequest,
     CrawlRequest,
     ProxyProbeRequest,
@@ -401,6 +402,25 @@ def create_app(
     @api.get("/auth")
     async def auth_statuses(container: ServiceContainer = Depends(get_service)):
         return container.auth.statuses()
+
+    # 注意：/auth/proxy 必须先于 /auth/{site} 注册，否则会被当成站点名匹配。
+    @api.get("/auth/proxy")
+    async def auth_proxy_status(container: ServiceContainer = Depends(get_service)):
+        return container.auth.proxy_status()
+
+    @api.put("/auth/proxy")
+    async def auth_set_proxy(
+        payload: AuthProxyUpdate,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        try:
+            return await container.auth.set_authorization_proxy(payload.proxy_url)
+        except AuthError as exc:
+            _raise_auth_error(exc)
+
+    @api.delete("/auth/proxy")
+    async def auth_reset_proxy(container: ServiceContainer = Depends(get_service)):
+        return await container.auth.clear_authorization_proxy()
 
     @api.get("/auth/{site}")
     async def auth_status(site: str, container: ServiceContainer = Depends(get_service)):

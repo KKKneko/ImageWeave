@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gdl_backend.config import AppSettings
+from gdl_backend.config import AppSettings, normalize_authorization_proxy
 
 
 class ConfigDefaultsTests(unittest.TestCase):
@@ -81,6 +81,88 @@ class ConfigDefaultsTests(unittest.TestCase):
             )
             floored = AppSettings.load(config_path)
         self.assertEqual(floored.scheduler.retry_backoff_cap_seconds, 1.0)
+
+
+class AuthorizationProxyConfigTests(unittest.TestCase):
+    def test_default_is_direct_and_reported_as_none(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = AppSettings.load(Path(temporary) / "missing-config.json")
+        self.assertEqual(settings.auth.authorization_proxy, "")
+        self.assertIsNone(settings.public_dict()["auth"]["authorization_proxy"])
+
+    def test_configured_proxy_is_normalized_and_public(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"auth": {"authorization_proxy": " HTTP://127.0.0.1:7890/ "}}),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        self.assertEqual(settings.auth.authorization_proxy, "http://127.0.0.1:7890")
+        self.assertEqual(
+            settings.public_dict()["auth"]["authorization_proxy"],
+            "http://127.0.0.1:7890",
+        )
+
+    def test_invalid_proxy_rejected_at_load(self):
+        bad_values = [
+            "ftp://127.0.0.1:7890",
+            "127.0.0.1:7890",
+            "http://:7890",
+            "http://127.0.0.1",
+            "http://127.0.0.1:7890/path",
+            "socks5://user:pass@127.0.0.1:1080",
+        ]
+        for bad in bad_values:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config_path = root / "config.json"
+                config_path.write_text(
+                    json.dumps({"auth": {"authorization_proxy": bad}}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError, msg=bad):
+                    AppSettings.load(config_path)
+
+    def test_validate_rejects_directly_assigned_invalid_value(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = AppSettings.load(Path(temporary) / "missing-config.json")
+            settings.auth.authorization_proxy = "not-a-proxy"
+            with self.assertRaises(ValueError):
+                settings.validate()
+
+
+class NormalizeAuthorizationProxyTests(unittest.TestCase):
+    def test_valid_forms(self):
+        self.assertEqual(normalize_authorization_proxy(""), "")
+        self.assertEqual(normalize_authorization_proxy(None), "")
+        self.assertEqual(normalize_authorization_proxy("   "), "")
+        self.assertEqual(
+            normalize_authorization_proxy("http://user:pa55@10.0.0.2:8080"),
+            "http://user:pa55@10.0.0.2:8080",
+        )
+        self.assertEqual(
+            normalize_authorization_proxy("socks5h://127.0.0.1:7890"),
+            "socks5h://127.0.0.1:7890",
+        )
+        self.assertEqual(
+            normalize_authorization_proxy("socks5://[::1]:1080"),
+            "socks5://[::1]:1080",
+        )
+
+    def test_rejects_garbage(self):
+        bad_values = [
+            "http://127.0.0.1:7890 extra",
+            "http://127.0.0.1:notaport",
+            "https://127.0.0.1:7890?x=1",
+            "socks5://127.0.0.1:7890#frag",
+            "http://127.0\n.0.1:7890",
+            "http://127.0.0.1:7890/" + "a" * 300,
+        ]
+        for bad in bad_values:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                normalize_authorization_proxy(bad)
 
 
 if __name__ == "__main__":

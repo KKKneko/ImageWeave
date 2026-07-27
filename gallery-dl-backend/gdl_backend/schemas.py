@@ -348,3 +348,11 @@ class ProxyProbeRequest(BaseModel):
 
 class ProxyStopRequest(BaseModel):
     force: bool = False
+
+
+class AuthProxyUpdate(BaseModel):
+    """授权专用代理地址；空字符串表示直连。格式校验在 AuthManager 内完成。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proxy_url: str = Field(default="", max_length=300)

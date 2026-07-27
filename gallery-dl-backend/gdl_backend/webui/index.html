@@ -103,6 +103,15 @@
             </div>
           </div>
 
+          <div class="auth-proxy-row">
+            <label for="authProxyInput">授权专用代理</label>
+            <input id="authProxyInput" type="text" placeholder="http://127.0.0.1:7890（留空 = 直连）" spellcheck="false" autocomplete="off">
+            <button id="saveAuthProxy" class="button secondary compact" type="button">保存代理</button>
+            <button id="resetAuthProxy" class="button ghost compact" type="button">恢复配置默认</button>
+            <span id="authProxyHint" class="muted"></span>
+          </div>
+          <p id="authProxyFeedback" class="auth-feedback hidden" aria-live="polite"></p>
+
           <div id="authCards" class="auth-grid" aria-live="polite">
             <article class="auth-card" data-auth-card="danbooru">
               <div class="auth-card-title"><strong>Danbooru</strong><span class="auth-state">检测中</span></div>

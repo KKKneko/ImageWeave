@@ -268,6 +268,10 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary)
 .auth-center-heading h3 { margin: 1px 0 3px; font-size: 17px; }
 .auth-center-heading p { margin-bottom: 0; }
 .auth-toolbar { align-items: flex-end; gap: 8px; }
+.auth-proxy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 11px 0 9px; }
+.auth-proxy-row label { font-size: 12px; font-weight: 800; white-space: nowrap; }
+.auth-proxy-row input { flex: 1 1 250px; min-width: 200px; min-height: 34px; padding-block: 5px; font-size: 12px; }
+.auth-proxy-row .muted { flex-basis: 100%; font-size: 11px; }
 .compact-auth-field { min-width: 150px; }
 .compact-auth-field select { min-height: 34px; padding-block: 5px; font-size: 12px; }
 .auth-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-top: 13px; }
@@ -602,6 +606,8 @@ footer { display: flex; justify-content: center; gap: 14px; padding: 0 16px 30px
   .eh-tag-filter-controls .button { width: 100%; }
   .eh-tag-filter-legend a { width: 100%; margin-left: 0; }
   .auth-center-heading, .auth-toolbar, .oauth-controls { align-items: stretch; flex-direction: column; }
+  .auth-proxy-row { align-items: stretch; flex-direction: column; }
+  .auth-proxy-row input { min-width: 0; }
   .auth-grid { grid-template-columns: 1fr; }
   .compact-auth-field { width: 100%; }
 }

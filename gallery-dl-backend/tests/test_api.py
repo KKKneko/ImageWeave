@@ -48,6 +48,10 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="startPixivOAuth"', index.text)
         self.assertIn('id="cancelPixivOAuth"', index.text)
         self.assertIn('id="clearAuthBrowserProfile"', index.text)
+        self.assertIn('id="authProxyInput"', index.text)
+        self.assertIn('id="saveAuthProxy"', index.text)
+        self.assertIn('id="resetAuthProxy"', index.text)
+        self.assertIn("授权专用代理", index.text)
         self.assertIn('id="ehDownloadOptions"', index.text)
         self.assertIn('name="ehImageMode"', index.text)
         self.assertIn('id="ehGpPolicy"', index.text)
@@ -87,6 +91,8 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("importBrowserLogin", script.text)
         self.assertIn("schedulePixivOAuthPoll", script.text)
         self.assertIn("/api/v1/auth/browser-profile", script.text)
+        self.assertIn("/api/v1/auth/proxy", script.text)
+        self.assertIn("renderAuthProxy", script.text)
         self.assertIn("/review/decisions", script.text)
         self.assertIn("/review/start", script.text)
         self.assertIn("automatic_rejected_image_count", script.text)
@@ -101,11 +107,52 @@ class ApiTests(unittest.TestCase):
         self.assertIn(".eh-tag-filter", styles.text)
         self.assertIn(".eh-tag-option.exclude", styles.text)
         self.assertIn(".auth-center", styles.text)
+        self.assertIn(".auth-proxy-row", styles.text)
         self.assertIn(".oauth-panel", styles.text)
         self.assertIn(".segmented-control", styles.text)
         self.assertIn(".eh-download-options", styles.text)
         self.assertIn(".review-image-grid", styles.text)
         self.assertIn(".review-group.duplicate", styles.text)
+
+    def test_authorization_proxy_api_roundtrip(self):
+        # 路由顺序回归：/auth/proxy 不能被 /auth/{site} 当成站点名吃掉（那会 404）
+        initial = self.client.get("/api/v1/auth/proxy")
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertIsNone(initial.json()["proxy_url"])
+        self.assertEqual(initial.json()["source"], "none")
+
+        updated = self.client.put(
+            "/api/v1/auth/proxy", json={"proxy_url": "http://127.0.0.1:7890"}
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(updated.json()["source"], "runtime")
+
+        listing = self.client.get("/api/v1/auth")
+        self.assertEqual(
+            listing.json()["authorization_proxy"]["proxy_url"], "http://127.0.0.1:7890"
+        )
+
+        invalid = self.client.put(
+            "/api/v1/auth/proxy", json={"proxy_url": "ftp://127.0.0.1:21"}
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(invalid.json()["error"]["code"], "invalid_authorization_proxy")
+
+        unknown_field = self.client.put(
+            "/api/v1/auth/proxy", json={"proxy_url": "", "surprise": True}
+        )
+        self.assertEqual(unknown_field.status_code, 422)
+
+        direct = self.client.put("/api/v1/auth/proxy", json={"proxy_url": ""})
+        self.assertEqual(direct.status_code, 200, direct.text)
+        self.assertIsNone(direct.json()["proxy_url"])
+        self.assertEqual(direct.json()["source"], "runtime")
+
+        reset = self.client.delete("/api/v1/auth/proxy")
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertIsNone(reset.json()["proxy_url"])
+        self.assertEqual(reset.json()["source"], "none")
 
     def test_managed_auth_api_contract(self):
         listing = self.client.get("/api/v1/auth")

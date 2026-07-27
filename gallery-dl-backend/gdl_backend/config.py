@@ -6,10 +6,56 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_DIR.parent
+
+AUTH_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+
+
+def normalize_authorization_proxy(value: Any) -> str:
+    """校验并规范化授权专用代理地址；空值表示直连，非法值抛 ValueError。
+
+    同一个地址会同时交给 Chrome（--proxy-server）和 gallery-dl（-o proxy=），
+    所以这里只接受两边都能消费的形态：scheme://[user:pass@]host:port。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) > 300:
+        raise ValueError("代理地址过长")
+    if any(ord(char) <= 32 or ord(char) == 127 for char in text):
+        raise ValueError("代理地址包含空白或控制字符")
+    try:
+        parsed = urlsplit(text)
+    except ValueError as exc:
+        raise ValueError("代理地址无法解析") from exc
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in AUTH_PROXY_SCHEMES:
+        raise ValueError("仅支持 http/https/socks4/socks5/socks5h 代理，例如 http://127.0.0.1:7890")
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("代理主机或端口无效") from exc
+    if not hostname:
+        raise ValueError("代理地址缺少主机名")
+    if port is None:
+        raise ValueError("代理地址需要显式端口，例如 http://127.0.0.1:7890")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("代理地址不能包含路径或查询参数")
+    if scheme.startswith("socks") and (parsed.username or parsed.password):
+        raise ValueError("Chrome 不支持带账号密码的 SOCKS 代理，请改用 HTTP 代理或去掉凭证")
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{userinfo}{host}:{port}"
 
 
 def _path(value: str | os.PathLike[str] | None, base: Path, default: Path) -> Path:
@@ -93,6 +139,9 @@ class AuthSettings:
     chrome_executable: str = ""
     browser_login_timeout_seconds: float = 900.0
     browser_poll_interval_seconds: float = 1.0
+    # 授权专用代理：X/Pixiv/EH 登录授权全程（共享 Chrome 页面流量 + Pixiv token 交换）
+    # 走这个地址；与抓取用的代理池互不影响。空字符串 = 直连。
+    authorization_proxy: str = ""
 
 
 @dataclass(slots=True)
@@ -231,6 +280,7 @@ class AppSettings:
             browser_poll_interval_seconds=float(
                 auth_data.get("browser_poll_interval_seconds", 1.0)
             ),
+            authorization_proxy=str(auth_data.get("authorization_proxy") or "").strip(),
         )
         node_file_value = proxy_data.get("node_file")
         transport_core_binary_value = proxy_data.get("transport_core_binary")
@@ -335,6 +385,12 @@ class AppSettings:
             raise ValueError("auth.browser_login_timeout_seconds 必须大于 0")
         if self.auth.browser_poll_interval_seconds <= 0:
             raise ValueError("auth.browser_poll_interval_seconds 必须大于 0")
+        try:
+            self.auth.authorization_proxy = normalize_authorization_proxy(
+                self.auth.authorization_proxy
+            )
+        except ValueError as exc:
+            raise ValueError(f"auth.authorization_proxy 无效: {exc}") from exc
         if not 1 <= int(self.proxy.probe_workers) <= 64:
             raise ValueError("proxy.probe_workers 必须位于 1..64")
         if self.proxy.probe_timeout_seconds <= 0 or self.proxy.subscription_timeout_seconds <= 0:
@@ -434,6 +490,7 @@ class AppSettings:
                 "chrome_configured": bool(self.auth.chrome_executable.strip()),
                 "browser_login_timeout_seconds": self.auth.browser_login_timeout_seconds,
                 "browser_poll_interval_seconds": self.auth.browser_poll_interval_seconds,
+                "authorization_proxy": self.auth.authorization_proxy or None,
             },
             "proxy": {
                 "enabled": self.proxy.enabled,

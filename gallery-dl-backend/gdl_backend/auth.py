@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .config import AppSettings
+from .config import AppSettings, normalize_authorization_proxy
 from .file_security import secure_private_path
 from .managed_browser import (
     MANAGED_BROWSER_SITES,
@@ -46,6 +46,23 @@ COOKIE_LABELS = {
     "exhentai": "EH 导出凭证",
 }
 PIXIV_LOGIN_URL_RE = re.compile(r"https://app-api\.pixiv\.net/web/v1/login\?[^\s]+")
+# auth-metadata.json 以站点名为键；下划线前缀保证与 SUPPORTED_AUTH_SITES 永不冲突。
+AUTH_PROXY_METADATA_KEY = "_authorization_proxy"
+
+
+def chrome_proxy_server(proxy_url: str) -> str:
+    """把授权代理地址转成 Chrome --proxy-server 参数值。
+
+    Chrome 的该参数不接受内嵌账号密码（HTTP 代理会改走 407 弹窗），也不认识
+    socks5h/socks4a 方案名，这里剥掉 userinfo 并归一 scheme。
+    """
+    parsed = urlsplit(proxy_url)
+    scheme = (parsed.scheme or "").lower()
+    scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(scheme, scheme)
+    hostname = parsed.hostname or ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = parsed.port
+    return f"{scheme}://{host}:{port}" if port is not None else f"{scheme}://{host}"
 
 
 class AuthError(RuntimeError):
@@ -123,6 +140,7 @@ class ManagedBrowserHost:
     profile_dir: Path
     debug_port: int
     websocket_url: str
+    proxy_url: str = ""
 
 
 class AuthManager:
@@ -261,6 +279,71 @@ class AuthManager:
             "sites": ["twitter", "pixiv", "exhentai"],
         }
 
+    def _authorization_proxy_override(self) -> dict[str, Any] | None:
+        value = self._metadata().get(AUTH_PROXY_METADATA_KEY)
+        return value if isinstance(value, dict) and "url" in value else None
+
+    def authorization_proxy(self) -> str:
+        """当前生效的授权专用代理；界面保存的运行时值优先于 config.json。"""
+        override = self._authorization_proxy_override()
+        if override is not None:
+            try:
+                return normalize_authorization_proxy(override.get("url"))
+            except ValueError:
+                # 手改 metadata 导致的坏值不让授权流程崩掉，退回配置文件。
+                override = None
+        try:
+            return normalize_authorization_proxy(self.settings.auth.authorization_proxy)
+        except ValueError:
+            return ""
+
+    def proxy_status(self) -> dict[str, Any]:
+        override = self._authorization_proxy_override()
+        if override is not None:
+            try:
+                normalize_authorization_proxy(override.get("url"))
+            except ValueError:
+                override = None
+        try:
+            config_proxy = normalize_authorization_proxy(self.settings.auth.authorization_proxy)
+        except ValueError:
+            config_proxy = ""
+        effective = normalize_authorization_proxy(override.get("url")) if override else config_proxy
+        if override is not None:
+            source = "runtime"
+        elif config_proxy:
+            source = "config"
+        else:
+            source = "none"
+        host = self._browser_host
+        browser_running = bool(host and host.process.returncode is None)
+        return {
+            "proxy_url": effective or None,
+            "source": source,
+            "config_proxy_url": config_proxy or None,
+            "browser_running": browser_running,
+            "browser_proxy_url": (host.proxy_url or None) if browser_running else None,
+            "restart_pending": bool(browser_running and host.proxy_url != effective),
+            "updated_at": override.get("updated_at") if override else None,
+        }
+
+    async def set_authorization_proxy(self, value: str) -> dict[str, Any]:
+        try:
+            normalized = normalize_authorization_proxy(value)
+        except ValueError as exc:
+            raise AuthError("invalid_authorization_proxy", f"授权专用代理地址无效: {exc}") from exc
+        async with self._lock:
+            self._update_metadata(
+                AUTH_PROXY_METADATA_KEY,
+                {"url": normalized, "updated_at": time.time()},
+            )
+        return self.proxy_status()
+
+    async def clear_authorization_proxy(self) -> dict[str, Any]:
+        async with self._lock:
+            self._update_metadata(AUTH_PROXY_METADATA_KEY, None)
+        return self.proxy_status()
+
     async def _close_browser_host_instance(self, host: ManagedBrowserHost) -> None:
         if host.websocket_url:
             await asyncio.to_thread(close_browser, host.websocket_url)
@@ -279,8 +362,15 @@ class AuthManager:
 
     async def _ensure_browser_host(self) -> ManagedBrowserHost:
         async with self._host_lock:
+            proxy_url = self.authorization_proxy()
             host = self._browser_host
-            if host is not None and host.process.returncode is None:
+            # --proxy-server 只能在启动时注入：代理变更后已运行的宿主必须重启，
+            # 否则本次授权仍走旧线路。
+            if (
+                host is not None
+                and host.process.returncode is None
+                and host.proxy_url == proxy_url
+            ):
                 endpoint = await asyncio.to_thread(read_browser_websocket, host.debug_port)
                 if endpoint:
                     host.websocket_url = endpoint[1]
@@ -321,8 +411,11 @@ class AuthManager:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-default-apps",
-                "about:blank",
             ]
+            if proxy_url:
+                # Chrome 默认对回环地址绕过代理，DevTools 端口不受影响。
+                command.append(f"--proxy-server={chrome_proxy_server(proxy_url)}")
+            command.append("about:blank")
             kwargs: dict[str, Any] = {
                 "stdout": asyncio.subprocess.DEVNULL,
                 "stderr": asyncio.subprocess.DEVNULL,
@@ -359,6 +452,7 @@ class AuthManager:
                 profile_dir=profile_dir,
                 debug_port=debug_port,
                 websocket_url=websocket_url,
+                proxy_url=proxy_url,
             )
             self._browser_host = host
             return host
@@ -594,6 +688,7 @@ class AuthManager:
         return {
             "items": [self.status(site) for site in SUPPORTED_AUTH_SITES],
             "browser_profile": self.browser_profile_status(),
+            "authorization_proxy": self.proxy_status(),
             "managed": True,
             "secrets_exposed": False,
         }
@@ -717,6 +812,9 @@ class AuthManager:
                 session.message = session.error
         finally:
             await self._close_browser_target(session)
+            # 会话终结即关闭共享浏览器窗口，不留 about:blank 空壳；登录状态保留在
+            # 磁盘 Profile。此时授权占用尚未释放，start_* 均被拒，宿主无并发使用者。
+            await self._stop_browser_host()
             await self._release_authorization(session.id)
 
     async def start_browser_login(self, site: str) -> dict[str, Any]:
@@ -924,6 +1022,8 @@ class AuthManager:
                 self._cleanup_oauth_cache(session.cache_file)
         finally:
             await self._close_pixiv_target(session)
+            # 与 X/EH 流程一致：会话终结即关闭共享浏览器窗口，Profile 保留。
+            await self._stop_browser_host()
             await self._release_authorization(session.id)
 
     async def start_pixiv_oauth(self) -> dict[str, Any]:
@@ -959,8 +1059,12 @@ class AuthManager:
             "extractor.oauth.browser=false",
             "-o",
             "extractor.oauth.input=true",
-            "oauth:pixiv",
         ]
+        proxy_url = self.authorization_proxy()
+        if proxy_url:
+            # 覆盖 gallery-dl 侧的 token 交换请求（oauth.secure.pixiv.net）。
+            command += ["-o", f"proxy={proxy_url}"]
+        command.append("oauth:pixiv")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"

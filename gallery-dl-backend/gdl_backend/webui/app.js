@@ -375,6 +375,37 @@ function setAuthFeedback(site, message = "", kind = "") {
   feedback.classList.toggle("hidden", !message);
 }
 
+function setAuthProxyFeedback(message = "", kind = "") {
+  const feedback = $("#authProxyFeedback");
+  if (!feedback) return;
+  feedback.textContent = message;
+  feedback.classList.remove("success", "error");
+  if (kind) feedback.classList.add(kind);
+  feedback.classList.toggle("hidden", !message);
+}
+
+const AUTH_PROXY_SOURCE_NAMES = { runtime: "界面设置", config: "配置文件", none: "未设置（直连）" };
+
+function renderAuthProxy(info) {
+  const input = $("#authProxyInput");
+  const hint = $("#authProxyHint");
+  if (!input || !hint) return;
+  state.authProxy = info || null;
+  if (!info) {
+    hint.textContent = "";
+    return;
+  }
+  // 正在编辑时不覆盖输入框内容
+  if (document.activeElement !== input) input.value = info.proxy_url || "";
+  const parts = [`来源：${AUTH_PROXY_SOURCE_NAMES[info.source] || info.source || "未知"}`];
+  if (info.restart_pending) {
+    parts.push("共享浏览器仍在旧线路运行，下次授权自动按新代理重启");
+  } else if (info.browser_running && info.proxy_url) {
+    parts.push("共享浏览器已按此代理运行");
+  }
+  hint.textContent = parts.join(" · ");
+}
+
 function stopBrowserLoginPolling(site) {
   const timer = state.browserLoginPollers.get(site);
   if (timer) clearTimeout(timer);
@@ -540,6 +571,7 @@ async function refreshAuthStatus(quiet = true) {
   try {
     const response = await api("/api/v1/auth");
     (response.items || []).forEach(renderAuthStatus);
+    renderAuthProxy(response.authorization_proxy || null);
     if (!quiet) appendLog("站点授权状态已刷新。", "success");
     return response;
   } catch (error) {
@@ -653,6 +685,39 @@ async function clearAuthBrowserProfile(element) {
       appendLog("共享授权浏览器 Profile 已清空；后端导出凭证保持原样。", "success");
     } catch (error) {
       appendLog(`清空授权浏览器：${formatError(error)}`, "error");
+    }
+  });
+}
+
+async function saveAuthProxy(element) {
+  const input = $("#authProxyInput");
+  const value = (input?.value || "").trim();
+  await withBusy(element, "保存中…", async () => {
+    try {
+      const info = await api("/api/v1/auth/proxy", { method: "PUT", body: { proxy_url: value } });
+      renderAuthProxy(info);
+      const message = info.proxy_url
+        ? `授权流量将通过 ${info.proxy_url}${info.restart_pending ? "（下次授权生效）" : ""}`
+        : "授权已设置为直连。";
+      setAuthProxyFeedback(message, "success");
+      appendLog(`授权专用代理已更新：${info.proxy_url || "直连"}`, "success");
+    } catch (error) {
+      setAuthProxyFeedback(formatError(error), "error");
+    }
+  });
+}
+
+async function resetAuthProxy(element) {
+  await withBusy(element, "恢复中…", async () => {
+    try {
+      const info = await api("/api/v1/auth/proxy", { method: "DELETE" });
+      renderAuthProxy(info);
+      setAuthProxyFeedback(
+        info.proxy_url ? `已恢复为配置文件代理 ${info.proxy_url}` : "已恢复为配置文件默认（直连）。",
+        "success",
+      );
+    } catch (error) {
+      setAuthProxyFeedback(formatError(error), "error");
     }
   });
 }
@@ -1985,6 +2050,14 @@ function bindEvents() {
   });
   $("#refreshAuth").addEventListener("click", (event) => {
     withBusy(event.currentTarget, "刷新中…", () => refreshAuthStatus(false));
+  });
+  $("#saveAuthProxy").addEventListener("click", (event) => saveAuthProxy(event.currentTarget));
+  $("#resetAuthProxy").addEventListener("click", (event) => resetAuthProxy(event.currentTarget));
+  $("#authProxyInput").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      saveAuthProxy($("#saveAuthProxy"));
+    }
   });
   $("#clearAuthBrowserProfile").addEventListener("click", (event) => {
     clearAuthBrowserProfile(event.currentTarget);

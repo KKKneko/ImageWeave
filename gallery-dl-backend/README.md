@@ -21,6 +21,12 @@
 站点授权需要桌面环境中的 Chrome、Chromium 或 Chromium Browser。非标准路径通过
 `auth.chrome_executable` 配置。
 
+X、Pixiv、EH 登录授权可通过 `auth.authorization_proxy`（或授权面板中的「授权专用代理」
+输入框，运行时设置优先并持久化）指定一个独立代理，例如 `http://127.0.0.1:7890`；
+共享授权 Chrome 的页面流量与 Pixiv token 交换全程经该代理，与抓取用的代理池互不影响，
+留空则直连。支持 http/https/socks4/socks5/socks5h，地址需带显式端口。授权会话结束后
+共享浏览器窗口自动关闭，登录状态保留在项目 Profile，下次授权自动重新拉起。
+
 ## 主要能力
 
 - 搜索 Danbooru、E-Hentai/ExHentai 与 Pawchive，并从 Danbooru 画师资料补充已验证的 X/Pixiv 账号；
