@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from dedup_resources import build_resource_profile, configure_process_resources
+
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
 DEFAULT_CORE_SCRIPT = WORKSPACE_DIR / "dedup_core.py"
@@ -349,23 +351,56 @@ def build_manifest(
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = path.absolute()
+    for candidate in (*reversed(path.parents), path):
+        if candidate.is_symlink():
+            raise ValueError("审核清单路径不能包含符号链接")
+    parent_existed = path.parent.exists()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # 只收紧由 worker 新建的专用目录；已有外部父目录保持用户权限策略。
+    if not parent_existed:
+        path.parent.chmod(0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    if temporary.is_symlink():
+        raise ValueError("审核清单临时路径不能是符号链接")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_NOFOLLOW", 0))
+    created = False
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        created = True
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                manifest,
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        if any(candidate.is_symlink() for candidate in (*reversed(path.parents), path)):
+            raise ValueError("审核清单路径不能包含符号链接")
+        os.replace(temporary, path)
+        created = False
+        path.chmod(0o600)
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
+    if os.name != "nt":
+        os.umask(0o077)
+    started_at = time.perf_counter()
     parser = argparse.ArgumentParser(description="为聚合爬图批次生成 L0-L2 全图片审核清单")
     parser.add_argument("root", type=Path, help="批次图片根目录")
     parser.add_argument("--output", type=Path, required=True, help="审核清单 JSON 输出路径")
     parser.add_argument("--core-script", type=Path, default=DEFAULT_CORE_SCRIPT)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument("--workers", type=int, default=0, help="0=按设备与 CPU 数量选择")
+    parser.add_argument("--torch-threads", type=int, default=0, help="0=按设备选择")
+    parser.add_argument("--torch-interop-threads", type=int, default=0, help="0=按设备选择")
+    parser.add_argument("--deep-batch-size", type=int, default=0, help="0=按设备选择")
+    parser.add_argument("--neighbor-block-size", type=int, default=0, help="0=按设备选择")
     parser.add_argument("--no-sscd", action="store_true")
     parser.add_argument("--no-dino", action="store_true")
     args = parser.parse_args()
@@ -373,8 +408,34 @@ def main() -> int:
     root = args.root.resolve()
     if not root.is_dir():
         parser.error(f"批次图片目录不存在: {root}")
-    if args.workers < 1:
-        parser.error("--workers 必须大于等于 1")
+    resource_values = {
+        "--workers": (args.workers, 64),
+        "--torch-threads": (args.torch_threads, 128),
+        "--torch-interop-threads": (args.torch_interop_threads, 16),
+        "--deep-batch-size": (args.deep_batch_size, 128),
+        "--neighbor-block-size": (args.neighbor_block_size, 8192),
+    }
+    for name, (value, maximum) in resource_values.items():
+        if not 0 <= value <= maximum:
+            parser.error(f"{name} 必须是 0（自动）或 1..{maximum}")
+
+    profile = build_resource_profile(
+        args.device,
+        workers=args.workers,
+        torch_threads=args.torch_threads,
+        torch_interop_threads=args.torch_interop_threads,
+        deep_batch_size=args.deep_batch_size,
+        neighbor_block_size=args.neighbor_block_size,
+    )
+    actual_resources = configure_process_resources(profile)
+    print(
+        "去重资源参数："
+        f"device={args.device}, workers={profile.workers}, "
+        f"batch={profile.deep_batch_size}, torch={actual_resources.get('torch_threads') or '原有默认'}, "
+        f"interop={actual_resources.get('torch_interop_threads') or '原有默认'}, "
+        f"neighbor_block={profile.neighbor_block_size}",
+        flush=True,
+    )
 
     core = load_core(args.core_script.resolve())
     core_arguments = [
@@ -386,7 +447,15 @@ def main() -> int:
         "--device",
         args.device,
         "--workers",
-        str(args.workers),
+        str(profile.workers),
+        "--torch-threads",
+        str(profile.torch_threads or 0),
+        "--torch-interop-threads",
+        str(profile.torch_interop_threads or 0),
+        "--deep-batch-size",
+        str(profile.deep_batch_size),
+        "--neighbor-block-size",
+        str(profile.neighbor_block_size),
     ]
     if args.no_sscd:
         core_arguments.append("--no-sscd")
@@ -394,11 +463,15 @@ def main() -> int:
         core_arguments.append("--no-dino")
     core_parser = core.build_argument_parser()
     core_args = core_parser.parse_args(core_arguments)
+    core_args.model_decode_workers = profile.model_decode_workers
     core.validate_args(core_parser, core_args)
 
+    scan_started = time.perf_counter()
     image_paths = find_review_images(root)
+    scan_elapsed = time.perf_counter() - scan_started
+    preprocess_started = time.perf_counter()
     image_infos: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ThreadPoolExecutor(max_workers=profile.workers) as executor:
         futures = {executor.submit(core.get_image_info, path): path for path in image_paths}
         for future in as_completed(futures):
             result = future.result()
@@ -406,29 +479,52 @@ def main() -> int:
                 image_infos.append(result)
 
     image_infos.sort(key=lambda info: normalized_path(info["path"]))
+    preprocess_elapsed = time.perf_counter() - preprocess_started
+    analysis_started = time.perf_counter()
     if image_infos:
         auto_groups, review_groups = core.analyze_images(image_infos, core_args)
     else:
         auto_groups, review_groups = [], []
+    analysis_elapsed = time.perf_counter() - analysis_started
+    manifest_started = time.perf_counter()
     manifest = build_manifest(root, image_paths, image_infos, auto_groups, review_groups, core)
+    manifest_elapsed = time.perf_counter() - manifest_started
     actual_device = args.device
     if not args.no_sscd or not args.no_dino:
         from dedup_models import resolve_device
 
         actual_device = resolve_device(args.device)
+    try:
+        import torch
+
+        actual_resources["torch_threads"] = int(torch.get_num_threads())
+        actual_resources["torch_interop_threads"] = int(torch.get_num_interop_threads())
+    except ImportError:
+        pass
+    timings = {
+        "scan": round(scan_elapsed, 6),
+        "preprocess": round(preprocess_elapsed, 6),
+        "analysis": round(analysis_elapsed, 6),
+        "manifest_build": round(manifest_elapsed, 6),
+        "total_before_write": round(time.perf_counter() - started_at, 6),
+    }
     manifest["analysis"] = {
         "device": actual_device,
+        "configured_device": args.device,
         "models": {
             "sscd": not args.no_sscd,
             "dinov2": not args.no_dino,
         },
+        "resources": actual_resources,
+        "timings_seconds": timings,
     }
-    write_manifest(args.output.resolve(), manifest)
+    write_manifest(args.output.absolute(), manifest)
     print(
         "审核清单完成: "
         f"{manifest['counts']['images']} 张图片, "
         f"严格自动淘汰 {manifest['counts']['automatic_rejected_images']} 张, "
-        f"{manifest['counts']['duplicate_groups']} 个人工重复组"
+        f"{manifest['counts']['duplicate_groups']} 个人工重复组; "
+        f"分析 {timings['analysis']:.3f}s，总计 {timings['total_before_write']:.3f}s"
     )
     return 0
 

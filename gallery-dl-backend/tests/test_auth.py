@@ -527,8 +527,21 @@ class AuthManagerTests(unittest.TestCase):
                 ),
                 patch("gdl_backend.auth.close_browser") as close_browser,
             ):
-                await self.auth.set_authorization_proxy("http://user:secret@127.0.0.1:7890")
+                public_status = await self.auth.set_authorization_proxy(
+                    "http://user:secret@127.0.0.1:7890"
+                )
+                self.assertEqual(public_status["proxy_url"], "http://***@127.0.0.1:7890")
+                self.assertTrue(public_status["credentials_redacted"])
+                self.assertNotIn("user", str(public_status))
+                self.assertNotIn("secret", str(public_status))
+
                 first = await self.auth._ensure_browser_host()
+                running_status = self.auth.proxy_status()
+                self.assertEqual(
+                    running_status["browser_proxy_url"],
+                    "http://***@127.0.0.1:7890",
+                )
+                self.assertNotIn("secret", str(running_status))
                 command = spawn.await_args.args
                 # Chrome 参数剥离凭证；完整地址只进 gallery-dl
                 self.assertIn("--proxy-server=http://127.0.0.1:7890", command)

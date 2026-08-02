@@ -1,7 +1,13 @@
 import importlib.util
+import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from dedup_resources import build_resource_profile
 
 import dedup_review_worker as worker
 
@@ -37,6 +43,61 @@ def image_info(path: Path, rank: int) -> dict:
 
 
 class ReviewManifestTests(unittest.TestCase):
+    def test_cpu_profile_is_bounded_and_allows_explicit_override(self):
+        profile = build_resource_profile("cpu", cpu_count=64)
+        self.assertLessEqual(profile.workers, 4)
+        self.assertLessEqual(profile.torch_threads or 0, 4)
+        self.assertLessEqual(profile.deep_batch_size, 4)
+        self.assertLessEqual(profile.neighbor_block_size, 256)
+        overridden = build_resource_profile(
+            "cpu",
+            cpu_count=16,
+            workers=3,
+            torch_threads=2,
+            torch_interop_threads=1,
+            deep_batch_size=5,
+            neighbor_block_size=96,
+        )
+        cuda_profile = build_resource_profile("cuda", cpu_count=16)
+        self.assertEqual(cuda_profile.workers, 8)
+        self.assertEqual(cuda_profile.model_decode_workers, 4)
+        self.assertEqual(
+            (
+                overridden.workers,
+                overridden.torch_threads,
+                overridden.torch_interop_threads,
+                overridden.deep_batch_size,
+                overridden.neighbor_block_size,
+            ),
+            (3, 2, 1, 5, 96),
+        )
+
+    def test_empty_cpu_worker_records_real_resources_and_timings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "managed" / "manifest.json"
+            arguments = [
+                "dedup_review_worker.py",
+                str(root),
+                "--output",
+                str(output),
+                "--device",
+                "cpu",
+                "--no-sscd",
+                "--no-dino",
+            ]
+            with patch.object(sys, "argv", arguments):
+                self.assertEqual(worker.main(), 0)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            analysis = manifest["analysis"]
+            self.assertEqual(analysis["device"], "cpu")
+            self.assertGreaterEqual(analysis["resources"]["workers"], 1)
+            self.assertGreaterEqual(analysis["resources"]["torch_threads"], 1)
+            self.assertIn("analysis", analysis["timings_seconds"])
+            if os.name != "nt":
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
+
     def test_original_auto_winner_is_kept_and_only_losers_are_marked_automatic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

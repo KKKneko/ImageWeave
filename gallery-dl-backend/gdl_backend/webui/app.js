@@ -395,9 +395,15 @@ function renderAuthProxy(info) {
     hint.textContent = "";
     return;
   }
-  // 正在编辑时不覆盖输入框内容
-  if (document.activeElement !== input) input.value = info.proxy_url || "";
+  // 含凭据代理只展示脱敏地址，不把秘密回填到 DOM；输入新地址即可覆盖。
+  if (document.activeElement !== input) {
+    input.value = info.credentials_redacted ? "" : (info.proxy_url || "");
+    input.placeholder = info.credentials_redacted
+      ? `${info.proxy_url}（凭据已隐藏；输入新地址覆盖）`
+      : "http://127.0.0.1:7890（留空 = 直连）";
+  }
   const parts = [`来源：${AUTH_PROXY_SOURCE_NAMES[info.source] || info.source || "未知"}`];
+  if (info.credentials_redacted) parts.push("代理凭据已隐藏");
   if (info.restart_pending) {
     parts.push("共享浏览器仍在旧线路运行，下次授权自动按新代理重启");
   } else if (info.browser_running && info.proxy_url) {

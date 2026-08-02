@@ -19,7 +19,12 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .config import AppSettings, normalize_authorization_proxy
-from .file_security import secure_private_path
+from .file_security import (
+    ensure_private_directory,
+    secure_private_path,
+    secure_sqlite_files,
+    write_private_text,
+)
 from .managed_browser import (
     MANAGED_BROWSER_SITES,
     allocate_debug_port,
@@ -34,6 +39,7 @@ from .managed_browser import (
     write_netscape_cookies,
 )
 from .process_control import terminate_process
+from .proxy_runtime import mask_proxy
 
 
 SUPPORTED_AUTH_SITES = ("danbooru", "twitter", "pixiv", "exhentai", "pawchive")
@@ -148,15 +154,20 @@ class AuthManager:
 
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
-        self.managed_dir = (settings.allowed_cookie_roots[0] / "managed").resolve()
-        self.managed_dir.mkdir(parents=True, exist_ok=True)
-        secure_private_path(self.managed_dir)
-        self.browser_profiles_dir = (self.managed_dir / "browser-profiles").resolve()
-        self.browser_profiles_dir.mkdir(parents=True, exist_ok=True)
-        secure_private_path(self.browser_profiles_dir)
-        self.browser_profile_dir = (self.browser_profiles_dir / "shared").resolve()
-        self.cache_file = settings.gallery.cache_file.resolve()
-        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.managed_dir = Path(
+            os.path.abspath(os.fspath(settings.allowed_cookie_roots[0] / "managed"))
+        )
+        ensure_private_directory(self.managed_dir)
+        self.browser_profiles_dir = self.managed_dir / "browser-profiles"
+        ensure_private_directory(self.browser_profiles_dir)
+        self.browser_profile_dir = self.browser_profiles_dir / "shared"
+        self.cache_file = Path(os.path.abspath(os.fspath(settings.gallery.cache_file)))
+        ensure_private_directory(
+            self.cache_file.parent,
+            repair_existing=settings.is_dedicated_credentials_directory(
+                self.cache_file.parent
+            ),
+        )
         self.metadata_file = self.managed_dir / "auth-metadata.json"
         self._lock = asyncio.Lock()
         self._host_lock = asyncio.Lock()
@@ -188,18 +199,27 @@ class AuthManager:
         return (base / "gallery-dl" / "cache.sqlite3").resolve()
 
     def _ensure_cache(self, cache_file: Path | None = None) -> None:
-        cache_file = (cache_file or self.cache_file).resolve()
+        cache_file = Path(os.path.abspath(os.fspath(cache_file or self.cache_file)))
         try:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            os.close(os.open(cache_file, os.O_CREAT | os.O_RDONLY, 0o600))
+            private_parent = (
+                self.settings.is_dedicated_credentials_directory(cache_file.parent)
+                or self.settings._lexically_inside(cache_file.parent, self.managed_dir)
+            )
+            ensure_private_directory(
+                cache_file.parent,
+                repair_existing=private_parent,
+            )
+            secure_sqlite_files(cache_file)
+            flags = os.O_CREAT | os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0))
+            os.close(os.open(cache_file, flags, 0o600))
             with closing(sqlite3.connect(cache_file)) as db:
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS data "
                     "(key TEXT PRIMARY KEY, value TEXT, expires INTEGER)"
                 )
                 db.commit()
-            secure_private_path(cache_file)
-        except OSError as exc:
+            secure_sqlite_files(cache_file)
+        except (OSError, PermissionError, ValueError) as exc:
             raise RuntimeError(f"初始化 gallery-dl 授权缓存失败: {exc}") from exc
 
     def _migrate_default_pixiv_cache(self) -> None:
@@ -317,12 +337,21 @@ class AuthManager:
             source = "none"
         host = self._browser_host
         browser_running = bool(host and host.process.returncode is None)
+        effective_has_credentials = bool(
+            effective
+            and (urlsplit(effective).username is not None or urlsplit(effective).password is not None)
+        )
         return {
-            "proxy_url": effective or None,
+            # 状态接口和 WebUI 只接收脱敏地址；完整值仅由 authorization_proxy()
+            # 在进程内部交给 Chrome/gallery-dl，避免凭据进入页面、日志或 API 响应。
+            "proxy_url": mask_proxy(effective) if effective else None,
             "source": source,
-            "config_proxy_url": config_proxy or None,
+            "config_proxy_url": mask_proxy(config_proxy) if config_proxy else None,
+            "credentials_redacted": effective_has_credentials,
             "browser_running": browser_running,
-            "browser_proxy_url": (host.proxy_url or None) if browser_running else None,
+            "browser_proxy_url": (
+                mask_proxy(host.proxy_url) if browser_running and host.proxy_url else None
+            ),
             "restart_pending": bool(browser_running and host.proxy_url != effective),
             "updated_at": override.get("updated_at") if override else None,
         }
@@ -391,8 +420,7 @@ class AuthManager:
                 ) from exc
 
             profile_dir = self.browser_profile_dir
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            secure_private_path(profile_dir)
+            ensure_private_directory(profile_dir)
             try:
                 (profile_dir / "DevToolsActivePort").unlink()
             except FileNotFoundError:
@@ -571,14 +599,10 @@ class AuthManager:
             metadata.pop(site, None)
         else:
             metadata[site] = value
-        temporary = self.metadata_file.with_name(self.metadata_file.name + ".tmp")
-        temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            os.chmod(temporary, 0o600)
-        except OSError:
-            pass
-        os.replace(temporary, self.metadata_file)
-        secure_private_path(self.metadata_file)
+        write_private_text(
+            self.metadata_file,
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+        )
 
     def _normalize_site(self, site: str) -> str:
         value = str(site).strip().lower()

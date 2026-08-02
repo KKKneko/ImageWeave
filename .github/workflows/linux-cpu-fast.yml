@@ -1,0 +1,67 @@
+name: Linux CPU 快速门槛
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: 后端完整测试 / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: gallery-dl-backend/requirements.txt
+      - name: 安装后端锁定依赖
+        run: >-
+          ./scripts/setup-linux.sh --device cpu
+          --skip-dedup-deps --skip-models --skip-mihomo
+      - name: 后端完整测试
+        working-directory: gallery-dl-backend
+        run: ./.venv/bin/python -m unittest discover -s tests -v
+
+  linux-cpu:
+    name: Linux CPU 安装、根测试与服务 smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            gallery-dl-backend/requirements.txt
+            requirements-dedup-cpu.txt
+      - name: Shell 语法与依赖漂移
+        run: |
+          git ls-files '*.sh' | xargs -r -n1 bash -n
+          ./scripts/lock-dependencies.sh --check
+      - name: 干净 CPU 锁定安装（不下载模型）
+        run: ./scripts/setup-linux.sh --device cpu --skip-models --skip-mihomo
+      - name: CPU 纯净性与根测试
+        run: |
+          ./.venv/bin/python ./scripts/check-cpu-environment.py
+          ./.venv/bin/python -m unittest discover -s tests -v
+      - name: healthz / readyz 语义
+        run: ./scripts/smoke-linux-service.sh
+      - name: 工作区与差异格式
+        run: |
+          git diff --check
+          test -z "$(git status --short --untracked-files=no)"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +84,68 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(floored.scheduler.retry_backoff_cap_seconds, 1.0)
 
 
+class DedupResourceConfigTests(unittest.TestCase):
+    def test_resource_profile_uses_zero_as_auto_and_preserves_overrides(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_dir": "runtime",
+                        "database_path": "runtime/backend.sqlite3",
+                        "default_output_root": "runtime/downloads",
+                        "gallery": {"cache_file": "credentials/managed/cache.sqlite3"},
+                        "dedup": {
+                            "enabled": False,
+                            "device": "cpu",
+                            "workers": 3,
+                            "torch_threads": 2,
+                            "torch_interop_threads": 1,
+                            "deep_batch_size": 2,
+                            "neighbor_block_size": 96,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+
+        self.assertEqual(settings.dedup.workers, 3)
+        self.assertEqual(settings.dedup.torch_threads, 2)
+        self.assertEqual(settings.dedup.torch_interop_threads, 1)
+        self.assertEqual(settings.dedup.deep_batch_size, 2)
+        self.assertEqual(settings.dedup.neighbor_block_size, 96)
+        public = settings.public_dict()["dedup"]
+        self.assertEqual(public["torch_threads"], 2)
+        self.assertEqual(public["neighbor_block_size"], 96)
+
+    @unittest.skipIf(os.name == "nt", "POSIX 符号链接权限验证")
+    def test_managed_runtime_symlink_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "external-target"
+            target.mkdir(mode=0o755)
+            (root / "runtime-link").symlink_to(target, target_is_directory=True)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_dir": "runtime-link",
+                        "database_path": "runtime-link/backend.sqlite3",
+                        "default_output_root": "runtime-link/downloads",
+                        "dedup": {"enabled": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before_mode = target.stat().st_mode & 0o777
+            with self.assertRaisesRegex(ValueError, "符号链接"):
+                AppSettings.load(config_path)
+            self.assertEqual(target.stat().st_mode & 0o777, before_mode)
+            self.assertEqual(list(target.iterdir()), [])
+
+
 class AuthorizationProxyConfigTests(unittest.TestCase):
     def test_default_is_direct_and_reported_as_none(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,6 +167,24 @@ class AuthorizationProxyConfigTests(unittest.TestCase):
             settings.public_dict()["auth"]["authorization_proxy"],
             "http://127.0.0.1:7890",
         )
+
+    def test_proxy_credentials_are_redacted_from_public_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "auth": {"authorization_proxy": "http://user:secret@127.0.0.1:7890"},
+                        "dedup": {"enabled": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+        public_value = settings.public_dict()["auth"]["authorization_proxy"]
+        self.assertEqual(public_value, "http://***@127.0.0.1:7890")
+        self.assertNotIn("secret", public_value)
 
     def test_invalid_proxy_rejected_at_load(self):
         bad_values = [

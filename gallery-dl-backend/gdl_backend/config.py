@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .file_security import ensure_private_directory
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_DIR.parent
@@ -66,6 +68,20 @@ def _path(value: str | os.PathLike[str] | None, base: Path, default: Path) -> Pa
         if not path.is_absolute():
             path = base / path
     return path.resolve()
+
+
+def _managed_path(
+    value: str | os.PathLike[str] | None,
+    base: Path,
+    default: Path,
+) -> Path:
+    """规范化应用管理路径但不解引用叶节点，供创建前检查符号链接。"""
+    path = default if value in (None, "") else Path(
+        os.path.expandvars(os.path.expanduser(str(value)))
+    )
+    if not path.is_absolute():
+        path = base / path
+    return Path(os.path.abspath(os.fspath(path)))
 
 
 def _executable_path(
@@ -203,7 +219,12 @@ class DedupSettings:
     core_script: Path = field(default_factory=lambda: (WORKSPACE_DIR / "dedup_core.py").resolve())
     model_dir: Path = field(default_factory=lambda: (WORKSPACE_DIR / ".models").resolve())
     device: str = "auto"
-    workers: int = field(default_factory=lambda: min(8, os.cpu_count() or 1))
+    # 0 表示由 worker 根据设备和 CPU 数量选择；显式正整数始终覆盖 profile。
+    workers: int = 0
+    torch_threads: int = 0
+    torch_interop_threads: int = 0
+    deep_batch_size: int = 0
+    neighbor_block_size: int = 0
     poll_interval_seconds: float = 1.0
     shutdown_grace_seconds: float = 10.0
     no_sscd: bool = False
@@ -254,9 +275,9 @@ class AppSettings:
             data = json.loads(config_path.read_text(encoding="utf-8"))
         base = config_path.parent if config_path else PROJECT_DIR
 
-        runtime = _path(data.get("runtime_dir"), base, PROJECT_DIR / "runtime")
-        database = _path(data.get("database_path"), base, runtime / "backend.sqlite3")
-        output_root = _path(data.get("default_output_root"), base, runtime / "downloads")
+        runtime = _managed_path(data.get("runtime_dir"), base, PROJECT_DIR / "runtime")
+        database = _managed_path(data.get("database_path"), base, runtime / "backend.sqlite3")
+        output_root = _managed_path(data.get("default_output_root"), base, runtime / "downloads")
 
         server_data = dict(data.get("server") or {})
         gallery_data = dict(data.get("gallery") or {})
@@ -273,7 +294,7 @@ class AppSettings:
         )
         gallery = GallerySettings(
             repo_path=_path(gallery_data.get("repo_path"), base, WORKSPACE_DIR / "gallery-dl-codeberg"),
-            cache_file=_path(
+            cache_file=_managed_path(
                 gallery_data.get("cache_file"),
                 base,
                 PROJECT_DIR / "credentials" / "managed" / "gallery-dl-cache.sqlite3",
@@ -352,13 +373,21 @@ class AppSettings:
                 base,
                 WORKSPACE_DIR / "dedup_core.py",
             ),
-            model_dir=_path(
+            model_dir=_managed_path(
                 dedup_data.get("model_dir"),
                 base,
                 WORKSPACE_DIR / ".models",
             ),
             device=str(dedup_data.get("device", "auto")).strip().lower(),
-            workers=max(1, int(dedup_data.get("workers", min(8, os.cpu_count() or 1)))),
+            workers=max(0, int(dedup_data.get("workers", 0) or 0)),
+            torch_threads=max(0, int(dedup_data.get("torch_threads", 0) or 0)),
+            torch_interop_threads=max(
+                0, int(dedup_data.get("torch_interop_threads", 0) or 0)
+            ),
+            deep_batch_size=max(0, int(dedup_data.get("deep_batch_size", 0) or 0)),
+            neighbor_block_size=max(
+                0, int(dedup_data.get("neighbor_block_size", 0) or 0)
+            ),
             poll_interval_seconds=max(0.1, float(dedup_data.get("poll_interval_seconds", 1.0))),
             shutdown_grace_seconds=max(1.0, float(dedup_data.get("shutdown_grace_seconds", 10.0))),
             no_sscd=bool(dedup_data.get("no_sscd", False)),
@@ -419,24 +448,61 @@ class AppSettings:
             raise ValueError("proxy.transport_core_start_timeout_seconds 必须大于 0")
         if self.dedup.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("dedup.device 必须是 auto、cpu 或 cuda")
-        if self.dedup.workers < 1:
-            raise ValueError("dedup.workers 必须大于等于 1")
+        resource_limits = {
+            "dedup.workers": (self.dedup.workers, 64),
+            "dedup.torch_threads": (self.dedup.torch_threads, 128),
+            "dedup.torch_interop_threads": (self.dedup.torch_interop_threads, 16),
+            "dedup.deep_batch_size": (self.dedup.deep_batch_size, 128),
+            "dedup.neighbor_block_size": (self.dedup.neighbor_block_size, 8192),
+        }
+        for name, (value, maximum) in resource_limits.items():
+            if not 0 <= value <= maximum:
+                raise ValueError(f"{name} 必须是 0（自动）或 1..{maximum}")
         if self.dedup.poll_interval_seconds <= 0 or self.dedup.shutdown_grace_seconds <= 0:
             raise ValueError("去重轮询与退出等待时间必须大于 0")
         digest = self.proxy.transport_core_sha256
         if digest and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
             raise ValueError("proxy.transport_core_sha256 必须是 64 位十六进制 SHA-256")
 
+    @staticmethod
+    def _lexically_inside(path: Path, root: Path) -> bool:
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        parent = Path(os.path.abspath(os.fspath(root)))
+        return candidate == parent or candidate.is_relative_to(parent)
+
+    def is_dedicated_credentials_directory(self, path: Path) -> bool:
+        roots = [*self.allowed_config_roots, *self.allowed_cookie_roots]
+        return any(
+            self._lexically_inside(path, root)
+            and Path(os.path.abspath(os.fspath(path))) != Path(os.path.abspath(os.fspath(root)))
+            for root in roots
+        )
+
     def ensure_directories(self) -> None:
         for path in (
             self.runtime_dir,
-            self.database_path.parent,
-            self.default_output_root,
             self.runtime_dir / "logs",
             self.runtime_dir / "proxy",
-            self.gallery.cache_file.parent,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(path)
+        if self._lexically_inside(self.database_path.parent, self.runtime_dir):
+            ensure_private_directory(self.database_path.parent)
+        else:
+            ensure_private_directory(self.database_path.parent, repair_existing=False)
+        if self.is_dedicated_credentials_directory(self.gallery.cache_file.parent):
+            ensure_private_directory(self.gallery.cache_file.parent)
+        else:
+            ensure_private_directory(
+                self.gallery.cache_file.parent,
+                repair_existing=False,
+            )
+        # 默认 runtime/downloads 属于应用管理路径；显式外部输出目录不做 chmod。
+        if self._lexically_inside(self.default_output_root, self.runtime_dir):
+            ensure_private_directory(self.default_output_root)
+        else:
+            self.default_output_root.mkdir(parents=True, exist_ok=True)
+        if self.dedup.enabled:
+            ensure_private_directory(self.dedup.model_dir)
 
     @staticmethod
     def _inside(path: Path, roots: list[Path]) -> bool:
@@ -459,8 +525,12 @@ class AppSettings:
         if not self._inside(candidate, self.allowed_output_roots):
             raise ValueError("输出目录超出 allowed_output_roots")
         try:
-            candidate.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
+            if self._lexically_inside(candidate, self.runtime_dir):
+                ensure_private_directory(candidate)
+            else:
+                # 用户显式外部输出目录保留其权限策略，不由应用盲目 chmod。
+                candidate.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError, ValueError) as exc:
             raise ValueError("无法创建输出目录") from exc
         return candidate
 
@@ -479,6 +549,16 @@ class AppSettings:
         if not candidate.is_file():
             raise ValueError(f"{label}不存在或不是文件")
         return candidate
+
+    def _public_authorization_proxy(self) -> str | None:
+        value = self.auth.authorization_proxy
+        if not value:
+            return None
+        parsed = urlsplit(value)
+        if parsed.username is None:
+            return value
+        host = f"[{parsed.hostname}]" if parsed.hostname and ":" in parsed.hostname else parsed.hostname
+        return f"{parsed.scheme}://***@{host}:{parsed.port}"
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -504,7 +584,7 @@ class AppSettings:
                 "chrome_configured": bool(self.auth.chrome_executable.strip()),
                 "browser_login_timeout_seconds": self.auth.browser_login_timeout_seconds,
                 "browser_poll_interval_seconds": self.auth.browser_poll_interval_seconds,
-                "authorization_proxy": self.auth.authorization_proxy or None,
+                "authorization_proxy": self._public_authorization_proxy(),
             },
             "proxy": {
                 "enabled": self.proxy.enabled,
@@ -532,6 +612,10 @@ class AppSettings:
                 "model_dir": str(self.dedup.model_dir),
                 "device": self.dedup.device,
                 "workers": self.dedup.workers,
+                "torch_threads": self.dedup.torch_threads,
+                "torch_interop_threads": self.dedup.torch_interop_threads,
+                "deep_batch_size": self.dedup.deep_batch_size,
+                "neighbor_block_size": self.dedup.neighbor_block_size,
                 "no_sscd": self.dedup.no_sscd,
                 "no_dino": self.dedup.no_dino,
             },

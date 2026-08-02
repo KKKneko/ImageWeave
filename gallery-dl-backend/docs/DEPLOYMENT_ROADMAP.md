@@ -8,7 +8,7 @@
 当前优先支持：
 
 - Linux x86_64；
-- Python 3.10 及以上；
+- Python 3.11–3.14（3.11 最低，3.14 推荐）；
 - 无 NVIDIA GPU 的 CPU-only 完整工作流；
 - 后端、gallery-dl worker、Mihomo、SSCD/DINOv2 去重和 WebUI；
 - X、Pixiv、EH 的托管授权仍需要桌面 Chrome/Chromium 与图形会话。
@@ -110,83 +110,90 @@
 
 ## P1：部署可复现性、资源控制与持续验证
 
-状态：**待处理，下一阶段**。
+状态：**已完成（2026-08-02）**。
 
-### P1-1：依赖不可复现，支持矩阵仍不明确
+### P1-1：依赖可复现与支持矩阵
 
-当前问题：
+已完成：
 
-- 后端 `requirements.txt` 使用宽松下限，传递依赖会随安装日期变化；
-- `pyproject.toml` 与 `requirements.txt` 重复维护，未来可能漂移；
-- CPU/CUDA 清单只固定直接依赖，没有统一锁定完整传递依赖；
-- 虽然声明 Python 3.10+，但缺少明确的发行版、Python 版本和架构验证矩阵；
-- 没有标准化的依赖更新与回滚流程。
+- `gallery-dl-backend/pyproject.toml` 成为后端、去重公共、CPU 和 CUDA 的唯一直接依赖
+  事实来源；去重使用 PEP 735 dependency groups，不再手工同步多份直接依赖；
+- 提交四份带哈希的完整传递依赖锁：后端、去重公共、CPU 完整环境、CUDA 完整环境；
+- CPU 锁固定官方 `torch==2.11.0+cpu`/`torchvision==0.26.0+cpu`，不含 `nvidia-*`、
+  CUDA runtime、Triton 或非 headless OpenCV；CUDA 12.8 完整闭包严格位于独立锁；
+- `setup-linux.sh` 默认用 `pip --require-hashes --only-binary` 消费锁，不再自动升级 pip 或依赖；
+- `scripts/lock-dependencies.sh --upgrade/--check` 固定 `uv==0.12.1`，提供显式更新和 drift 检查；
+- 完整产品最低版本从无法满足 NumPy 约束的 Python 3.10 如实上调到 3.11，推荐 3.14，
+  支持范围暂定 `<3.15`；快速 CI 配置 3.11 与 3.14，不排列所有中间微版本；
+- 必测平台仅为 Linux x86_64 CPU。Windows x86_64 与 CUDA 12.8 路径保留兼容锁和脚本，
+  但本次未实机验证；macOS、ARM 和其他加速器明确标记未验证。
 
-目标：
+### P1-2：CPU 去重资源边界与可观察性
 
-- 确定唯一依赖事实来源；
-- 提交可审查、可更新的后端与 CPU/CUDA 锁定结果；
-- 安装器默认使用锁定依赖，同时保留显式更新流程；
-- 明确 Linux x86_64、Python 最低版本与当前推荐版本；
-- 在支持矩阵外的环境给出清晰提示，而不是隐式承诺。
+已完成：
 
-### P1-2：CPU 去重缺少资源边界和服务器默认值
+- 新增 CPU 保守 profile：worker/模型解码最多 4，Torch intra-op 最多 4、inter-op 1，
+  OpenCV 1；OpenMP/MKL 与 Torch 同步，batch 收敛到 1–4，近邻块收敛到 64–256；
+- `workers`、`torch_threads`、`torch_interop_threads`、`deep_batch_size`、
+  `neighbor_block_size` 支持 `0=自动` 和正整数覆盖，并贯穿配置、管理器、worker、核心和模型层；
+- worker 在重型库导入和并行计算前设置环境/Torch；inter-op 每进程最多设置一次，CUDA/auto
+  未覆盖时保留原有 8/8/512 与 Torch 线程语义；
+- manifest 和日志记录配置/实际设备、预处理与解码 worker、batch、Torch/OpenMP/MKL/OpenCV
+  线程、近邻分块以及扫描、预处理、分析、manifest 构建和总耗时；
+- 未修改任何去重阈值、候选条件、complete-link 分组或质量 winner 规则；现有确定性测试通过。
 
-当前问题：
+真实 CPU 基准（程序生成、无敏感内容的 48 张 384×384 图片，SSCD+DINOv2 全开）：
 
-- 图片预处理线程、Torch intra-op/inter-op 线程和 OpenMP/MKL 线程可能叠加；
-- CPU-only 主机可能因线程过度订阅影响后端响应；
-- 深度 batch、近邻分块和线程数没有统一的 CPU profile；
-- 缺少一组真实但适度规模的 CPU 时间、内存和吞吐基准。
+- 实际参数：16 逻辑 CPU，worker 4，Torch 4/1，OpenCV 1，batch 2，neighbor block 128；
+- wall time 28.141 秒；manifest 内分析阶段 24.380246 秒；
+- worker 峰值 RSS 892060 KiB，由 Linux `resource.RUSAGE_CHILDREN.ru_maxrss` 实测；
+- 生成合法 manifest：48 张图片、5 个候选组、无读取失败；
+- 同时运行的后端接受 28 次 `/healthz`，0 次失败，最慢 0.015418 秒；
+- CPU venv 无 CUDA/NVIDIA/Triton，`torch.version.cuda is None`，未加载 CUDA 路径。
 
-目标：
+### P1-3：Linux CPU 自动化发布门槛
 
-- 为 CPU 模式提供保守且可配置的 worker、Torch 线程和 batch 默认值；
-- 避免 API、下载任务与去重 worker 无限制争用所有 CPU；
-- 在 manifest/日志中记录关键资源参数和阶段耗时；
-- 使用一组中等规模本地样本做一次基准，避免构造大量细粒度性能测试。
+已完成：
 
-### P1-3：Linux CPU 支持尚未成为自动化发布门槛
+- `linux-cpu-fast.yml` 在 push/PR/手动触发：Shell 语法、依赖漂移、Python 3.11/3.14 后端
+  完整测试、3.14 CPU 锁安装、根测试、CPU 纯净性和 health/ready smoke；
+- `linux-cpu-real-models.yml` 每周和手动触发：缓存固定公开模型，校验 SSCD+DINOv2，
+  并运行程序生成图片的真实 CPU worker 闭环；快速层不重复下载大模型；
+- workflow 复用 setup、纯净性、服务 smoke 和真实模型脚本，未引用本机安装代理；
+- 私人 `runtime/downloads` 真实变体测试仍可选并在样本缺失时跳过，但程序生成闭环已经提供
+  独立公开证据，不再依赖私人样本作为唯一回归；
+- 本地已解析两份 workflow 结构并执行其中关键命令；GitHub 托管调度本身只能在远端触发，
+  不伪造本地调度结果。
 
-当前问题：
+### P1-4：应用级权限与秘密保护
 
-- 仓库没有 CI workflow；
-- 没有从干净环境安装、启动和检查 `/readyz` 的自动验证；
-- 真实模型测试依赖外部网络，不适合每个提交都强制下载；
-- 现有真实变体回归依赖开发机未跟踪样本。
+已完成：
 
-目标：
+- Linux setup、doctor、run 和 Mihomo 安装脚本使用 `umask 077`；setup 安全修复明确的项目管理
+  元数据/凭据/模型树，但不递归修改 `runtime/downloads` 或用户外部输出；
+- 应用主动维护 runtime 元数据、SQLite/WAL/SHM、credentials/managed、浏览器授权文件、
+  审核 manifest/日志、代理核心配置/日志和模型/embedding 缓存为目录 0700、文件 0600；
+- 敏感文件和直接管理目录在创建/替换前拒绝现有路径组件中的明显符号链接，原子临时写使用 0600 与
+  `O_NOFOLLOW`（平台支持时）；Windows ACL 逻辑保留；
+- 外部输出根目录保持用户权限策略；doctor 只报告，不 chmod，并新增 SQLite、模型缓存、
+  外部输出边界诊断；
+- 公共配置中的带凭据授权代理会掩码；doctor 错误与输出不打印订阅 URL、Cookie、token、
+  代理凭据或授权 Profile 内容；符号链接权限失败关键测试通过。
 
-- 每次提交执行 Linux 后端测试、根 CPU 测试和最小启动 smoke；
-- CI 验证 CPU 环境不含 CUDA/NVIDIA 包；
-- 定时或手动 workflow 下载真实模型并执行一次 CPU 去重闭环；
-- 将必要的最小回归图片作为小型、许可清晰的测试夹具管理；
-- 测试保持少而真实，不建立无意义的微型组合矩阵。
+### P1 真实验收结果
 
-### P1-4：应用自身的权限保护仍依赖安装脚本
+环境：Arch Linux x86_64、Python 3.14.6、16 逻辑 CPU、无 NVIDIA GPU、已有 Chromium；
+安装/下载阶段临时使用本机 HTTP 代理，未写入抓取代理池或 workflow。
 
-当前问题：
-
-- setup 已设置配置 `0600`、敏感目录 `0700`，但直接调用 Python 或使用自定义路径时，
-  应用创建目录仍可能受到宽松 umask 影响；
-- 数据库、日志、模型缓存和自定义 runtime 路径缺少统一的权限策略与诊断；
-- 现有文件权限异常时，应用与 doctor 的修复边界尚未明确。
-
-目标：
-
-- 应用创建敏感目录和文件时主动使用安全权限，不只依赖 setup；
-- setup 使用安全 umask，并安全修复自己管理的既有路径；
-- doctor 继续只报告，不擅自修改用户提供的外部目录；
-- 不泄露订阅 URL、Cookie、Token、代理凭据或授权 Profile 内容。
-
-### P1 建议实施顺序
-
-1. 确定支持矩阵和唯一依赖事实来源；
-2. 生成并接入可复现锁定依赖；
-3. 增加 CPU 资源 profile 与一次真实基准；
-4. 建立快速 CI 和定时真实模型 smoke；
-5. 收紧应用级权限创建逻辑；
-6. 在干净 Linux CPU 环境重新执行安装、doctor、启动和去重闭环。
+- 在全新 `/tmp` 隔离目录由 `setup-linux.sh` 创建两个 venv 并安装完整 CPU 锁：后端关键包与锁
+  一致，CPU 纯净性检查通过，配置 0600、敏感目录 0700；
+- 后端完整测试 235/235 通过；根 CPU 测试 32 个通过，1 个私人样本测试明确跳过；
+- doctor 为 ready，`/healthz` 与完整 `/readyz` 返回 200；另行 smoke 验证启用去重但模型缺失时
+  `/healthz` 仍为 200、`/readyz` 为 503；
+- SSCD+DINOv2 中等规模基准结果如 P1-2；CPU 环境只有 headless OpenCV；
+- 所有修改 Shell 脚本通过 `bash -n`，锁 drift、workflow 结构和 `git diff --check` 通过；
+- submodule 保持 `2790ceb303ee4986ef7f683cc16d3799bb4356ce`，模型、venv、配置、runtime、
+  credentials、Mihomo 二进制、安装代理和其他秘密均未加入跟踪。
 
 ---
 

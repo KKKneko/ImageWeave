@@ -66,6 +66,11 @@ def _dedup_cache_key(settings: AppSettings) -> tuple[Any, ...]:
         settings.dedup.device,
         settings.dedup.no_sscd,
         settings.dedup.no_dino,
+        settings.dedup.workers,
+        settings.dedup.torch_threads,
+        settings.dedup.torch_interop_threads,
+        settings.dedup.deep_batch_size,
+        settings.dedup.neighbor_block_size,
         _path_signature(model_dir / SSCD_FILENAME),
         _path_signature(model_dir / DINO_CHECKPOINT),
         _path_signature(model_dir / DINO_REPOSITORY / "hubconf.py"),
@@ -100,19 +105,36 @@ else:
         for dist in metadata.distributions()
         if dist.metadata.get("Name")
     })
+    forbidden = [
+        name for name in names
+        if name.startswith("nvidia-")
+        or name in {
+            "cuda-bindings", "cuda-pathfinder", "cuda-toolkit",
+            "pytorch-triton", "triton",
+        }
+    ]
+    opencv_variants = [
+        name for name in names
+        if name in {
+            "opencv-python", "opencv-contrib-python",
+            "opencv-contrib-python-headless", "opencv-python-headless",
+        }
+    ]
     result.update({
         "torch_version": str(torch.__version__),
         "torchvision_version": str(torchvision.__version__),
         "cuda_available": cuda_available,
         "actual_device": actual_device,
-        "nvidia_packages": [name for name in names if name.startswith("nvidia-")],
+        "forbidden_cpu_packages": forbidden,
+        "opencv_variants": opencv_variants,
     })
     if requested == "cpu" and (
         not str(torch.__version__).endswith("+cpu")
-        or result["nvidia_packages"]
+        or forbidden
         or cuda_available
+        or opencv_variants != ["opencv-python-headless"]
     ):
-        result["cpu_purity_error"] = "CPU 配置不是纯 CPU PyTorch 环境"
+        result["cpu_purity_error"] = "CPU 配置不是纯 CPU PyTorch/headless OpenCV 环境"
 result["sscd_present"] = (
     not use_sscd
     or ((model_dir / "sscd_disc_mixup.torchscript.pt").is_file()
@@ -237,7 +259,8 @@ def dedup_components(
                 configured_device=settings.dedup.device,
                 actual_device=str(probe.get("actual_device") or "unknown"),
                 cuda_available=bool(probe.get("cuda_available")),
-                nvidia_package_count=len(probe.get("nvidia_packages") or []),
+                forbidden_cpu_package_count=len(probe.get("forbidden_cpu_packages") or []),
+                opencv_variants=list(probe.get("opencv_variants") or []),
             )
         )
         sscd_component = (
@@ -267,6 +290,13 @@ def dedup_components(
                 "ok" if dedup_ok else "error",
                 "去重环境已就绪" if dedup_ok else "去重环境或模型不完整",
                 configured_device=settings.dedup.device,
+                configured_resources={
+                    "workers": settings.dedup.workers,
+                    "torch_threads": settings.dedup.torch_threads,
+                    "torch_interop_threads": settings.dedup.torch_interop_threads,
+                    "deep_batch_size": settings.dedup.deep_batch_size,
+                    "neighbor_block_size": settings.dedup.neighbor_block_size,
+                },
             ),
             "dedup_python": _component("ok", "去重 Python 可执行"),
             "torch": torch_component,
@@ -392,6 +422,63 @@ def _directory_component(path: Path, label: str) -> dict[str, Any]:
     return _component("ok", f"{label}可读写且权限受限")
 
 
+def _private_files_component(paths: list[Path], label: str) -> dict[str, Any]:
+    existing = 0
+    for path in paths:
+        if path.is_symlink():
+            return _component("error", f"{label}包含符号链接")
+        if not path.exists():
+            continue
+        existing += 1
+        if not path.is_file() or not os.access(path, os.R_OK | os.W_OK):
+            return _component("error", f"{label}包含不可读写文件")
+        if os.name != "nt" and path.stat().st_mode & 0o077:
+            return _component("error", f"{label}文件权限过宽，需要 0600")
+    return _component("ok", f"{label}权限受限", existing_file_count=existing)
+
+
+def _model_permissions_component(settings: AppSettings) -> dict[str, Any]:
+    if not settings.dedup.enabled:
+        return _component("disabled", "模型缓存权限检查随去重禁用", required=False)
+    directory = _directory_component(settings.dedup.model_dir, "模型缓存目录")
+    if directory["status"] != "ok":
+        return directory
+    model_dir = settings.dedup.model_dir
+    return _private_files_component(
+        [
+            model_dir / SSCD_FILENAME,
+            model_dir / "embeddings.sqlite3",
+            model_dir / "embeddings.sqlite3-wal",
+            model_dir / "embeddings.sqlite3-shm",
+            model_dir / DINO_CHECKPOINT,
+        ],
+        "模型与 embedding 缓存",
+    )
+
+
+def _external_output_component(settings: AppSettings) -> dict[str, Any]:
+    if settings._lexically_inside(settings.default_output_root, settings.runtime_dir):
+        return _component(
+            "ok",
+            "默认输出目录位于应用管理 runtime 内，权限由应用维护",
+            required=False,
+        )
+    path = settings.default_output_root
+    if not path.is_dir() or not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        return _component("error", "外部输出目录不可读写", required=False)
+    if os.name != "nt" and path.stat().st_mode & 0o022:
+        return _component(
+            "optional_warning",
+            "外部输出目录可被组或其他用户写入；doctor 仅报告，不会修改",
+            required=False,
+        )
+    return _component(
+        "ok",
+        "外部输出目录可用；权限由用户维护，doctor 不会修改",
+        required=False,
+    )
+
+
 def _chrome_component(settings: AppSettings) -> dict[str, Any]:
     configured = settings.auth.chrome_executable.strip()
     candidate = configured if configured and Path(configured).is_file() else ""
@@ -487,10 +574,20 @@ def doctor_snapshot(settings: AppSettings) -> dict[str, Any]:
         ),
         "config": config_component,
         "sqlite": sqlite_component,
+        "sqlite_file_permissions": _private_files_component(
+            [
+                settings.database_path,
+                Path(f"{settings.database_path}-wal"),
+                Path(f"{settings.database_path}-shm"),
+            ],
+            "SQLite 主文件与 sidecar",
+        ),
         "runtime_permissions": _directory_component(settings.runtime_dir, "runtime 目录"),
         "credentials_permissions": _directory_component(
             settings.gallery.cache_file.parent, "credentials/managed 目录"
         ),
+        "model_cache_permissions": _model_permissions_component(settings),
+        "external_output_permissions": _external_output_component(settings),
         "install_proxy": _component(
             "ok" if install_proxy_present else "disabled",
             (
@@ -518,6 +615,7 @@ def _print_doctor(snapshot: dict[str, Any]) -> None:
         "error": "失败",
         "disabled": "禁用",
         "optional_missing": "可选缺失",
+        "optional_warning": "提示",
     }
     print("ImageWeave Linux doctor")
     for name, item in snapshot["components"].items():
@@ -530,7 +628,8 @@ def _print_doctor(snapshot: dict[str, Any]) -> None:
                 "       "
                 f"torch={item.get('version')}，实际设备={item.get('actual_device')}，"
                 f"cuda_available={str(bool(item.get('cuda_available'))).lower()}，"
-                f"nvidia 包={item.get('nvidia_package_count')}"
+                f"CPU 禁止包={item.get('forbidden_cpu_package_count')}，"
+                f"OpenCV={','.join(item.get('opencv_variants') or [])}"
             )
     print("doctor 结论：" + ("ready" if snapshot["ready"] else "not ready"))
 

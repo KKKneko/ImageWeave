@@ -12,13 +12,22 @@
 
 ## 平台支持
 
-| 平台 | 支持等级 | 说明 |
+| 平台/设备 | 支持等级 | 说明 |
 | --- | --- | --- |
-| Windows | 完整支持 | 主要开发与端到端验证平台，提供 PowerShell 安装和启动脚本。 |
-| Linux | 完整支持 | 已验证 API/UI、桌面 Chrome 授权、SQLite、子进程回收和 Mihomo 生命周期。 |
-| macOS | 兼容预览 | 具备 POSIX 基础实现；孤儿进程识别仍有 Linux `/proc` 依赖。 |
+| Linux x86_64 / CPU | 必测支持 | P1 真实验收：Arch Linux、Python 3.14、无 NVIDIA GPU；快速 CI 为 Ubuntu 24.04。 |
+| Windows x86_64 / CPU 或 CUDA | 兼容维护 | PowerShell 路径和通用锁保留；本次 P1 未在 Windows 实机运行。 |
+| Linux x86_64 / CUDA 12.8 | 兼容维护 | 有独立完整锁，但本次无 NVIDIA 硬件，未验证驱动、运行时或性能。 |
+| macOS、Linux ARM、其他加速器 | 未验证 | 不属于当前发布门槛，不作可用性承诺。 |
 
-站点授权需要桌面环境中的 Chrome、Chromium 或 Chromium Browser。非标准路径通过
+| Python | 状态 | 说明 |
+| --- | --- | --- |
+| 3.11 | 最低支持 / CI | `numpy==2.4.2` 已不支持 3.10，因此最低版本如实上调。 |
+| 3.14 | 推荐 / CI / 实测 | 当前 Arch 验收和推荐生产版本。 |
+| 3.12–3.13 | 锁可解析 | 不为每个微版本扩张 CI 矩阵。 |
+| < 3.11 或 >= 3.15 | 不支持 | setup 会提前退出；放开前必须重新验锁。 |
+
+CPU-only 是 Linux 发布门槛；CUDA 及 ARM 不会因存在代码路径而被隐式视为已验证。站点授权需要
+桌面环境中的 Chrome、Chromium 或 Chromium Browser。非标准路径通过
 `auth.chrome_executable` 配置。doctor 检测到浏览器不等于服务器具备桌面会话；纯 SSH/headless
 环境可以运行 API、下载调度和 CPU 去重，但不能完成需要可见窗口的 X/Pixiv/EH 授权。
 
@@ -65,16 +74,26 @@ export no_proxy="$NO_PROXY"
 ./scripts/run.sh
 ```
 
-安装器不会执行 `sudo`；缺少 Python >= 3.10、venv、git、curl/wget、gzip 或 SHA-256 工具时，
-会分别给出 Debian/Ubuntu 与 Arch Linux 安装提示。它幂等初始化 submodule、创建
+安装器不会执行 `sudo`；要求 Linux x86_64 与 Python 3.11–3.14，缺少 venv、git、
+curl/wget、gzip 或 SHA-256 工具时，会分别给出 Debian/Ubuntu 与 Arch Linux 安装提示。它幂等初始化 submodule、创建
 `gallery-dl-backend/.venv`（后端）和根 `.venv`（去重），安装官方 CPU PyTorch 与
 `opencv-python-headless`、校验 Mihomo v1.19.28，并把 SSCD/DINOv2 缓存到根 `.models`。
 `--skip-models`、`--skip-mihomo` 等选项用于快速重跑；已有 config、模型缓存和运行数据不会被
 覆盖。新建 config 为 0600，runtime/credentials 等敏感目录为 0700。
 
-CPU 环境使用 `requirements-dedup-common.txt` + `requirements-dedup-cpu.txt`，不含 CUDA
-wheel、`nvidia-*` 或普通 OpenCV；`requirements-dedup-cuda.txt` 是独立 CUDA 路径，不适合
-无 GPU 主机。安装脚本固定下载并校验受支持的 Mihomo 版本；单独安装时也支持：
+`pyproject.toml` 是后端、去重公共、CPU 和 CUDA **直接依赖的唯一事实来源**。生成的
+`requirements.txt`、根目录 `requirements-dedup-common.txt`、`requirements-dedup-cpu.txt`、
+`requirements-dedup-cuda.txt` 分别固定完整传递闭包与哈希；CPU/CUDA 文件各自是一份可直接
+安装的完整环境锁，不需要先叠加 common。CPU 锁不含 CUDA、`nvidia-*`、Triton 或普通 OpenCV。
+维护命令：
+
+```bash
+./scripts/lock-dependencies.sh --upgrade  # 固定 uv 0.12.1，显式更新锁
+./scripts/lock-dependencies.sh --check    # 复算现有版本并检查漂移
+```
+
+普通 `setup-linux.sh` 只消费锁，不自动升级依赖解析结果。安装脚本固定下载并校验受支持的
+Mihomo 版本；单独安装时也支持：
 
 ```bash
 bash gallery-dl-backend/scripts/install_mihomo.sh --proxy http://127.0.0.1:7890
@@ -82,7 +101,27 @@ bash gallery-dl-backend/scripts/install_mihomo.sh --proxy http://127.0.0.1:7890
 ```
 
 自定义目录、强制重装及手动安装见 [`docs/MIHOMO.md`](./docs/MIHOMO.md)。Windows PowerShell
-仍使用 `scripts/install_mihomo.ps1` 和根 `setup-dedup.ps1`。
+仍使用 `scripts/install_mihomo.ps1` 和根 `setup-dedup.ps1`；后者同样消费 CUDA 完整哈希锁，
+但本次只做兼容性维护，未实机验证。
+
+### CPU 去重资源 profile
+
+Linux setup 明确写入 `dedup.device=cpu`。以下字段接受 `0`（自动）或正整数覆盖：
+
+| 配置字段 | 16 逻辑 CPU 自动值 | 自动边界 |
+| --- | ---: | --- |
+| `workers` | 4 | 图片预处理、关系分析和模型解码共用，最多 4 |
+| `torch_threads` | 4 | Torch intra-op，同时设置 OpenMP/MKL，最多 4 |
+| `torch_interop_threads` | 1 | 每个独立 worker 进程只设置一次 |
+| `deep_batch_size` | 2 | CPU 按逻辑 CPU 收敛到 1–4 |
+| `neighbor_block_size` | 128 | CPU 按逻辑 CPU 收敛到 64–256 |
+
+CPU 下 OpenCV 固定为 1 个原生线程，避免多个 Python worker 各自展开线程池。worker 在导入
+Torch/OpenCV 和启动并行计算前应用边界，并把实际设备、worker、batch、Torch/OpenMP/MKL、
+分块和主要阶段耗时写入日志及审核 manifest。资源参数不参与阈值、候选关系、complete-link
+分组或质量 winner 判定。`device=auto/cuda` 且字段为 0 时仍沿用原有 8 worker、batch 8、
+block 512 且不主动改变 Torch 线程；CPU 服务器应明确使用 `device=cpu`。P0 配置若已有
+`workers: 8`，该值会被视为用户覆盖，改为 `0` 才会采用新 profile。
 
 ## 最小配置与代理边界
 
@@ -140,11 +179,34 @@ python -m gdl_backend --config .\config.json
 `/healthz` 只表示进程与 SQLite 存活；`/readyz` 结构化报告 submodule、调度器、项目抓取代理、
 Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件显示 `disabled`，启用去重
 但 Python/Torch/任一启用模型缺失时返回 HTTP 503。`./scripts/doctor.sh` 做同类快速检查，并额外
-报告配置/敏感目录权限和可选 Chrome 状态，不下载模型、不运行推理，也不会打印订阅 URL、
-Cookie 或 token。
+报告配置、runtime、SQLite/sidecar、credentials/managed、模型缓存及外部输出边界，不下载模型、
+不运行推理，也不会打印订阅 URL、Cookie、token、代理凭据或完整授权数据。
+
+应用管理目录（runtime 元数据、credentials/managed、审核日志/manifest、代理核心配置、模型
+缓存）为 0700，敏感文件为 0600；创建前拒绝管理路径现有组件中的符号链接。setup 使用 `umask 077` 并只
+修复上述项目管理路径。`default_output_root` 位于 runtime 内时由应用维护；用户配置到外部的
+输出根目录不被 setup、应用或 doctor 递归 `chmod`，doctor 只诊断。
 
 服务只允许绑定回环地址。任务和探活目标默认拒绝回环、私网、链路本地及保留 IP；本地部署
 确需访问局域网图站时，在 `server` 配置中设置 `"allow_private_targets": true`。
+
+## Linux CPU CI 分层
+
+- `.github/workflows/linux-cpu-fast.yml`：每次 push/PR/手动触发；检查 Shell 语法和锁漂移，
+  在 Python 3.11/3.14 跑后端完整测试，并在 3.14 做干净 CPU 锁安装、根测试、CPU 纯净性、
+  `/healthz` 与 ready/not-ready 语义。快速层不下载大模型。
+- `.github/workflows/linux-cpu-real-models.yml`：每周和手动触发；缓存固定公开模型，校验
+  SSCD+DINOv2，并用程序生成、无敏感内容的图片跑 CPU worker 闭环。
+- 两层均复用仓库 setup/smoke 脚本，不包含开发机代理。私人 `runtime/downloads` 样本测试继续
+  可选；它不再是唯一真实回归证据。
+
+本地复现关键 smoke：
+
+```bash
+./.venv/bin/python ./scripts/check-cpu-environment.py
+./scripts/smoke-linux-service.sh
+./.venv/bin/python ./scripts/run-real-model-smoke.py --base-images 4
+```
 
 ## WebUI 工作流
 

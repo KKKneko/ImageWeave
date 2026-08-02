@@ -1,0 +1,40 @@
+name: Linux CPU 真实模型闭环
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-model-worker:
+    name: SSCD + DINOv2 CPU worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            gallery-dl-backend/requirements.txt
+            requirements-dedup-cpu.txt
+      - name: 缓存公开模型（不缓存 embedding 数据库）
+        uses: actions/cache@v4
+        with:
+          path: |
+            .models/sscd_disc_mixup.torchscript.pt
+            .models/torch/hub/checkpoints/dinov2_vits14_pretrain.pth
+            .models/torch/hub/facebookresearch_dinov2_7764ea0f912e53c92e82eb78a2a1631e92725fc8
+          key: imageweave-public-models-sscd-9f26bd4c-dino-b938bf1b-r7764ea0f
+      - name: CPU 锁定安装与模型固定校验
+        run: ./scripts/setup-linux.sh --device cpu --skip-mihomo
+      - name: CPU 纯净性
+        run: ./.venv/bin/python ./scripts/check-cpu-environment.py
+      - name: 程序生成样本真实 worker 闭环
+        run: ./.venv/bin/python ./scripts/run-real-model-smoke.py --base-images 4

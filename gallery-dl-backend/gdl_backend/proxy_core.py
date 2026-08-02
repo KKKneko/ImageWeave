@@ -15,6 +15,11 @@ from typing import Any, Iterable
 
 import yaml
 
+from .file_security import (
+    ensure_private_directory,
+    open_private_binary,
+    write_private_text,
+)
 from .proxy_sources import ParsedProxyNode
 from .redaction import redact_text
 
@@ -96,32 +101,6 @@ def resolve_core_binary(
         "scripts/install_mihomo.ps1（Windows）安装到项目 bin 目录，"
         "或将 mihomo 加入 PATH，或设置 proxy.transport_core_binary"
     )
-
-
-def _restrict_sensitive_file(path: Path) -> None:
-    if os.name != "nt":
-        path.chmod(0o600)
-        return
-    domain = str(os.environ.get("USERDOMAIN") or "").strip()
-    username = str(os.environ.get("USERNAME") or "").strip()
-    principal = f"{domain}\\{username}" if domain and username else username
-    if not principal:
-        raise RuntimeError("读取当前 Windows 用户名失败，未写入代理核心敏感配置")
-    result = subprocess.run(
-        [
-            "icacls.exe",
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            f"{principal}:(F)",
-        ],
-        capture_output=True,
-        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
-        check=False,
-    )
-    if result.returncode != 0:
-        output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
-        raise RuntimeError(f"代理核心敏感文件 ACL 设置失败: {redact_text(output, limit=500)}")
 
 
 def _unique_name(raw: str, index: int, used: set[str]) -> str:
@@ -262,7 +241,7 @@ class TunnelTransportCore:
     ) -> None:
         self.binary_path = binary_path
         self.expected_sha256 = str(expected_sha256 or "").strip().lower()
-        self.runtime_dir = runtime_dir.resolve()
+        self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir)))
         self.base_port = int(base_port)
         self.start_timeout_seconds = max(1.0, float(start_timeout_seconds))
         self.listen_host = str(listen_host or "127.0.0.1")
@@ -351,16 +330,13 @@ class TunnelTransportCore:
         )
         if not endpoints:
             raise ValueError("订阅中未发现代理核心可加载的节点")
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self._config_path.write_text(
+        ensure_private_directory(self.runtime_dir)
+        write_private_text(
+            self._config_path,
             yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
         )
-        _restrict_sensitive_file(self._config_path)
         self._validate_config(binary)
-        self._log_path.touch(exist_ok=True)
-        _restrict_sensitive_file(self._log_path)
-        log_file = self._log_path.open("ab", buffering=0)
+        log_file = open_private_binary(self._log_path, append=True)
         try:
             process = subprocess.Popen(
                 [str(binary), "-f", str(self._config_path), "-d", str(self.runtime_dir)],

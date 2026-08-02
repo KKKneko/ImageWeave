@@ -13,7 +13,7 @@ from urllib.request import ProxyHandler, build_opener
 
 import websocket
 
-from .file_security import secure_private_path
+from .file_security import ensure_private_directory, write_private_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,33 +408,25 @@ def close_browser(websocket_url: str) -> None:
 
 
 def write_netscape_cookies(path: Path, cookies: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    secure_private_path(path.parent)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as fp:
-        fp.write("# Netscape HTTP Cookie File\n\n")
-        for cookie in sorted(
-            cookies,
-            key=lambda item: (
-                str(item.get("domain") or ""),
-                str(item.get("path") or "/"),
-                str(item.get("name") or ""),
-            ),
-        ):
-            domain = str(cookie.get("domain") or "")
-            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
-            cookie_path = str(cookie.get("path") or "/")
-            secure = "TRUE" if cookie.get("secure") else "FALSE"
-            expires = max(0, int(float(cookie.get("expires") or 0)))
-            name = str(cookie.get("name") or "")
-            value = str(cookie.get("value") or "")
-            fp.write(
-                f"{domain}\t{include_subdomains}\t{cookie_path}\t{secure}\t"
-                f"{expires}\t{name}\t{value}\n"
-            )
-    try:
-        os.chmod(temporary, 0o600)
-    except OSError:
-        pass
-    os.replace(temporary, path)
-    secure_private_path(path)
+    ensure_private_directory(path.parent)
+    lines = ["# Netscape HTTP Cookie File", ""]
+    for cookie in sorted(
+        cookies,
+        key=lambda item: (
+            str(item.get("domain") or ""),
+            str(item.get("path") or "/"),
+            str(item.get("name") or ""),
+        ),
+    ):
+        domain = str(cookie.get("domain") or "")
+        include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+        cookie_path = str(cookie.get("path") or "/")
+        secure = "TRUE" if cookie.get("secure") else "FALSE"
+        expires = max(0, int(float(cookie.get("expires") or 0)))
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        lines.append(
+            f"{domain}\t{include_subdomains}\t{cookie_path}\t{secure}\t"
+            f"{expires}\t{name}\t{value}"
+        )
+    write_private_text(path, "\n".join(lines) + "\n")

@@ -10,6 +10,11 @@ from typing import Any, Awaitable, Callable
 
 from .config import DedupSettings
 from .database import Database
+from .file_security import (
+    ensure_private_directory,
+    open_private_binary,
+    secure_private_path,
+)
 
 
 AnalysisRunner = Callable[[dict[str, Any]], Awaitable[tuple[dict[str, Any], str]]]
@@ -42,7 +47,7 @@ class DedupReviewManager:
     ) -> None:
         self.db = db
         self.settings = settings
-        self.runtime_dir = (runtime_dir / "reviews").resolve()
+        self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir / "reviews")))
         self.runner = runner
         self._loop_task: asyncio.Task | None = None
         self._process: asyncio.subprocess.Process | None = None
@@ -58,7 +63,7 @@ class DedupReviewManager:
         self.db.recover_crawl_reviews()
         if not self.settings.enabled:
             return
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.runtime_dir)
         self._loop_task = asyncio.create_task(self._loop(), name="dedup-review-manager")
 
     async def stop(self) -> None:
@@ -145,9 +150,11 @@ class DedupReviewManager:
         if not core.is_file():
             raise FileNotFoundError(f"去重核心脚本不存在: {core}")
 
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.runtime_dir)
         manifest_path = self.runtime_dir / f"{batch_id}.json"
         log_path = self.runtime_dir / f"{batch_id}.log"
+        secure_private_path(manifest_path)
+        secure_private_path(log_path)
         manifest_path.unlink(missing_ok=True)
         command = [
             str(python),
@@ -163,6 +170,14 @@ class DedupReviewManager:
             self.settings.device,
             "--workers",
             str(self.settings.workers),
+            "--torch-threads",
+            str(self.settings.torch_threads),
+            "--torch-interop-threads",
+            str(self.settings.torch_interop_threads),
+            "--deep-batch-size",
+            str(self.settings.deep_batch_size),
+            "--neighbor-block-size",
+            str(self.settings.neighbor_block_size),
         ]
         if self.settings.no_sscd:
             command.append("--no-sscd")
@@ -170,8 +185,9 @@ class DedupReviewManager:
             command.append("--no-dino")
         environment = os.environ.copy()
         environment.setdefault("PYTHONUTF8", "1")
+        environment.setdefault("PYTHONUNBUFFERED", "1")
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        with log_path.open("wb") as log_file:
+        with open_private_binary(log_path) as log_file:
             self._process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(worker.parent),
@@ -188,6 +204,8 @@ class DedupReviewManager:
             )
         if not manifest_path.is_file():
             raise RuntimeError("去重分析进程未生成审核清单")
+        secure_private_path(manifest_path)
+        secure_private_path(log_path)
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

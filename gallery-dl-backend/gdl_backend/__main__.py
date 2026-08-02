@@ -11,6 +11,8 @@ from .config import AppSettings, PROJECT_DIR
 
 
 def main() -> None:
+    if os.name != "nt":
+        os.umask(0o077)
     parser = argparse.ArgumentParser(description="gallery-dl + native proxy backend")
     parser.add_argument("--config", help="JSON 配置文件路径")
     parser.add_argument("--host", help="覆盖监听地址")

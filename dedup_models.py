@@ -31,6 +31,28 @@ SSCD_CACHE_KEY = "sscd_disc_mixup_320_v1"
 DINO_CACHE_KEY = "dinov2_vits14_full224_v1"
 
 
+def _reject_managed_symlink(path: Path) -> None:
+    path = Path(os.path.abspath(os.fspath(path)))
+    for candidate in (*reversed(path.parents), path):
+        if candidate.is_symlink():
+            raise RuntimeError(f"模型缓存路径不能包含符号链接: {candidate}")
+
+
+def _private_directory(path: Path) -> Path:
+    _reject_managed_symlink(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _reject_managed_symlink(path)
+    path.chmod(0o700)
+    return path
+
+
+def _secure_cache_files(path: Path) -> None:
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        _reject_managed_symlink(candidate)
+        if candidate.exists():
+            candidate.chmod(0o600)
+
+
 def resolve_device(requested: str) -> str:
     import torch
 
@@ -42,10 +64,10 @@ def resolve_device(requested: str) -> str:
 
 
 def model_root(path: str | os.PathLike[str]) -> Path:
-    root = Path(path).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    root = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    _private_directory(root)
     torch_home = root / "torch"
-    torch_home.mkdir(parents=True, exist_ok=True)
+    _private_directory(torch_home)
     os.environ["TORCH_HOME"] = str(torch_home)
     return root
 
@@ -76,22 +98,29 @@ def verify_or_remove(path: Path, expected_sha256: str) -> None:
 
 
 def download_file(url: str, destination: Path, expected_sha256: str | None = None) -> Path:
+    _reject_managed_symlink(destination)
     if destination.is_file() and destination.stat().st_size > 0:
         try:
             if expected_sha256:
                 verify_file(destination, expected_sha256)
+            destination.chmod(0o600)
             return destination
         except RuntimeError:
             destination.unlink(missing_ok=True)
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _private_directory(destination.parent)
     part_path = destination.with_suffix(destination.suffix + ".part")
+    _reject_managed_symlink(part_path)
     part_path.unlink(missing_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": "image-dedup/1.0"})
+    part_created = False
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
             total = int(response.headers.get("Content-Length", 0))
-            with part_path.open("wb") as file_obj, tqdm(
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(part_path, flags, 0o600)
+            part_created = True
+            with os.fdopen(descriptor, "wb") as file_obj, tqdm(
                 total=total or None,
                 unit="B",
                 unit_scale=True,
@@ -103,11 +132,15 @@ def download_file(url: str, destination: Path, expected_sha256: str | None = Non
                         break
                     file_obj.write(chunk)
                     progress.update(len(chunk))
+        _reject_managed_symlink(destination)
         os.replace(part_path, destination)
+        part_created = False
+        destination.chmod(0o600)
         if expected_sha256:
             verify_file(destination, expected_sha256)
     except Exception:
-        part_path.unlink(missing_ok=True)
+        if part_created:
+            part_path.unlink(missing_ok=True)
         if expected_sha256:
             destination.unlink(missing_ok=True)
         raise
@@ -116,7 +149,9 @@ def download_file(url: str, destination: Path, expected_sha256: str | None = Non
 
 class EmbeddingCache:
     def __init__(self, database_path: Path):
-        database_path.parent.mkdir(parents=True, exist_ok=True)
+        _private_directory(database_path.parent)
+        _secure_cache_files(database_path)
+        self.database_path = database_path
         self.connection = sqlite3.connect(database_path)
         # 多个去重进程可能同时读写同一缓存库：WAL + busy_timeout 避免 database is locked
         self.connection.execute("PRAGMA journal_mode=WAL")
@@ -132,6 +167,7 @@ class EmbeddingCache:
             )
             """
         )
+        _secure_cache_files(database_path)
 
     def get(self, model_key: str, file_hash: str) -> np.ndarray | None:
         row = self.connection.execute(
@@ -160,6 +196,7 @@ class EmbeddingCache:
 
     def close(self) -> None:
         self.connection.close()
+        _secure_cache_files(self.database_path)
 
 
 def _normalized_transform(size: int):
@@ -188,6 +225,7 @@ class DeepEmbeddingExtractor:
         batch_size: int = 16,
         use_sscd: bool = True,
         use_dino: bool = True,
+        decode_workers: int = 4,
     ):
         import torch
 
@@ -195,6 +233,7 @@ class DeepEmbeddingExtractor:
         self.root = model_root(root)
         self.device = resolve_device(device)
         self.batch_size = max(1, batch_size)
+        self.decode_workers = max(1, int(decode_workers))
         self.cache = EmbeddingCache(self.root / "embeddings.sqlite3")
         self.models = {}
         self.transforms = {}
@@ -209,9 +248,11 @@ class DeepEmbeddingExtractor:
 
         if use_dino:
             dino_checkpoint = self.root / "torch" / "hub" / "checkpoints" / "dinov2_vits14_pretrain.pth"
+            local_repository = self.root / "torch" / "hub" / DINO_REPOSITORY_CACHE
+            _reject_managed_symlink(dino_checkpoint)
+            _reject_managed_symlink(local_repository)
             if dino_checkpoint.is_file():
                 verify_or_remove(dino_checkpoint, DINO_SHA256)
-            local_repository = self.root / "torch" / "hub" / DINO_REPOSITORY_CACHE
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="xFormers is not available.*")
                 if (local_repository / "hubconf.py").is_file():
@@ -233,6 +274,9 @@ class DeepEmbeddingExtractor:
                     )
             if dino_checkpoint.is_file():
                 verify_or_remove(dino_checkpoint, DINO_SHA256)
+                dino_checkpoint.chmod(0o600)
+            if local_repository.is_dir() and not local_repository.is_symlink():
+                local_repository.chmod(0o700)
             self.models["dino"] = model.eval().to(self.device)
             self.transforms["dino"] = _normalized_transform(224)
 
@@ -309,7 +353,7 @@ class DeepEmbeddingExtractor:
         # 主线程严格按提交顺序消费，各模型攒批顺序 = 其 missing 序列原顺序，
         # 分批切法与逐模型独立跑完全一致；在途任务不超过 batch_size*3，防止解码结果无界堆积
         window = self.batch_size * 3
-        pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
+        pool = ThreadPoolExecutor(max_workers=self.decode_workers)
         try:
             entry_iter = iter(union_missing)
             inflight = deque(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
 import threading
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .file_security import ensure_private_directory, secure_sqlite_files
 from .redaction import redact_data, redact_text
 
 
@@ -20,8 +22,11 @@ TERMINAL_BATCH_STATUSES = {"succeeded", "completed_with_errors", "cancelled"}
 
 class Database:
     def __init__(self, path: Path, *, max_logs_per_task: int = 5000) -> None:
-        self.path = path.resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 不先 resolve 叶节点，否则 SQLite 文件符号链接会被静默解引用。
+        self.path = Path(os.path.abspath(os.fspath(path)))
+        # 已存在的自定义外部父目录保持用户权限；新目录仍以 0700 创建。
+        ensure_private_directory(self.path.parent, repair_existing=False)
+        secure_sqlite_files(self.path)
         self.max_logs_per_task = max(100, int(max_logs_per_task))
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
@@ -37,6 +42,7 @@ class Database:
             self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._initialize()
+            secure_sqlite_files(self.path)
 
     def _initialize(self) -> None:
         self._conn.executescript(
@@ -471,6 +477,7 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            secure_sqlite_files(self.path)
 
     def ping(self) -> bool:
         with self._lock:

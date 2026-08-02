@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import re
 import socket
 import sys
@@ -79,6 +80,8 @@ class ApiError(RuntimeError):
 
 class ServiceContainer:
     def __init__(self, settings: AppSettings) -> None:
+        if os.name != "nt":
+            os.umask(0o077)
         self.settings = settings
         self.db = Database(
             settings.database_path,

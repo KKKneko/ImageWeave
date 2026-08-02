@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import os
 import re
 import shutil
 import uuid
@@ -15,6 +16,7 @@ import requests
 from curl_cffi import requests as curl_requests
 
 from .classifier import FailureDecision, classify_result
+from .file_security import ensure_private_directory
 from .gallery import GalleryRunner
 from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
 from .redaction import redact_text
@@ -1382,8 +1384,8 @@ class DiscoveryService:
     ) -> None:
         self.gallery = gallery
         self.proxy = proxy
-        self.runtime_dir = (runtime_dir / "discovery").resolve()
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir / "discovery")))
+        ensure_private_directory(self.runtime_dir)
         self.auth_failure_callback = auth_failure_callback
 
     def _danbooru_node_tags(self, policy: SitePolicy) -> list[str]:

@@ -8,9 +8,12 @@
 | [`gallery-dl-codeberg/`](./gallery-dl-codeberg/) | 上游 gallery-dl Git submodule，源码树保持上游原样；后端所需行为差异由 `gallery-dl-backend/gdl_backend/worker_patches.py` 在 worker 进程内实现，勿直接修改本目录 |
 | [`Proxy_pool/`](./Proxy_pool/) | 早期抽出的独立代理池参考模块 |
 
-平台支持：**Windows 与 Linux 完整支持，macOS 兼容预览**。平台限制和运行要求见
-[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)；已解决问题与后续
-P1/P2 部署计划见 [`DEPLOYMENT_ROADMAP.md`](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)。
+当前发布门槛以 **Linux x86_64 + CPU-only** 为必测路径：Python 3.11 为最低版本，3.14 为
+推荐与当前实测版本；快速 CI 使用 Ubuntu 24.04/Python 3.11、3.14。Windows x86_64 安装与
+CUDA 12.8 锁定路径继续维护兼容，但本次 P1 未在对应硬件实测；macOS、Linux ARM 与其他
+加速器均未验证，不作隐式承诺。完整矩阵见
+[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)，部署状态见
+[`DEPLOYMENT_ROADMAP.md`](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)。
 
 ## Linux CPU（无 GPU）快速开始
 
@@ -30,8 +33,8 @@ export no_proxy="$NO_PROXY"
 ./scripts/run.sh
 ```
 
-安装器检查 Linux、Python >= 3.10、venv、git、下载与哈希工具，不自动运行 `sudo`；随后
-初始化 submodule、创建两个 venv、安装并校验 Mihomo、下载固定 revision 和 SHA-256 的
+安装器检查 Linux x86_64、Python 3.11–3.14、venv、git、下载与哈希工具，不自动运行
+`sudo`；随后初始化 submodule、创建两个 venv、安装并校验 Mihomo、下载固定 revision 和 SHA-256 的
 SSCD/DINOv2，并创建但不覆盖 `gallery-dl-backend/config.json`。快速重跑可用
 `--skip-models`、`--skip-mihomo`、`--skip-submodule`、`--skip-backend-deps` 或
 `--skip-dedup-deps`；跳过仍启用的模型后，doctor/readyz 会如实保持 not ready。
@@ -41,11 +44,22 @@ SSCD/DINOv2，并创建但不覆盖 `gallery-dl-backend/config.json`。快速重
 | 后端 venv | `gallery-dl-backend/.venv` | FastAPI、gallery-dl worker、代理与授权 |
 | 去重 venv | `.venv` | OpenCV headless、CPU PyTorch、SSCD/DINOv2 推理 |
 
-CPU 清单为 `requirements-dedup-common.txt` + `requirements-dedup-cpu.txt`，只安装官方
-`torch==2.11.0+cpu`/`torchvision==0.26.0+cpu`，不得包含 CUDA wheel、`nvidia-*` 运行时，
-也不会与普通 `opencv-python` 混装。CUDA 是独立的 `requirements-dedup-cuda.txt` 路径，
-不能用于无 GPU Linux 服务器。模型和 embedding 缓存位于 `.models/`，doctor 只做快速状态
-检查，不重复下载或推理。
+`gallery-dl-backend/pyproject.toml` 是后端及去重**直接依赖的唯一事实来源**。
+`gallery-dl-backend/requirements.txt`、`requirements-dedup-common.txt`、
+`requirements-dedup-cpu.txt` 和 `requirements-dedup-cuda.txt` 都是带哈希的完整传递依赖锁；
+setup 按设备只安装一份完整环境锁，不会在普通安装时升级到任意最新版。CPU 锁固定
+`torch==2.11.0+cpu`/`torchvision==0.26.0+cpu`，不含 `nvidia-*`、CUDA/Triton，且只含
+`opencv-python-headless`。CUDA 12.8 使用独立锁，不能用于无 GPU 主机。
+
+维护者更新与检查依赖：
+
+```bash
+./scripts/lock-dependencies.sh --upgrade  # 显式更新全部锁
+./scripts/lock-dependencies.sh --check    # CI 使用：验证锁与事实来源无漂移
+```
+
+维护脚本固定临时使用 `uv==0.12.1`；普通安装不要求预装 uv。模型和 embedding 缓存位于
+`.models/`，doctor 只做快速状态与权限检查，不重复下载或推理。
 
 ### 三种代理不要混淆
 
@@ -54,6 +68,24 @@ CPU 清单为 `requirements-dedup-common.txt` + `requirements-dedup-cpu.txt`，�
 2. `config.json` 的 `proxy`：项目抓取代理池，需要订阅、节点文件或内联节点；新安装因没有
    节点源而默认禁用；Mihomo 只是其中隧道节点的传输核心；
 3. `auth.authorization_proxy`：X/Pixiv/EH 共享授权 Chrome 的专用代理，与抓取池独立。
+
+### CPU 资源边界
+
+Linux setup 会把 `dedup.device` 写为 `cpu`。资源字段的 `0` 表示自动保守档：最多 4 个图片
+预处理/模型解码 worker、最多 4 个 Torch intra-op 线程、1 个 inter-op 线程、CPU batch
+1–4、近邻分块 64–256，并把 OpenMP/MKL 与 OpenCV 原生线程纳入同一边界。可在
+`config.json` 的 `dedup.workers`、`torch_threads`、`torch_interop_threads`、
+`deep_batch_size`、`neighbor_block_size` 中用正整数覆盖。旧 P0 配置中的 `workers: 8` 是
+显式覆盖；希望采用新 profile 时改为 `0`。CUDA/`auto` 未显式覆盖时保留旧的 8/8/512 性能语义。
+实际设备、资源值和主要阶段耗时会写入审核 manifest 与 worker 日志。
+
+### CI 与权限边界
+
+快速 workflow 做锁漂移、后端完整测试、根 CPU 测试、CPU 纯净性及
+`/healthz`/`/readyz` smoke；每周/手动 workflow 才下载真实 SSCD+DINOv2 并运行程序生成
+图片闭环。应用管理的 runtime、SQLite、credentials/managed、审核 manifest/日志、代理核心
+配置和模型缓存使用目录 0700、文件 0600，并拒绝敏感管理路径中的符号链接。用户显式外部输出
+目录不被应用或 doctor 擅自 `chmod`，doctor 只报告其可用性与宽松权限。
 
 Chrome/Chromium 仅为桌面授权所需；无图形会话的 Linux 服务器仍可运行后端和 CPU 去重，
 但不能完成需要可见浏览器窗口的 X/Pixiv/EH 授权。启动后打开
@@ -65,7 +97,7 @@ Windows PowerShell 仍可分别安装：
 
 ```powershell
 cd .\gallery-dl-backend
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
 .\scripts\install_mihomo.ps1
 Copy-Item config.example.json config.json
 cd ..

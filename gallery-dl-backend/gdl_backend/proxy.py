@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 import time
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 import requests
 
 from .config import ProxySettings
+from .file_security import ensure_private_directory
 from .proxy_core import TunnelTransportCore
 from .proxy_runtime import LocalHTTPForwarder, NativeProxyPool, mask_proxy
 from .proxy_sources import ParsedProxyNode, fetch_subscriptions, parse_subscription_text
@@ -87,8 +89,8 @@ class ProxyPoolAdapter:
 
     def __init__(self, settings: ProxySettings, runtime_dir: Path) -> None:
         self.settings = settings
-        self.runtime_dir = (runtime_dir / "proxy").resolve()
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir / "proxy")))
+        ensure_private_directory(self.runtime_dir)
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._pool: NativeProxyPool | None = None

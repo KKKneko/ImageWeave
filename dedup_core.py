@@ -10,6 +10,19 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from dedup_resources import (
+    apply_thread_environment,
+    build_resource_profile,
+    configure_process_resources,
+    profile_from_argv,
+)
+
+# 直接 CLI 在导入 NumPy/OpenCV/Torch 前即可识别显式 CPU 档；审核 worker
+# 也会在加载本模块前完成同样配置。
+_early_resource_profile = profile_from_argv(sys.argv[1:])
+if _early_resource_profile is not None:
+    apply_thread_environment(_early_resource_profile)
+
 
 def project_venv_python():
     """返回当前平台的根目录去重 venv Python，同时保持 Windows 旧路径。"""
@@ -741,6 +754,7 @@ def extract_deep_candidates(base_infos, args):
         batch_size=args.deep_batch_size,
         use_sscd=not args.no_sscd,
         use_dino=not args.no_dino,
+        decode_workers=getattr(args, "model_decode_workers", min(4, os.cpu_count() or 4)),
     )
     sscd_pairs = {}
     dino_pairs = {}
@@ -1541,14 +1555,16 @@ def validate_args(parser, args):
         parser.error("--compression-noise-residual-std 必须大于等于 0")
     if args.compression_noise_sigma_delta < 0:
         parser.error("--compression-noise-sigma-delta 必须大于等于 0")
-    if args.workers < 1:
-        parser.error("--workers 必须大于等于 1")
-    if args.deep_batch_size < 1:
-        parser.error("--deep-batch-size 必须大于等于 1")
+    if args.workers < 0:
+        parser.error("--workers 必须是 0（自动）或正整数")
+    if args.torch_threads < 0 or args.torch_interop_threads < 0:
+        parser.error("Torch 线程参数必须是 0（自动）或正整数")
+    if args.deep_batch_size < 0:
+        parser.error("--deep-batch-size 必须是 0（自动）或正整数")
     if args.sscd_top_k < 1 or args.dino_top_k < 1:
         parser.error("--sscd-top-k 和 --dino-top-k 必须大于等于 1")
-    if args.neighbor_block_size < 1:
-        parser.error("--neighbor-block-size 必须大于等于 1")
+    if args.neighbor_block_size < 0:
+        parser.error("--neighbor-block-size 必须是 0（自动）或正整数")
 
 
 def print_review_groups(review_groups):
@@ -1632,10 +1648,10 @@ def build_argument_parser():
                         help="L1/L2 人工候选允许的对数宽高比差 (默认0.20)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
                         help="深度模型运行设备 (默认auto)")
-    parser.add_argument("--deep-batch-size", type=int, default=8,
-                        help="深度模型推理批量；6GB显存默认8 (默认8)")
-    parser.add_argument("--neighbor-block-size", type=int, default=512,
-                        help="向量 Top-K 检索分块大小 (默认512)")
+    parser.add_argument("--deep-batch-size", type=int, default=0,
+                        help="深度模型推理批量；0=按设备选择，CPU 保守、CUDA 保持8")
+    parser.add_argument("--neighbor-block-size", type=int, default=0,
+                        help="向量 Top-K 检索分块；0=按设备选择")
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR,
                         help=f"模型与特征缓存目录 (默认 {DEFAULT_MODEL_DIR})")
     parser.add_argument("--no-sscd", action="store_true", help="关闭 L1 SSCD，保留旧 pHash 流程")
@@ -1646,18 +1662,45 @@ def build_argument_parser():
     parser.add_argument("--delete", action="store_true", help="不选中的图直接删除，而不是移入 duplicates")
     parser.add_argument("--dry-run", action="store_true", help="仅模拟运行，打印结果，不改变文件")
     parser.add_argument("--no-gui", action="store_true", help="仅打印人工候选组，不打开审核界面")
-    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="多线程数量")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="图片预处理/关系分析 worker；0=按设备与 CPU 数量选择")
+    parser.add_argument("--torch-threads", type=int, default=0,
+                        help="Torch/OpenMP/MKL intra-op 线程；0=按设备选择")
+    parser.add_argument("--torch-interop-threads", type=int, default=0,
+                        help="Torch inter-op 线程；0=按设备选择")
     parser.add_argument("--move-txt", action="store_true", help="移动或删除图片时，同时处理同目录下的同名txt文件")
 
     return parser
 
 
 def main():
+    if os.name != "nt":
+        os.umask(0o077)
     parser = build_argument_parser()
 
     args = parser.parse_args()
     validate_args(parser, args)
+    profile = build_resource_profile(
+        args.device,
+        workers=args.workers,
+        deep_batch_size=args.deep_batch_size,
+        neighbor_block_size=args.neighbor_block_size,
+        torch_threads=args.torch_threads,
+        torch_interop_threads=args.torch_interop_threads,
+    )
+    args.workers = profile.workers
+    args.model_decode_workers = profile.model_decode_workers
+    args.deep_batch_size = profile.deep_batch_size
+    args.neighbor_block_size = profile.neighbor_block_size
+    actual_resources = configure_process_resources(profile)
     args.model_dir = os.path.abspath(args.model_dir)
+    print(
+        "资源参数："
+        f"device={args.device}, workers={args.workers}, batch={args.deep_batch_size}, "
+        f"torch={actual_resources.get('torch_threads') or '原有默认'}, "
+        f"interop={actual_resources.get('torch_interop_threads') or '原有默认'}, "
+        f"neighbor_block={args.neighbor_block_size}"
+    )
 
     if args.prepare_models:
         try:

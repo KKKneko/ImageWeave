@@ -1,2 +1,0 @@
-# 公共依赖入口；设备相关的 PyTorch 必须另选 CPU 或 CUDA 清单。
--r requirements-dedup-common.txt
