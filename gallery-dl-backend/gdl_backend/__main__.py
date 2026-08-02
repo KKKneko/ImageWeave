@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 
 import uvicorn
 
 from .app import create_app
-from .config import AppSettings
+from .config import AppSettings, PROJECT_DIR
 
 
 def main() -> None:
@@ -14,7 +16,18 @@ def main() -> None:
     parser.add_argument("--host", help="覆盖监听地址")
     parser.add_argument("--port", type=int, help="覆盖监听端口")
     args = parser.parse_args()
-    settings = AppSettings.load(args.config)
+    requested_config = args.config or os.environ.get("GDL_BACKEND_CONFIG")
+    config_path = (
+        Path(requested_config).expanduser().resolve()
+        if requested_config
+        else (PROJECT_DIR / "config.json")
+    )
+    if not config_path.is_file():
+        parser.error(
+            f"配置文件不存在：{config_path}；请先从仓库根目录运行 "
+            "./scripts/setup-linux.sh --device cpu，或复制 config.example.json 后用 --config 指定"
+        )
+    settings = AppSettings.load(config_path)
     if args.host:
         settings.server.host = args.host
     if args.port:

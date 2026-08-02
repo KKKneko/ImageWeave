@@ -6,9 +6,11 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 install_dir="$project_dir/bin"
 force=0
+proxy_mode="environment"
+proxy_url=""
 
 usage() {
-    printf 'Usage: %s [--install-dir PATH] [--force]\n' "$0"
+    printf '用法：%s [--install-dir PATH] [--force] [--proxy URL | --no-proxy]\n' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -22,6 +24,16 @@ while [[ $# -gt 0 ]]; do
             force=1
             shift
             ;;
+        --proxy)
+            [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 2; }
+            proxy_mode="explicit"
+            proxy_url="$2"
+            shift 2
+            ;;
+        --no-proxy)
+            proxy_mode="disabled"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -33,6 +45,17 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+case "$proxy_mode" in
+    explicit)
+        export HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
+        export http_proxy="$proxy_url" https_proxy="$proxy_url"
+        ;;
+    disabled)
+        unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+        export NO_PROXY="*" no_proxy="*"
+        ;;
+esac
 
 [[ "$(uname -s)" == "Linux" ]] || { printf 'This installer requires Linux.\n' >&2; exit 1; }
 
@@ -94,9 +117,15 @@ archive="$temporary_dir/$asset"
 url="https://github.com/MetaCubeX/mihomo/releases/download/${version}/${asset}"
 printf 'Downloading %s\n' "$url"
 if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$archive" "$url"
+    if ! curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$archive" "$url"; then
+        printf 'Mihomo 下载失败（代理模式：%s）；修复网络后重试同一命令。\n' "$proxy_mode" >&2
+        exit 1
+    fi
 elif command -v wget >/dev/null 2>&1; then
-    wget --https-only --tries=3 --timeout=30 --output-document="$archive" "$url"
+    if ! wget --https-only --tries=3 --timeout=30 --output-document="$archive" "$url"; then
+        printf 'Mihomo 下载失败（代理模式：%s）；修复网络后重试同一命令。\n' "$proxy_mode" >&2
+        exit 1
+    fi
 else
     printf 'Required download command not found: curl or wget\n' >&2
     exit 1

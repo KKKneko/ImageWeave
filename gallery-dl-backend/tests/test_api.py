@@ -28,9 +28,28 @@ class ApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
 
-    def test_health_and_local_api(self):
-        self.assertEqual(self.client.get("/healthz").status_code, 200)
+    def test_health_ready_and_local_api(self):
+        health = self.client.get("/healthz")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["components"]["database"]["status"], "ok")
+        ready = self.client.get("/readyz")
+        self.assertEqual(ready.status_code, 200, ready.text)
+        self.assertTrue(ready.json()["ready"])
+        self.assertEqual(ready.json()["components"]["dedup"]["status"], "disabled")
+        self.assertEqual(
+            ready.json()["components"]["project_proxy"]["status"], "disabled"
+        )
         self.assertEqual(self.client.get("/api/v1/tasks").status_code, 200)
+
+    def test_ready_fails_when_enabled_dedup_python_is_missing(self):
+        self.settings.dedup.enabled = True
+        self.settings.dedup.python_executable = Path(self.temp.name) / "missing-python"
+        ready = self.client.get("/readyz")
+        self.assertEqual(ready.status_code, 503, ready.text)
+        self.assertFalse(ready.json()["ready"])
+        self.assertEqual(
+            ready.json()["components"]["dedup_python"]["status"], "error"
+        )
 
     def test_webui_static_assets_and_root_link(self):
         root = self.client.get("/")

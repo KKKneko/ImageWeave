@@ -68,6 +68,20 @@ def _path(value: str | os.PathLike[str] | None, base: Path, default: Path) -> Pa
     return path.resolve()
 
 
+def _executable_path(
+    value: str | os.PathLike[str] | None,
+    base: Path,
+    default: Path,
+) -> Path:
+    """规范化解释器路径，但不解引用 venv 的 python 符号链接。"""
+    path = default if value in (None, "") else Path(
+        os.path.expandvars(os.path.expanduser(str(value)))
+    )
+    if not path.is_absolute():
+        path = base / path
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def _paths(values: list[str] | None, base: Path, defaults: list[Path]) -> list[Path]:
     if not values:
         return [p.resolve() for p in defaults]
@@ -178,7 +192,7 @@ class SchedulerSettings:
 
 def _default_dedup_python() -> Path:
     relative = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
-    return (WORKSPACE_DIR / ".venv" / relative).resolve()
+    return Path(os.path.abspath(WORKSPACE_DIR / ".venv" / relative))
 
 
 @dataclass(slots=True)
@@ -323,7 +337,7 @@ class AppSettings:
         )
         dedup = DedupSettings(
             enabled=bool(dedup_data.get("enabled", True)),
-            python_executable=_path(
+            python_executable=_executable_path(
                 dedup_data.get("python_executable"),
                 base,
                 _default_dedup_python(),

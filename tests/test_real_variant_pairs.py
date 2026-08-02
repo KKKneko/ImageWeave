@@ -32,7 +32,7 @@ class RealVariantPairTests(unittest.TestCase):
         from dedup_models import DeepEmbeddingExtractor
 
         cls.infos = [DEDUP.get_image_info(str(cls.image_root / name)) for name in cls.names]
-        extractor = DeepEmbeddingExtractor(ROOT / ".models", device="cuda", batch_size=4)
+        extractor = DeepEmbeddingExtractor(ROOT / ".models", device="cpu", batch_size=4)
         for model_name, key in (("sscd", "sscd_embedding"), ("dino", "dino_embedding")):
             vectors = extractor.encode_infos(cls.infos, model_name)
             for info, vector in zip(cls.infos, vectors):

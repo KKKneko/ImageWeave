@@ -134,7 +134,8 @@ class DedupReviewManager:
 
     async def _run_worker(self, claimed: dict[str, Any]) -> tuple[dict[str, Any], str]:
         batch_id = str(claimed["batch_id"])
-        python = self.settings.python_executable.resolve()
+        # 不解引用 .venv/bin/python 符号链接，否则会退化为缺少依赖的系统 Python。
+        python = self.settings.python_executable.absolute()
         worker = self.settings.worker_script.resolve()
         core = self.settings.core_script.resolve()
         if not python.is_file():

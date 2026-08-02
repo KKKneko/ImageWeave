@@ -120,6 +120,9 @@ def apply_activity_heartbeat_patch() -> bool:
 
         def write(self, data):
             result = self._fp.write(data)
+            # 每个完整网络块写入后刷新 Python 用户态缓冲；watchdog 随后终止进程时，
+            # 已收到的块仍会留在非空 .part 中。这里只 flush，不做昂贵的逐块 fsync。
+            self._fp.flush()
             now = time.monotonic()
             if state["activity"] and now - state["last_touch"] >= 1.0:
                 state["last_touch"] = now

@@ -19,7 +19,8 @@
 | macOS | 兼容预览 | 具备 POSIX 基础实现；孤儿进程识别仍有 Linux `/proc` 依赖。 |
 
 站点授权需要桌面环境中的 Chrome、Chromium 或 Chromium Browser。非标准路径通过
-`auth.chrome_executable` 配置。
+`auth.chrome_executable` 配置。doctor 检测到浏览器不等于服务器具备桌面会话；纯 SSH/headless
+环境可以运行 API、下载调度和 CPU 去重，但不能完成需要可见窗口的 X/Pixiv/EH 授权。
 
 X、Pixiv、EH 登录授权可通过 `auth.authorization_proxy`（或授权面板中的「授权专用代理」
 输入框，运行时设置优先并持久化）指定一个独立代理，例如 `http://127.0.0.1:7890`；
@@ -46,62 +47,65 @@ X、Pixiv、EH 登录授权可通过 `auth.authorization_proxy`（或授权面�
 具体进程边界、状态机、搜索证据规则和代理选择算法见
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)。
 
-## 快速开始
+## Linux CPU（无 GPU）快速开始
 
-先在仓库根目录初始化上游子模块：
-
-```bash
-git submodule update --init --recursive
-```
-
-Linux：
+从仓库根目录运行统一安装器，而不是分别手工创建环境。以下代理地址只是当前主机示例，可改用
+环境变量中的其他地址；`--no-proxy` 可明确关闭安装下载代理：
 
 ```bash
-cd gallery-dl-backend
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
-bash scripts/install_mihomo.sh
-cp config.example.json config.json
-bash run_backend.sh
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy="$NO_PROXY"
+
+./scripts/setup-linux.sh --device cpu --proxy http://127.0.0.1:7890
+./scripts/doctor.sh
+./scripts/run.sh
 ```
 
-Windows PowerShell：
+安装器不会执行 `sudo`；缺少 Python >= 3.10、venv、git、curl/wget、gzip 或 SHA-256 工具时，
+会分别给出 Debian/Ubuntu 与 Arch Linux 安装提示。它幂等初始化 submodule、创建
+`gallery-dl-backend/.venv`（后端）和根 `.venv`（去重），安装官方 CPU PyTorch 与
+`opencv-python-headless`、校验 Mihomo v1.19.28，并把 SSCD/DINOv2 缓存到根 `.models`。
+`--skip-models`、`--skip-mihomo` 等选项用于快速重跑；已有 config、模型缓存和运行数据不会被
+覆盖。新建 config 为 0600，runtime/credentials 等敏感目录为 0700。
 
-```powershell
-cd .\gallery-dl-backend
-python -m pip install -r requirements.txt
-.\scripts\install_mihomo.ps1
-Copy-Item config.example.json config.json
-.\run_backend.ps1
+CPU 环境使用 `requirements-dedup-common.txt` + `requirements-dedup-cpu.txt`，不含 CUDA
+wheel、`nvidia-*` 或普通 OpenCV；`requirements-dedup-cuda.txt` 是独立 CUDA 路径，不适合
+无 GPU 主机。安装脚本固定下载并校验受支持的 Mihomo 版本；单独安装时也支持：
+
+```bash
+bash gallery-dl-backend/scripts/install_mihomo.sh --proxy http://127.0.0.1:7890
+# 或明确直连：--no-proxy
 ```
 
-安装脚本固定下载并校验受支持的 Mihomo 版本。自定义目录、强制重装及手动安装见
-[`docs/MIHOMO.md`](./docs/MIHOMO.md)。
+自定义目录、强制重装及手动安装见 [`docs/MIHOMO.md`](./docs/MIHOMO.md)。Windows PowerShell
+仍使用 `scripts/install_mihomo.ps1` 和根 `setup-dedup.ps1`。
 
-## 最小配置
+## 最小配置与代理边界
 
-编辑 `config.json`，至少设置代理来源。完整字段及默认值以
-[`config.example.json`](./config.example.json) 为准：
+完整字段以 [`config.example.json`](./config.example.json) 为准。示例中的项目抓取代理池和去重
+默认禁用，避免在没有节点源、根 venv 或模型时静默进入半可用状态；统一 Linux CPU 安装器会
+准备模型并只启用去重。直连抓取可以保持 `proxy.enabled=false`；需要抓取代理池时再显式启用并
+配置订阅、`proxy.node_file` 或 `inline_nodes`：
 
 ```json
 {
   "proxy": {
     "enabled": true,
     "auto_start": true,
-    "engine": "native",
-    "allow_socks": true,
-    "subscription_urls": [
-      "https://SUBSCRIPTION_URL"
-    ],
-    "transport_core_enabled": true,
-    "transport_core_base_port": 29000
+    "subscription_urls": ["https://SUBSCRIPTION_URL"],
+    "transport_core_enabled": true
   }
 }
 ```
 
-也可以用 `proxy.node_file` 指向本地节点文件，格式示例见
-[`nodes.example.txt`](./nodes.example.txt)。后端完整导入节点后统一探活，不限制导入数量。
+`HTTP_PROXY`/`HTTPS_PROXY` 和 setup 的 `--proxy` 只服务于 git/pip/Mihomo/模型下载，不会写入
+config，也不会被 doctor 当作抓取代理池节点。Mihomo 是抓取池中 VLESS/VMess/Trojan 等隧道
+节点的本地传输核心，不是节点订阅本身。`auth.authorization_proxy` 又是共享授权 Chrome 的第三
+条独立线路。后端完整导入项目节点后统一探活，不限制导入数量。
 
 默认从项目 `bin/` 和系统 `PATH` 查找 Mihomo。其他位置使用
 `proxy.transport_core_binary`；需要固定校验本地可执行文件时，再设置
@@ -109,10 +113,12 @@ Copy-Item config.example.json config.json
 
 ## 启动与入口
 
-Linux 启动脚本优先使用 `.venv/bin/python`，并透传 `--config`、`--host` 和 `--port`：
+推荐从根目录运行 `./scripts/run.sh`，它会先执行快速 doctor。直接运行后端脚本时只使用明确的
+`PYTHON` 或 `gallery-dl-backend/.venv/bin/python`；venv/config 缺失会 fail-fast，不再回退
+系统 Python 或静默使用默认配置。`--config`、`--host` 和 `--port` 会继续透传：
 
 ```bash
-bash run_backend.sh --config ./config.json --port 8788
+bash gallery-dl-backend/run_backend.sh --port 8788
 ```
 
 Windows 可运行 `run_backend.ps1`，也可以直接执行：
@@ -130,6 +136,12 @@ python -m gdl_backend --config .\config.json
 | Swagger | `http://127.0.0.1:8787/docs` |
 | 健康检查 | `http://127.0.0.1:8787/healthz` |
 | 就绪检查 | `http://127.0.0.1:8787/readyz` |
+
+`/healthz` 只表示进程与 SQLite 存活；`/readyz` 结构化报告 submodule、调度器、项目抓取代理、
+Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件显示 `disabled`，启用去重
+但 Python/Torch/任一启用模型缺失时返回 HTTP 503。`./scripts/doctor.sh` 做同类快速检查，并额外
+报告配置/敏感目录权限和可选 Chrome 状态，不下载模型、不运行推理，也不会打印订阅 URL、
+Cookie 或 token。
 
 服务只允许绑定回环地址。任务和探活目标默认拒绝回环、私网、链路本地及保留 IP；本地部署
 确需访问局域网图站时，在 `server` 配置中设置 `"allow_private_targets": true`。

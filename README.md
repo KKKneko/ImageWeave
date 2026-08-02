@@ -9,55 +9,80 @@
 | [`Proxy_pool/`](./Proxy_pool/) | 早期抽出的独立代理池参考模块 |
 
 平台支持：**Windows 与 Linux 完整支持，macOS 兼容预览**。平台限制和运行要求见
-[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)。
+[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)；已解决问题与后续
+P1/P2 部署计划见 [`DEPLOYMENT_ROADMAP.md`](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)。
 
-## 快速开始
+## Linux CPU（无 GPU）快速开始
 
-首次检出先初始化上游子模块：
-
-```bash
-git submodule update --init --recursive
-```
-
-Linux：
+在仓库根目录执行统一安装器。下面的 `127.0.0.1:7890` 只是一个本机安装代理示例，按实际
+环境替换；也可只设置 `HTTP_PROXY`/`HTTPS_PROXY`，或用 `--no-proxy` 明确直连：
 
 ```bash
-cd gallery-dl-backend
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-bash scripts/install_mihomo.sh
-cp config.example.json config.json
-bash run_backend.sh
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy="$NO_PROXY"
+
+./scripts/setup-linux.sh --device cpu --proxy http://127.0.0.1:7890
+./scripts/doctor.sh
+./scripts/run.sh
 ```
 
-Windows PowerShell：
+安装器检查 Linux、Python >= 3.10、venv、git、下载与哈希工具，不自动运行 `sudo`；随后
+初始化 submodule、创建两个 venv、安装并校验 Mihomo、下载固定 revision 和 SHA-256 的
+SSCD/DINOv2，并创建但不覆盖 `gallery-dl-backend/config.json`。快速重跑可用
+`--skip-models`、`--skip-mihomo`、`--skip-submodule`、`--skip-backend-deps` 或
+`--skip-dedup-deps`；跳过仍启用的模型后，doctor/readyz 会如实保持 not ready。
+
+| 环境 | 路径 | 用途 |
+| --- | --- | --- |
+| 后端 venv | `gallery-dl-backend/.venv` | FastAPI、gallery-dl worker、代理与授权 |
+| 去重 venv | `.venv` | OpenCV headless、CPU PyTorch、SSCD/DINOv2 推理 |
+
+CPU 清单为 `requirements-dedup-common.txt` + `requirements-dedup-cpu.txt`，只安装官方
+`torch==2.11.0+cpu`/`torchvision==0.26.0+cpu`，不得包含 CUDA wheel、`nvidia-*` 运行时，
+也不会与普通 `opencv-python` 混装。CUDA 是独立的 `requirements-dedup-cuda.txt` 路径，
+不能用于无 GPU Linux 服务器。模型和 embedding 缓存位于 `.models/`，doctor 只做快速状态
+检查，不重复下载或推理。
+
+### 三种代理不要混淆
+
+1. `HTTP_PROXY`/`HTTPS_PROXY` 或 setup 的 `--proxy`：只辅助 git、pip、Mihomo 和模型下载，
+   不写入 `config.json`，也不表示抓取任务已有节点；
+2. `config.json` 的 `proxy`：项目抓取代理池，需要订阅、节点文件或内联节点；新安装因没有
+   节点源而默认禁用；Mihomo 只是其中隧道节点的传输核心；
+3. `auth.authorization_proxy`：X/Pixiv/EH 共享授权 Chrome 的专用代理，与抓取池独立。
+
+Chrome/Chromium 仅为桌面授权所需；无图形会话的 Linux 服务器仍可运行后端和 CPU 去重，
+但不能完成需要可见浏览器窗口的 X/Pixiv/EH 授权。启动后打开
+`http://127.0.0.1:8787/ui/`。配置、授权、API 和测试说明见
+[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md)，架构与状态机见
+[`gallery-dl-backend/docs/ARCHITECTURE.md`](./gallery-dl-backend/docs/ARCHITECTURE.md)。
+
+Windows PowerShell 仍可分别安装：
 
 ```powershell
 cd .\gallery-dl-backend
 python -m pip install -r requirements.txt
 .\scripts\install_mihomo.ps1
 Copy-Item config.example.json config.json
-.\run_backend.ps1
+cd ..
+.\setup-dedup.ps1 -ProxyUrl http://127.0.0.1:7890
+.\gallery-dl-backend\run_backend.ps1
 ```
-
-启动后打开 `http://127.0.0.1:8787/ui/`。配置、授权、API 和测试说明集中在
-[`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md)，架构与状态机见
-[`gallery-dl-backend/docs/ARCHITECTURE.md`](./gallery-dl-backend/docs/ARCHITECTURE.md)。
 
 ## L0-L2 图片变体去重
 
-以下命令从仓库根目录执行。首次安装会在仓库根目录创建或复用去重专用 `.venv`，并把官方
-SSCD、DINOv2 权重缓存到根目录 `.models`；它与 Linux 快速开始中可选的
-`gallery-dl-backend/.venv` 后端环境相互独立。默认代理为 `http://127.0.0.1:7890`：
-
-```powershell
-.\setup-dedup.ps1
-```
+以下命令从仓库根目录执行。Linux 先使用上面的统一安装器；Windows 可用
+`setup-dedup.ps1 -ProxyUrl URL`（不传则继承环境代理，`-NoProxy` 明确直连）。官方 SSCD、
+DINOv2 权重缓存到 `.models`，与两个 venv 分离。
 
 先模拟扫描：
 
-```powershell
-python ".\dedup_core.py" "图片目录" --dry-run --move-txt
+```bash
+./.venv/bin/python ./dedup_core.py "图片目录" --device cpu --dry-run --move-txt
 ```
 
 确认候选后移除 `--dry-run` 正式处理。脚本会自动切换到同目录 `.venv`，分层规则为：
@@ -69,8 +94,8 @@ python ".\dedup_core.py" "图片目录" --dry-run --move-txt
 默认参数采用平衡档。模型向量按文件 SHA256 缓存在 `.models/embeddings.sqlite3`，重复扫描会复用。
 使用 `--no-sscd` 或 `--no-dino` 可关闭对应层；完整参数见：
 
-```powershell
-python ".\dedup_core.py" --help
+```bash
+./.venv/bin/python ./dedup_core.py --help
 ```
 
 ## 聚合爬图到人工审核
@@ -89,6 +114,6 @@ python ".\dedup_core.py" --help
 新建和历史终态批次都保持“去重未开始”，只有显式启动才建立分析任务。读取批次详情、打开
 WebUI 或重启服务均不会隐式排队。
 
-聚合工作流仍从 `gallery-dl-backend` 启动，打开 `http://127.0.0.1:8787/ui/` 即可在同一批次
+聚合工作流使用根目录 `./scripts/run.sh` 启动，打开 `http://127.0.0.1:8787/ui/` 即可在同一批次
 页面完成爬取、去重和质量筛选。去重环境、脚本与模型路径可通过后端 `config.json` 的 `dedup`
 段覆盖，默认均指向本目录现有资源。

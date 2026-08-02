@@ -34,8 +34,8 @@
     "authorization_proxy": ""
   },
   "proxy": {
-    "enabled": true,
-    "auto_start": true,
+    "enabled": false,
+    "auto_start": false,
     "engine": "native",
     "subscription_urls": [],
     "node_file": "",
@@ -59,7 +59,7 @@
     "retry_jitter_seconds": 0.5
   },
   "dedup": {
-    "enabled": true,
+    "enabled": false,
     "python_executable": "",
     "worker_script": "../dedup_review_worker.py",
     "core_script": "../dedup_core.py",

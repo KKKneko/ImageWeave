@@ -25,6 +25,7 @@ from .auth import AuthError, AuthManager
 from .config import AppSettings
 from .crawl import CrawlPlanError, CrawlPlanner
 from .database import Database, TERMINAL_STATUSES
+from .diagnostics import readiness_snapshot
 from .discovery import (
     DiscoveryError,
     DiscoveryService,
@@ -364,22 +365,26 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": service.db.ping(), "time": time.time()}
+        database_ok = service.db.ping()
+        payload = {
+            "ok": database_ok,
+            "components": {
+                "process": {"status": "ok"},
+                "database": {"status": "ok" if database_ok else "error"},
+            },
+            "time": time.time(),
+        }
+        return JSONResponse(status_code=200 if database_ok else 503, content=payload)
 
     @app.get("/readyz")
     async def readyz():
-        gallery_ok = (settings.gallery.repo_path / "gallery_dl" / "__init__.py").is_file()
-        payload = {
-            "ready": bool(gallery_ok and service.db.ping()),
-            "gallery_source": gallery_ok,
-            "scheduler": service.scheduler.active_summary(),
-            "ordered_crawls": service.ordered_crawls.status(),
-            "proxy": {
-                key: value
-                for key, value in service.proxy.status().items()
-                if key not in {"nodes", "binary"}
-            },
-        }
+        payload = readiness_snapshot(
+            settings,
+            database_ok=service.db.ping(),
+            live_proxy_status=service.proxy.status(),
+            scheduler=service.scheduler.active_summary(),
+            ordered_crawls=service.ordered_crawls.status(),
+        )
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
     @api.get("/config")

@@ -411,6 +411,18 @@ def main() -> int:
     else:
         auto_groups, review_groups = [], []
     manifest = build_manifest(root, image_paths, image_infos, auto_groups, review_groups, core)
+    actual_device = args.device
+    if not args.no_sscd or not args.no_dino:
+        from dedup_models import resolve_device
+
+        actual_device = resolve_device(args.device)
+    manifest["analysis"] = {
+        "device": actual_device,
+        "models": {
+            "sscd": not args.no_sscd,
+            "dinov2": not args.no_dino,
+        },
+    }
     write_manifest(args.output.resolve(), manifest)
     print(
         "审核清单完成: "

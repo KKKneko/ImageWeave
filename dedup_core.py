@@ -11,10 +11,17 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+def project_venv_python():
+    """返回当前平台的根目录去重 venv Python，同时保持 Windows 旧路径。"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    relative = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
+    return os.path.join(root, ".venv", *relative)
+
+
 def reexec_in_project_venv():
     if __name__ != "__main__" or os.environ.get("DEDUP_VENV_ACTIVE") == "1":
         return
-    venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Scripts", "python.exe")
+    venv_python = project_venv_python()
     if not os.path.isfile(venv_python):
         return
     current_python = os.path.normcase(os.path.abspath(sys.executable))
@@ -713,9 +720,14 @@ def extract_deep_candidates(base_infos, args):
     try:
         from dedup_models import DeepEmbeddingExtractor, cosine_topk_pairs
     except ImportError as exc:
+        setup_command = (
+            "setup-dedup.ps1"
+            if os.name == "nt"
+            else "./scripts/setup-linux.sh --device cpu"
+        )
         raise RuntimeError(
-            f"深度特征依赖缺失，请使用 {os.path.join(SCRIPT_DIR, '.venv', 'Scripts', 'python.exe')} "
-            f"运行脚本，或先执行 setup-dedup.ps1。原始错误: {exc}"
+            f"深度特征依赖缺失，请使用 {project_venv_python()} 运行脚本，"
+            f"或先执行 {setup_command}。原始错误: {exc}"
         ) from exc
 
     eligible_indices = [index for index, info in enumerate(base_infos) if info['frames'] == 1]
