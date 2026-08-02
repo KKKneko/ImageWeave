@@ -733,11 +733,11 @@ def extract_deep_candidates(base_infos, args):
     try:
         from dedup_models import DeepEmbeddingExtractor, cosine_topk_pairs
     except ImportError as exc:
-        setup_command = (
-            "setup-dedup.ps1"
-            if os.name == "nt"
-            else "./scripts/setup-linux.sh --device cpu"
-        )
+        setup_device = "cuda" if args.device == "cuda" else "cpu"
+        if os.name == "nt":
+            setup_command = f".\\setup-dedup.ps1 -Device {setup_device}"
+        else:
+            setup_command = f"./scripts/setup-linux.sh --device {setup_device}"
         raise RuntimeError(
             f"深度特征依赖缺失，请使用 {project_venv_python()} 运行脚本，"
             f"或先执行 {setup_command}。原始错误: {exc}"

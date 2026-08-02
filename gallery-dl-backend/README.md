@@ -10,32 +10,13 @@
 - `gdl_backend/` 负责搜索、规划、调度、授权、代理池和状态持久化；
 - `/ui/` 提供随后端打包的静态操作界面，无需单独构建前端。
 
-## 平台支持
+## 运行要求
 
-| 平台/设备 | 支持等级 | 说明 |
-| --- | --- | --- |
-| Linux x86_64 / CPU | 必测支持 | P1 真实验收：Arch Linux、Python 3.14、无 NVIDIA GPU；快速 CI 为 Ubuntu 24.04。 |
-| Windows x86_64 / CPU 或 CUDA | 兼容维护 | PowerShell 路径和通用锁保留；本次 P1 未在 Windows 实机运行。 |
-| Linux x86_64 / CUDA 12.8 | 兼容维护 | 有独立完整锁，但本次无 NVIDIA 硬件，未验证驱动、运行时或性能。 |
-| Linux ARM、其他加速器 | 未验证 | 不属于当前发布门槛，不作可用性承诺。 |
+Linux、Windows 以及纯 CPU/CUDA 的完整安装命令统一维护在
+[根 README](../README.md)。后端要求 Python 3.11–3.14，默认只监听本机回环地址。
 
-| Python | 状态 | 说明 |
-| --- | --- | --- |
-| 3.11 | 最低支持 / CI | `numpy==2.4.2` 已不支持 3.10，因此最低版本如实上调。 |
-| 3.14 | 推荐 / CI / 实测 | 当前 Arch 验收和推荐生产版本。 |
-| 3.12–3.13 | 锁可解析 | 不为每个微版本扩张 CI 矩阵。 |
-| < 3.11 或 >= 3.15 | 不支持 | setup 会提前退出；放开前必须重新验锁。 |
-
-CPU-only 是 Linux 发布门槛；CUDA 及 ARM 不会因存在代码路径而被隐式视为已验证。站点授权需要
-桌面环境中的 Chrome、Chromium 或 Chromium Browser。非标准路径通过
-`auth.chrome_executable` 配置。doctor 检测到浏览器不等于服务器具备桌面会话；纯 SSH/headless
-环境可以运行 API、下载调度和 CPU 去重，但不能完成需要可见窗口的 X/Pixiv/EH 授权。
-
-X、Pixiv、EH 登录授权可通过 `auth.authorization_proxy`（或授权面板中的「授权专用代理」
-输入框，运行时设置优先并持久化）指定一个独立代理，例如 `http://127.0.0.1:7890`；
-共享授权 Chrome 的页面流量与 Pixiv token 交换全程经该代理，与抓取用的代理池互不影响，
-留空则直连。支持 http/https/socks4/socks5/socks5h，地址需带显式端口。授权会话结束后
-共享浏览器窗口自动关闭，登录状态保留在项目 Profile，下次授权自动重新拉起。
+X、Pixiv、EH 的托管授权需要桌面 Chrome/Chromium；纯后端、下载调度和去重不要求图形界面。
+`auth.authorization_proxy` 是授权浏览器的独立代理，与抓取代理池互不影响。
 
 ## 主要能力
 
@@ -50,61 +31,13 @@ X、Pixiv、EH 登录授权可通过 `auth.authorization_proxy`（或授权面�
 - 对每个新地址执行站点探活，图片任务全程固定一个代理节点；
 - 托管 X、Pixiv、EH 的项目专属浏览器授权，Danbooru 与 Pawchive 公共抓取无需登录；
 - 为 EH/EHX 批次显式选择 `fullimg` 原图或 1280 查看图，并控制 GP 响应时停止或降级；
-- 支持任务取消、失败重试、重启恢复、文件清单和幂等提交。
+- 支持任务取消、失败重试、重启恢复、文件清单和幂等提交；
 - 聚合批次结束后可独立启动 L0-L2 去重；严格自动组先淘汰，剩余图片进入分组人工审核。
 
 具体进程边界、状态机、搜索证据规则和代理选择算法见
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)。
 
-## Linux CPU（无 GPU）快速开始
-
-从仓库根目录运行统一安装器，而不是分别手工创建环境。以下代理地址只是当前主机示例，可改用
-环境变量中的其他地址；`--no-proxy` 可明确关闭安装下载代理：
-
-```bash
-export HTTP_PROXY=http://127.0.0.1:7890
-export HTTPS_PROXY=http://127.0.0.1:7890
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTPS_PROXY"
-export NO_PROXY=127.0.0.1,localhost
-export no_proxy="$NO_PROXY"
-
-./scripts/setup-linux.sh --device cpu --proxy http://127.0.0.1:7890
-./scripts/doctor.sh
-./scripts/run.sh
-```
-
-安装器不会执行 `sudo`；要求 Linux x86_64 与 Python 3.11–3.14，缺少 venv、git、
-curl/wget、gzip 或 SHA-256 工具时，会分别给出 Debian/Ubuntu 与 Arch Linux 安装提示。它幂等初始化 submodule、创建
-`gallery-dl-backend/.venv`（后端）和根 `.venv`（去重），安装官方 CPU PyTorch 与
-`opencv-python-headless`、校验 Mihomo v1.19.28，并把 SSCD/DINOv2 缓存到根 `.models`。
-`--skip-models`、`--skip-mihomo` 等选项用于快速重跑；已有 config、模型缓存和运行数据不会被
-覆盖。新建 config 为 0600，runtime/credentials 等敏感目录为 0700。
-
-`pyproject.toml` 是后端、去重公共、CPU 和 CUDA **直接依赖的唯一事实来源**。生成的
-`requirements.txt`、根目录 `requirements-dedup-common.txt`、`requirements-dedup-cpu.txt`、
-`requirements-dedup-cuda.txt` 分别固定完整传递闭包与哈希；CPU/CUDA 文件各自是一份可直接
-安装的完整环境锁，不需要先叠加 common。CPU 锁不含 CUDA、`nvidia-*`、Triton 或普通 OpenCV。
-维护命令：
-
-```bash
-./scripts/lock-dependencies.sh --upgrade  # 固定 uv 0.12.1，显式更新锁
-./scripts/lock-dependencies.sh --check    # 复算现有版本并检查漂移
-```
-
-普通 `setup-linux.sh` 只消费锁，不自动升级依赖解析结果。安装脚本固定下载并校验受支持的
-Mihomo 版本；单独安装时也支持：
-
-```bash
-bash gallery-dl-backend/scripts/install_mihomo.sh --proxy http://127.0.0.1:7890
-# 或明确直连：--no-proxy
-```
-
-自定义目录、强制重装及手动安装见 [`docs/MIHOMO.md`](./docs/MIHOMO.md)。Windows PowerShell
-仍使用 `scripts/install_mihomo.ps1` 和根 `setup-dedup.ps1`；后者同样消费 CUDA 完整哈希锁，
-但本次只做兼容性维护，未实机验证。
-
-### CPU 去重资源 profile
+## CPU 去重资源 profile
 
 Linux setup 明确写入 `dedup.device=cpu`。以下字段接受 `0`（自动）或正整数覆盖：
 
@@ -126,8 +59,8 @@ block 512 且不主动改变 Torch 线程；CPU 服务器应明确使用 `device
 ## 最小配置与代理边界
 
 完整字段以 [`config.example.json`](./config.example.json) 为准。示例中的项目抓取代理池和去重
-默认禁用，避免在没有节点源、根 venv 或模型时静默进入半可用状态；统一 Linux CPU 安装器会
-准备模型并只启用去重。直连抓取可以保持 `proxy.enabled=false`；需要抓取代理池时再显式启用并
+默认禁用，避免在没有节点源、根 venv 或模型时静默进入半可用状态；Linux 安装器会按所选设备
+准备模型并启用去重。直连抓取可以保持 `proxy.enabled=false`；需要抓取代理池时再显式启用并
 配置订阅、`proxy.node_file` 或 `inline_nodes`：
 
 ```json
@@ -160,10 +93,10 @@ config，也不会被 doctor 当作抓取代理池节点。Mihomo 是抓取池�
 bash gallery-dl-backend/run_backend.sh --port 8788
 ```
 
-Windows 可运行 `run_backend.ps1`，也可以直接执行：
+Windows 从仓库根目录运行 PowerShell 启动器；它固定使用后端 venv，不会退回系统 Python：
 
 ```powershell
-python -m gdl_backend --config .\config.json
+.\gallery-dl-backend\run_backend.ps1
 ```
 
 默认入口：
