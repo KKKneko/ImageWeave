@@ -17,7 +17,7 @@
 | Linux x86_64 / CPU | 必测支持 | P1 真实验收：Arch Linux、Python 3.14、无 NVIDIA GPU；快速 CI 为 Ubuntu 24.04。 |
 | Windows x86_64 / CPU 或 CUDA | 兼容维护 | PowerShell 路径和通用锁保留；本次 P1 未在 Windows 实机运行。 |
 | Linux x86_64 / CUDA 12.8 | 兼容维护 | 有独立完整锁，但本次无 NVIDIA 硬件，未验证驱动、运行时或性能。 |
-| macOS、Linux ARM、其他加速器 | 未验证 | 不属于当前发布门槛，不作可用性承诺。 |
+| Linux ARM、其他加速器 | 未验证 | 不属于当前发布门槛，不作可用性承诺。 |
 
 | Python | 状态 | 说明 |
 | --- | --- | --- |

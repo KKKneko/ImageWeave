@@ -10,8 +10,8 @@
 
 当前发布门槛以 **Linux x86_64 + CPU-only** 为必测路径：Python 3.11 为最低版本，3.14 为
 推荐与当前实测版本；快速 CI 使用 Ubuntu 24.04/Python 3.11、3.14。Windows x86_64 安装与
-CUDA 12.8 锁定路径继续维护兼容，但本次 P1 未在对应硬件实测；macOS、Linux ARM 与其他
-加速器均未验证，不作隐式承诺。完整矩阵见
+CUDA 12.8 锁定路径继续维护兼容，但本次 P1 未在对应硬件实测；Linux ARM 与其他加速器
+均未验证，不作隐式承诺。完整矩阵见
 [`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)，部署状态见
 [`DEPLOYMENT_ROADMAP.md`](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)。
 
