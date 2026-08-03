@@ -143,7 +143,7 @@ function sanitizeRuntimeNode(value) {
   const safeEndpoint = endpoint === "[REDACTED_PROXY]" || (
     /^[a-z][a-z0-9+.-]{0,23}:\/\/(?:\*\*\*@)?(?:\[[0-9a-f:.]+\]|[A-Za-z0-9._-]+)(?::[0-9]{1,5})?$/i.test(endpoint) &&
     !/[?#]/.test(endpoint)
-  ) ? endpoint : "端点已隐藏";
+  ) ? endpoint : "地址已隐藏";
   const refCount = safeInteger(value.ref_count, { maximum: 100_000 });
   return {
     id,
@@ -310,7 +310,7 @@ export function sanitizeProxySources(value) {
 }
 
 export function formatProxyStatus(status) {
-  if (!status) return Object.freeze({ status: "disabled", label: "运行状态待加载" });
+  if (!status) return Object.freeze({ status: "disabled", label: "正在加载" });
   if (!status.enabled) return Object.freeze({ status: "disabled", label: "代理池已停用" });
   if (status.running && status.last_error) {
     return Object.freeze({ status: "warning", label: "运行中，但存在警告" });
@@ -325,10 +325,10 @@ export function formatRevisionPair(configuredRevision, activeRevision) {
     ? `${value.slice(0, 8)}…${value.slice(-6)}`
     : "—";
   const relation = !activeRevision
-    ? "尚未应用"
+    ? "待应用"
     : configuredRevision === activeRevision
-      ? "相同"
-      : "不同";
+      ? "已生效"
+      : "有更新";
   return Object.freeze({
     configured: shorten(configuredRevision),
     active: shorten(activeRevision),
@@ -343,7 +343,7 @@ export function formatLatency(value) {
 }
 
 export function formatCooldown(value, nowMilliseconds = Date.now()) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "无冷却";
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "无需等待";
   const remaining = Math.ceil(value - Math.max(0, Number(nowMilliseconds) || 0) / 1_000);
   if (remaining <= 0) return "可立即重试";
   if (remaining < 60) return `约 ${remaining} 秒`;
@@ -362,7 +362,7 @@ export function formatRuntimeNode(node, nowMilliseconds = Date.now()) {
     endpoint: node.endpoint,
     tags: [...node.tags],
     state,
-    lease: node.ref_count > 0 ? `已租用 · 引用 ${node.ref_count}` : "未租用",
+    lease: node.ref_count > 0 ? `使用中 · ${node.ref_count}` : "未使用",
     latency: formatLatency(node.last_latency_ms),
     attempts: `成功 ${node.success_count} / 失败 ${node.fail_count}`,
     cooldown: formatCooldown(node.cooldown_until, nowMilliseconds),
@@ -387,7 +387,7 @@ export function formatInlineNodeSource(node) {
     identity: `${node.scheme.toUpperCase()} · ${node.name || "未命名节点"}`,
     authority: `${node.host || "主机已隐藏"}${node.port ? `:${node.port}` : ""}`,
     source: node.source,
-    transport: node.requires_transport_core ? "需要 Mihomo 传输核心" : "可由原生池加载",
+    transport: node.requires_transport_core ? "需要 Mihomo 传输核心" : "无需 Mihomo 传输核心",
   });
 }
 
@@ -406,18 +406,18 @@ export function deriveProxyControls(status, { busy = "" } = {}) {
   if (!status) {
     const reason = isBusy ? "正在执行其他代理操作" : "请先刷新运行状态";
     return Object.freeze({
-      start: control(true, reason, pendingLabel("start", "启动", "正在启动…")),
-      stop: control(true, reason, pendingLabel("stop", "停止", "正在停止…")),
-      reload: control(true, reason, pendingLabel("reload", "应用并重载", "正在应用…")),
-      probe: control(true, reason, pendingLabel("probe", "全池探活", "正在探活…")),
-      refresh: control(isBusy, isBusy ? "正在执行其他代理操作" : "", "刷新状态与代理源"),
+      start: control(true, reason, pendingLabel("start", "启动代理池", "正在启动…")),
+      stop: control(true, reason, pendingLabel("stop", "停止代理池", "正在停止…")),
+      reload: control(true, reason, pendingLabel("reload", "应用并重新加载", "正在应用…")),
+      probe: control(true, reason, pendingLabel("probe", "检测全部节点", "正在检测…")),
+      refresh: control(isBusy, isBusy ? "正在执行其他代理操作" : "", "刷新"),
     });
   }
 
   const hasLeases = status.leases > 0;
   const busyReason = "正在执行其他代理操作";
-  const disabledReason = "代理池在后端配置中已停用";
-  const leaseReason = `仍有 ${status.leases} 个活动租约`;
+  const disabledReason = "代理池已在服务配置中停用";
+  const leaseReason = `仍有 ${status.leases} 项正在使用代理`;
   const startReason = isBusy
     ? busyReason
     : !status.enabled
@@ -441,7 +441,7 @@ export function deriveProxyControls(status, { busy = "" } = {}) {
       : hasLeases
         ? leaseReason
         : !status.reload_required
-          ? "当前配置已经应用，无需重载"
+          ? "当前配置已生效，无需重新加载"
           : "";
   const probeReason = isBusy
     ? busyReason
@@ -452,28 +452,28 @@ export function deriveProxyControls(status, { busy = "" } = {}) {
         : "";
 
   return Object.freeze({
-    start: control(Boolean(startReason), startReason, pendingLabel("start", "启动", "正在启动…")),
-    stop: control(Boolean(stopReason), stopReason, pendingLabel("stop", "停止", "正在停止…")),
-    reload: control(Boolean(reloadReason), reloadReason, pendingLabel("reload", "应用并重载", "正在应用…")),
-    probe: control(Boolean(probeReason), probeReason, pendingLabel("probe", "全池探活", "正在探活…")),
-    refresh: control(isBusy, isBusy ? busyReason : "", "刷新状态与代理源"),
+    start: control(Boolean(startReason), startReason, pendingLabel("start", "启动代理池", "正在启动…")),
+    stop: control(Boolean(stopReason), stopReason, pendingLabel("stop", "停止代理池", "正在停止…")),
+    reload: control(Boolean(reloadReason), reloadReason, pendingLabel("reload", "应用并重新加载", "正在应用…")),
+    probe: control(Boolean(probeReason), probeReason, pendingLabel("probe", "检测全部节点", "正在检测…")),
+    refresh: control(isBusy, isBusy ? busyReason : "", "刷新"),
   });
 }
 
 const ERROR_NEXT_STEPS = Object.freeze({
-  proxy_conflict: "请等待任务释放活动租约，再刷新状态后重试；界面不会强制停止任务。",
+  proxy_conflict: "请等待正在使用代理的任务结束，再刷新后重试；不会强制停止任务。",
   invalid_proxy_subscription: "请输入包含主机名的完整 http:// 或 https:// 订阅地址。",
   invalid_proxy_inline_node: "请检查节点格式；批量提交时按提示修正对应行后重试。",
-  invalid_proxy_node_file: "请选择许可目录中的可解析普通节点文件。",
+  invalid_proxy_node_file: "请选择允许目录中的可解析普通节点文件。",
   invalid_proxy_source_id: "该列表项已失效，请刷新代理源后重试。",
-  proxy_source_path_forbidden: "请把节点文件放入后端配置的 allowed_node_roots 许可目录。",
+  proxy_source_path_forbidden: "请把节点文件放入服务配置的允许目录。",
   proxy_source_not_found: "该代理源可能已被其他操作删除，请刷新列表。",
-  proxy_sources_store_error: "托管覆盖可能损坏或发生并发修改；请刷新，损坏时仅使用“恢复 config 默认”。",
+  proxy_sources_store_error: "界面自定义配置可能损坏或发生并发修改；请刷新，必要时恢复配置文件默认值。",
   proxy_sources_request_too_large: "请减少本次节点数量或每行长度，再分批提交。",
   invalid_content_length: "请求大小信息无效，请刷新页面后重试。",
   proxy_error: "请保留现有列表并刷新状态；必要时检查节点源与 Mihomo 配置。",
-  network_error: "请确认后端仍在运行，连接恢复后使用手动刷新。",
-  invalid_response: "后端响应未通过界面校验，请刷新或打开 DIAG.EXE 检查版本。",
+  network_error: "请确认服务仍在运行，连接恢复后刷新。",
+  invalid_response: "服务响应未通过页面校验，请刷新或打开系统诊断检查版本。",
 });
 
 export function safeProxyErrorDetail(error) {
@@ -485,9 +485,9 @@ export function safeProxyErrorDetail(error) {
   const index = Number.isInteger(details.index) && details.index >= 0 && details.index < PROXY_INLINE_NODE_LIMIT
     ? details.index
     : null;
-  if (index !== null && reason) return `后端定位：第 ${index + 1} 行（索引 ${index}），原因 ${reason}`;
-  if (index !== null) return `后端定位：第 ${index + 1} 行（索引 ${index}）`;
-  if (reason) return `后端原因：${reason}`;
+  if (index !== null && reason) return `第 ${index + 1} 行：${reason}`;
+  if (index !== null) return `请检查第 ${index + 1} 行`;
+  if (reason) return `原因：${reason}`;
   return "";
 }
 
@@ -498,10 +498,10 @@ export function proxyErrorGuidance(error) {
     status === 413
       ? ERROR_NEXT_STEPS.proxy_sources_request_too_large
       : status === 422
-        ? "请检查输入格式后重试；界面不会回显刚提交的秘密值。"
+        ? "请检查输入格式后重试；刚提交的敏感信息不会显示在页面中。"
         : status === 409
           ? ERROR_NEXT_STEPS.proxy_conflict
-          : "请稍后重试，或打开 DIAG.EXE 检查系统状态。"
+          : "请稍后重试，或打开系统诊断检查运行状态。"
   );
   return Object.freeze({ code, nextStep, detail: safeProxyErrorDetail(error) });
 }

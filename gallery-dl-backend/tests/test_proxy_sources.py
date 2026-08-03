@@ -40,6 +40,16 @@ TEST_TUNNEL_NODE = (
 )
 
 
+def _mark_all_records_healthy(adapter: ProxyPoolAdapter) -> dict[str, object]:
+    for record in adapter._records:
+        record.healthy = True
+    return {
+        "total": len(adapter._records),
+        "healthy": len(adapter._records),
+        "results": [],
+    }
+
+
 def _assert_private_equal(
     test: unittest.TestCase,
     actual: object,
@@ -653,11 +663,7 @@ class ProxySourceRevisionAndLeaseTests(unittest.TestCase):
             self.settings.runtime_dir,
             source_provider=self.store,
         )
-        self.adapter.probe = lambda **_: {
-            "total": len(self.adapter._records),
-            "healthy": len(self.adapter._records),
-            "results": [],
-        }
+        self.adapter.probe = lambda **_: _mark_all_records_healthy(self.adapter)
 
     def tearDown(self):
         try:
@@ -733,11 +739,7 @@ class ProxySourceRevisionAndLeaseTests(unittest.TestCase):
             self.settings.runtime_dir,
             source_provider=provider,
         )
-        adapter.probe = lambda **_: {
-            "total": len(adapter._records),
-            "healthy": len(adapter._records),
-            "results": [],
-        }
+        adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
         try:
             adapter.start()
             self.assertEqual(provider.calls, 1)
@@ -751,11 +753,7 @@ class ProxySourceRevisionAndLeaseTests(unittest.TestCase):
 
     def test_api_save_does_not_touch_lease_and_api_reload_still_conflicts(self):
         container = ServiceContainer(self.settings)
-        container.proxy.probe = lambda **_: {
-            "total": len(container.proxy._records),
-            "healthy": len(container.proxy._records),
-            "results": [],
-        }
+        container.proxy.probe = lambda **_: _mark_all_records_healthy(container.proxy)
         context = TestClient(
             create_app(self.settings, container=container, start_background=False)
         )

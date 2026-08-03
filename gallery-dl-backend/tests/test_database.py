@@ -22,6 +22,17 @@ def task_values(root: Path) -> dict:
     }
 
 
+def site_policy_values(**overrides) -> dict:
+    policy = {
+        "max_concurrency": 20,
+        "retry_limit": 2,
+        "backoff_base_seconds": 2.0,
+        "proxy_mode": "prefer",
+    }
+    policy.update(overrides)
+    return policy
+
+
 def crawl_address_values(batch_id: str) -> list[dict]:
     return [
         {
@@ -113,9 +124,14 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertNotIn("secret", logs[0]["line"])
         self.assertTrue(self.db.get_events("task-1"))
-        policy = {"max_concurrency": 3}
+        policy = site_policy_values(max_concurrency=3)
         self.db.put_site_policy("example.com", policy)
         self.assertEqual(self.db.get_site_policy("example.com")["policy"], policy)
+        with self.assertRaises(ValueError):
+            self.db.put_site_policy(
+                "example.com",
+                {**policy, "http_timeout": 1},
+            )
         self.assertTrue(self.db.delete_site_policy("example.com"))
 
     def test_lease_cleanup_is_scoped_to_attempt(self):
@@ -1081,7 +1097,7 @@ class DatabaseTests(unittest.TestCase):
                     "PRAGMA table_info(crawl_reviews)"
                 ).fetchall()
             }
-            self.assertEqual(version, "7")
+            self.assertEqual(version, "8")
             self.assertIn("download_options_json", address_columns)
             self.assertIn("pre_dedup_skipped_count", address_columns)
             self.assertIn("automatic_group_count", review_columns)
@@ -1101,6 +1117,60 @@ class DatabaseTests(unittest.TestCase):
             )
         finally:
             upgraded.close()
+
+    def test_site_policy_v8_migration_clears_old_rows_once_then_preserves_new_rows(self):
+        path = self.root / "site-policy-v7.sqlite3"
+        legacy = Database(path)
+        with legacy._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO site_policies(site, policy_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "pixiv",
+                    '{"max_concurrency":3,"retry_limit":1,'
+                    '"backoff_base_seconds":0.5,"proxy_mode":"required",'
+                    '"http_timeout":1,"extra_args":["--legacy"]}',
+                    1.0,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO site_policies(site, policy_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                ("unknown-old-site", '{"secret":"legacy"}', 1.0),
+            )
+            conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
+        legacy.close()
+
+        upgraded = Database(path)
+        self.assertEqual(upgraded.list_site_policies(), [])
+        self.assertEqual(
+            upgraded._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0],
+            "8",
+        )
+        current = site_policy_values(max_concurrency=7, proxy_mode="direct")
+        upgraded.put_site_policy("pixiv", current)
+        upgraded.close()
+
+        restarted = Database(path)
+        try:
+            self.assertEqual(
+                restarted.get_site_policy("pixiv")["policy"],
+                current,
+            )
+            self.assertEqual(
+                restarted._conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "8",
+            )
+        finally:
+            restarted.close()
 
 
 if __name__ == "__main__":

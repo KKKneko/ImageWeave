@@ -60,10 +60,10 @@ function createDiagnosticsController(context) {
     });
     store.dispatch(actionCreators.diagnosticsReceived(snapshot));
     view.setOperationMessage(snapshot.offline
-      ? "后端离线；保留上一次安全投影并暂停采用无效响应。"
+      ? "服务离线，当前保留上次诊断结果。"
       : snapshot.stale
-        ? "△ 部分只读端点失败；已保留可验证的旧组件状态。"
-        : "✓ 健康、就绪、配置能力与调度摘要均已安全刷新。 ");
+        ? "部分检查失败，已保留上次成功读取的组件状态。"
+        : "服务、功能、安全配置和任务调度状态已刷新。");
     return true;
   };
 
@@ -86,9 +86,9 @@ function createDiagnosticsController(context) {
     try {
       if (!globalThis.navigator?.clipboard?.writeText) throw new Error("clipboard unavailable");
       await globalThis.navigator.clipboard.writeText(text);
-      if (active) view.setOperationMessage("✓ 已复制脱敏诊断摘要；内容不含路径、日志、配置原文或秘密。 ");
+      if (active) view.setOperationMessage("诊断摘要已复制，敏感信息已隐藏。");
     } catch {
-      if (active) view.setOperationMessage("浏览器未允许剪贴板写入；未创建隐藏文本副本，也未输出到 console。 ");
+      if (active) view.setOperationMessage("浏览器未允许写入剪贴板，请检查权限后重试。");
     }
   };
 
@@ -114,7 +114,7 @@ function createDiagnosticsController(context) {
       root.hidden = false;
       setElementInert(root, false);
       root.dataset.lifecycle = "active";
-      view.setOperationMessage("正在执行唯一 app-scoped 只读诊断轮询…");
+      view.setOperationMessage("正在刷新诊断信息……");
       polling.start({
         key: DIAGNOSTICS_POLL_KEY,
         scope: context.pollingScope,

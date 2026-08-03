@@ -9,6 +9,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .file_security import ensure_private_directory
+from .site_policy import (
+    DEFAULT_EDITABLE_SITE_POLICY,
+    EDITABLE_SITE_POLICY_FIELDS,
+    EditableSitePolicy,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -257,20 +262,26 @@ class DedupSettings:
     no_dino: bool = False
 
 
-DEFAULT_SITE_POLICY: dict[str, Any] = {
-    "max_concurrency": 20,
-    "retry_limit": 2,
-    "backoff_base_seconds": 2.0,
-    "proxy_mode": "prefer",
-    "probe_url": None,
-    "probe_before_use": False,
-    "node_tags": [],
-    "http_timeout": 30.0,
-    "gallery_retries": 2,
-    "task_timeout_seconds": 0.0,
-    "download_stall_timeout_seconds": 180.0,
-    "extra_args": [],
-}
+DEFAULT_SITE_POLICY: dict[str, Any] = dict(DEFAULT_EDITABLE_SITE_POLICY)
+
+
+def _editable_default_site_policy(value: Any) -> dict[str, Any]:
+    """只采用 default_site_policy 中仍属于产品设置的四个字段。"""
+
+    if value is None:
+        raw: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        raw = value
+    else:
+        raise ValueError("default_site_policy 必须是对象")
+    projected = {
+        field: raw[field]
+        for field in EDITABLE_SITE_POLICY_FIELDS
+        if field in raw
+    }
+    return EditableSitePolicy.model_validate(
+        {**DEFAULT_EDITABLE_SITE_POLICY, **projected}
+    ).model_dump()
 
 
 @dataclass(slots=True)
@@ -423,8 +434,7 @@ class AppSettings:
             no_dino=bool(dedup_data.get("no_dino", False)),
         )
 
-        policy = dict(DEFAULT_SITE_POLICY)
-        policy.update(data.get("default_site_policy") or {})
+        policy = _editable_default_site_policy(data.get("default_site_policy"))
         settings = cls(
             runtime_dir=runtime,
             database_path=database,
@@ -446,6 +456,10 @@ class AppSettings:
         return settings
 
     def validate(self) -> None:
+        # 程序化构造的 Settings 也走同一四字段投影；旧高级键不能改变运行时。
+        self.default_site_policy = _editable_default_site_policy(
+            self.default_site_policy
+        )
         if not 1 <= int(self.server.port) <= 65535:
             raise ValueError("server.port 超出范围")
         host = self.server.host.strip().lower()

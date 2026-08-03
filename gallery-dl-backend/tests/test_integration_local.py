@@ -123,11 +123,24 @@ class LocalGalleryIntegrationTests(unittest.TestCase):
                     f"http://127.0.0.1:{proxy_server.server_port}#LOCAL"
                 ]
                 container = ServiceContainer(settings)
-                container.proxy.probe = lambda **_: {
-                    "total": 1,
-                    "healthy": 1,
-                    "results": [],
-                }
+
+                def successful_probe(
+                    node_id,
+                    endpoint,
+                    target_url,
+                    *,
+                    update_pool=True,
+                ):
+                    return {
+                        "id": node_id,
+                        "healthy": True,
+                        "latency_ms": 0.0,
+                        "error": "",
+                        "endpoint": endpoint,
+                        "target": target_url,
+                    }
+
+                container.proxy._probe_endpoint = successful_probe
                 app = create_app(settings, container=container, start_background=True)
                 with TestClient(app) as client:
                     response = client.post(

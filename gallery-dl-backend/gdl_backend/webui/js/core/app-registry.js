@@ -5,12 +5,13 @@ import vaultApplication from "../apps/vault.js";
 import reviewApplication from "../apps/review.js";
 import policyApplication from "../apps/policy.js";
 import diagnosticsApplication from "../apps/diagnostics.js";
+import personalizationApplication from "../apps/personalization.js";
 import { createPlaceholderApplication } from "../apps/placeholder.js";
 
 const definitions = [
   {
     id: "crawl",
-    label: "聚合爬图",
+    label: "图片采集",
     icon: "download",
     route: "/crawl",
     windowTitle: "C:\\IMAGEWEAVE\\CRAWL.EXE",
@@ -20,7 +21,7 @@ const definitions = [
   },
   {
     id: "tasks",
-    label: "批次任务",
+    label: "批次管理",
     icon: "list",
     route: "/tasks",
     windowTitle: "C:\\IMAGEWEAVE\\TASKMGR.EXE",
@@ -30,7 +31,7 @@ const definitions = [
   },
   {
     id: "proxy",
-    label: "代理配置",
+    label: "代理管理",
     icon: "network",
     route: "/proxy",
     windowTitle: "C:\\IMAGEWEAVE\\PROXY.CPL",
@@ -40,7 +41,7 @@ const definitions = [
   },
   {
     id: "vault",
-    label: "凭证管理",
+    label: "授权管理",
     icon: "key",
     route: "/vault",
     windowTitle: "C:\\IMAGEWEAVE\\VAULT.CPL",
@@ -60,7 +61,7 @@ const definitions = [
   },
   {
     id: "policy",
-    label: "站点策略",
+    label: "站点设置",
     icon: "sliders",
     route: "/policy",
     windowTitle: "C:\\IMAGEWEAVE\\POLICY.CPL",
@@ -79,6 +80,16 @@ const definitions = [
     application: diagnosticsApplication,
   },
   {
+    id: "personalization",
+    label: "外观设置",
+    icon: "sliders",
+    route: "/personalization",
+    windowTitle: "C:\\IMAGEWEAVE\\DESKTOP.CPL",
+    availability: "ready",
+    defaultWindowState: "normal",
+    application: personalizationApplication,
+  },
+  {
     id: "gallery",
     label: "图片库",
     icon: "folder",
@@ -86,7 +97,7 @@ const definitions = [
     windowTitle: "C:\\IMAGEWEAVE\\GALLERY.EXE",
     availability: "placeholder",
     defaultWindowState: "normal",
-    application: createPlaceholderApplication("浏览与检索已下载图片。"),
+    application: createPlaceholderApplication("浏览和搜索已下载的图片。"),
   },
   {
     id: "schedule",
@@ -96,7 +107,7 @@ const definitions = [
     windowTitle: "C:\\IMAGEWEAVE\\SCHEDULE.EXE",
     availability: "placeholder",
     defaultWindowState: "normal",
-    application: createPlaceholderApplication("配置按时间触发的抓取计划。"),
+    application: createPlaceholderApplication("按计划自动启动采集任务。"),
   },
   {
     id: "export",
@@ -106,7 +117,7 @@ const definitions = [
     windowTitle: "C:\\IMAGEWEAVE\\EXPORT.EXE",
     availability: "placeholder",
     defaultWindowState: "normal",
-    application: createPlaceholderApplication("将审核后的图片整理为数据集。"),
+    application: createPlaceholderApplication("将审核后的图片整理并导出为数据集。"),
   },
 ];
 

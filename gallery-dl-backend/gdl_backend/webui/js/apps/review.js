@@ -211,14 +211,14 @@ function createReviewController(context) {
             report: false,
           });
         }
-        if (announce && active) view.setOperationMessage("✓ 本页选择已保存并由权威分页重新确认。 ");
+        if (announce && active) view.setOperationMessage("本页已保存，并已重新读取最新内容。");
         return true;
       } catch (error) {
         if (isAbortError(error) || controller.signal.aborted || destroyed) return false;
         if (active) {
           try { await refreshSummaryOnly(batchId, controller.signal); } catch { /* 保留原保存错误。 */ }
           view.showError(reviewErrorGuidance(error));
-          view.setOperationMessage("保存未完成；本页选择仍保留，筛选、翻页和离开应用已被阻止。 ");
+          view.setOperationMessage("保存失败，本页更改已保留。请重试后再翻页、筛选或离开。");
         }
         return false;
       } finally {
@@ -244,7 +244,7 @@ function createReviewController(context) {
         replace: true,
         report: true,
       });
-      if (loaded && active) view.setOperationMessage("✓ 审核分页已从服务器加载。 ");
+      if (loaded && active) view.setOperationMessage("审核内容已加载。");
       return loaded;
     } catch {
       return false;
@@ -266,7 +266,7 @@ function createReviewController(context) {
     view.clearError();
     try {
       const loaded = await readPage({ batchId, filter: "", offset: 0, replace: true, report: true });
-      if (loaded && active) view.setOperationMessage("✓ 已载入终态批次；读取不会隐式启动分析。 ");
+      if (loaded && active) view.setOperationMessage("已加载结束批次；打开批次不会自动开始分析。");
       return loaded;
     } catch {
       return false;
@@ -314,21 +314,21 @@ function createReviewController(context) {
     if (reviewState().dirty && !await persistPage({ announce: false })) return;
     const review = reviewState();
     if (review.summary.status === "ready" && review.summary.decidedGroupCount < review.summary.totalGroupCount) {
-      view.setOperationMessage("仍有未确认分组；请逐页保存后再应用，界面不会绕过后端约束。 ");
+      view.setOperationMessage("仍有未确认分组，请逐页保存后再应用结果。");
       return;
     }
     const choice = await dialogs.open({
-      title: review.summary.status === "apply_failed" ? "重试应用审核结果？" : "应用审核结果？",
+      title: review.summary.status === "apply_failed" ? "重试整理文件？" : "应用并整理文件？",
       message: view.applyConfirmationText(),
-      confirmLabel: review.summary.status === "apply_failed" ? "重试应用" : "应用并移动淘汰图片",
+      confirmLabel: review.summary.status === "apply_failed" ? "重试整理" : "应用并整理文件",
       dangerous: true,
-      confirmationText: "此操作会按后端审核清单移动文件；不会提供任意文件路径或强制覆盖选项。",
+      confirmationText: "将按当前审核结果移动待移除的图片。开始前请确认每组的保留项。",
     });
     if (choice !== "confirm" || !active || destroyed) return;
     await runStatusOperation({
       kind: "apply",
       suffix: "/apply",
-      successMessage: "✓ 应用请求已完成，审核页已从后端重新读取。",
+      successMessage: "审核结果已应用，页面已重新读取最新状态。",
     });
     await readRecent({ replace: true, report: false }).catch(() => {});
   };
@@ -337,11 +337,11 @@ function createReviewController(context) {
     const review = reviewState();
     if (!review.dirty || !review.batchId) return false;
     const choice = await dialogs.open({
-      title: "放弃陈旧审核选择？",
-      message: "后端审核状态已变化，当前本页选择不能再安全保存。可放弃本地草稿并重新读取权威分页。",
-      confirmLabel: "放弃选择并重载",
+      title: "放弃未保存的更改？",
+      message: "审核状态已经变化，本页更改无法继续保存。可以放弃更改并重新加载最新内容。",
+      confirmLabel: "放弃更改并重新加载",
       dangerous: true,
-      confirmationText: "只清除中央 Store 中这一页的未保存选择，不修改后端文件或已确认决策。",
+      confirmationText: "只会清除本页未保存的更改，不会修改文件或已确认结果。",
     });
     if (choice !== "confirm" || !active || destroyed) return false;
     const batchId = review.batchId;
@@ -367,7 +367,7 @@ function createReviewController(context) {
             })
           : Promise.resolve(false),
       ]);
-      if (active) view.setOperationMessage("✓ 终态批次与当前审核状态已刷新。 ");
+      if (active) view.setOperationMessage("已结束批次和当前审核状态已刷新。");
     } catch {
       // 读取函数已显示安全错误。
     } finally {
@@ -387,10 +387,10 @@ function createReviewController(context) {
     } else if (action === "refresh") await manualRefresh();
     else if (action === "open-tasks") actions.navigateToApp("tasks");
     else if (action === "start") await runStatusOperation({
-      kind: "start", suffix: "/start", successMessage: "✓ 去重分析已显式启动并进入按需轮询。",
+      kind: "start", suffix: "/start", successMessage: "去重分析已开始，状态将自动刷新。",
     });
     else if (action === "retry") await runStatusOperation({
-      kind: "retry", suffix: "/retry", successMessage: "✓ 去重分析已重新排队。",
+      kind: "retry", suffix: "/retry", successMessage: "去重分析已重新排队。",
     });
     else if (action === "filter") await switchPage({ filter: button.dataset.reviewFilter || "", offset: 0 });
     else if (action === "previous") await switchPage({ offset: Math.max(0, reviewState().offset - REVIEW_PAGE_LIMIT) });
@@ -434,7 +434,7 @@ function createReviewController(context) {
     async beforeLeave() {
       if (!reviewState().dirty) return true;
       if (busy && leaveSave) return Boolean(await leaveSave);
-      view.setOperationMessage("正在保存未提交的审核选择；完成前不会切换应用…");
+      view.setOperationMessage("正在保存未提交的审核更改，完成前不会切换页面……");
       return Boolean(await persistPage({ announce: false }));
     },
     activate() {
@@ -447,7 +447,7 @@ function createReviewController(context) {
       void readRecent({ replace: true, report: false }).catch(() => {});
       const current = reviewState();
       if (current.dirty) {
-        view.setOperationMessage("本页有未保存选择；已恢复本地安全投影，不会用 GET 覆盖。 ");
+        view.setOperationMessage("本页有未保存的更改，已恢复本地草稿。");
         return;
       }
       if (current.batchId) {
@@ -466,7 +466,7 @@ function createReviewController(context) {
           if (active && !destroyed && !reviewState().batchId) void loadBatch(activeBatch.id);
         });
       } else {
-        view.setOperationMessage("选择一个终态批次；审核读取不会隐式启动分析。 ");
+        view.setOperationMessage("选择一个已结束批次；打开批次不会自动开始分析。");
       }
     },
     deactivate() {

@@ -51,7 +51,6 @@ include = ["gdl_backend*"]
 [tool.setuptools.package-data]
 gdl_backend = [
   "webui/*.html",
-  "webui/assets/*.png",
   "webui/styles/*.css",
   "webui/styles/apps/*.css",
   "webui/js/*.js",

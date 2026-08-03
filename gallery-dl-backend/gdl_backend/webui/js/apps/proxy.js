@@ -166,7 +166,7 @@ function createProxyController(context) {
     view.clearError();
     setBusy(kind);
     view.setOperationMessage(
-      kind === "refresh" ? "正在刷新运行状态与代理源…" : "正在执行代理操作，请勿重复提交…",
+      kind === "refresh" ? "正在刷新代理状态和节点来源……" : "正在执行代理操作，请勿重复提交……",
     );
     const controller = new AbortController();
     activeOperationController = controller;
@@ -186,7 +186,7 @@ function createProxyController(context) {
         // 保留原操作错误；刷新失败不能覆盖更有用的安全指引。
       }
       view.showError(error);
-      view.setOperationMessage("操作未完成；现有壳层与已加载列表仍可使用。");
+      view.setOperationMessage("操作失败，当前列表已保留。请刷新后重试。");
       return false;
     } finally {
       if (activeOperationController === controller) activeOperationController = null;
@@ -217,7 +217,7 @@ function createProxyController(context) {
           status: 422,
           details: null,
         });
-        view.setOperationMessage("没有发送空的代理源请求。");
+        view.setOperationMessage("请填写要保存的节点来源。");
         return false;
       }
       capturedPayload = payload;
@@ -248,7 +248,7 @@ function createProxyController(context) {
     if (sources?.runtime_override_valid) return true;
     view.showError({
       code: "proxy_sources_store_error",
-      message: "运行时代理源覆盖无效",
+      message: "界面自定义节点来源无效",
       status: 409,
       details: { reason: "invalid_runtime_override" },
     });
@@ -259,7 +259,7 @@ function createProxyController(context) {
     const choice = await dialogs.open(options);
     if (choice !== "confirm") {
       view.clearSecretInputs();
-      view.setOperationMessage("已取消操作；秘密输入已清空。");
+      view.setOperationMessage("已取消操作，敏感输入已清空。");
       return false;
     }
     return active && !destroyed;
@@ -269,10 +269,10 @@ function createProxyController(context) {
     if (!requireMutableSources()) return;
     if (!await confirm({
       title: "删除订阅？",
-      message: "将从托管源快照删除此订阅。运行中的代理池不会自动改变。",
+      message: "将删除该订阅。运行中的代理池不会自动改变。",
       confirmLabel: "删除订阅",
       dangerous: true,
-      confirmationText: "删除后仍需手动点击“应用并重载”才会切换运行池。",
+      confirmationText: "删除后点击“应用并重新加载”才会生效。",
     })) return;
     await runOperation({
       kind: "subscription-delete",
@@ -280,18 +280,18 @@ function createProxyController(context) {
         `${PROXY_ENDPOINTS.subscriptions}/${encodeURIComponent(sourceId)}`,
         { signal },
       ),
-      successMessage: "✓ 订阅已保存为删除状态；未自动重载运行池。",
+      successMessage: "订阅已删除；点击“应用并重新加载”后生效。",
     });
   };
 
   const deleteInlineNode = async (sourceId) => {
     if (!requireMutableSources()) return;
     if (!await confirm({
-      title: "删除内联节点？",
-      message: "将从托管源快照删除此脱敏节点条目。运行中的代理池不会自动改变。",
+      title: "删除手动节点？",
+      message: "将删除该手动节点。运行中的代理池不会自动改变。",
       confirmLabel: "删除节点",
       dangerous: true,
-      confirmationText: "删除后仍需手动点击“应用并重载”才会切换运行池。",
+      confirmationText: "删除后点击“应用并重新加载”才会生效。",
     })) return;
     await runOperation({
       kind: "inline-delete",
@@ -299,7 +299,7 @@ function createProxyController(context) {
         `${PROXY_ENDPOINTS.inlineNodes}/${encodeURIComponent(sourceId)}`,
         { signal },
       ),
-      successMessage: "✓ 内联节点已保存为删除状态；未自动重载运行池。",
+      successMessage: "手动节点已删除；点击“应用并重新加载”后生效。",
     });
   };
 
@@ -307,15 +307,15 @@ function createProxyController(context) {
     if (!requireMutableSources()) return;
     if (!await confirm({
       title: "清除节点文件？",
-      message: "托管源快照将不再引用当前节点文件；磁盘上的文件本身不会被删除。",
+      message: "节点来源将不再引用当前文件；磁盘上的文件不会被删除。",
       confirmLabel: "清除引用",
       dangerous: true,
-      confirmationText: "当前运行池保持不变，直到手动应用并重载。",
+      confirmationText: "运行中的代理池保持不变，点击“应用并重新加载”后生效。",
     })) return;
     await runOperation({
       kind: "node-file-clear",
       request: (signal) => api.delete(PROXY_ENDPOINTS.nodeFile, { signal }),
-      successMessage: "✓ 节点文件引用已清除并保存；未自动重载运行池。",
+      successMessage: "节点文件引用已清除；点击“应用并重新加载”后生效。",
     });
   };
 
@@ -323,16 +323,16 @@ function createProxyController(context) {
     const sources = currentSources();
     if (!sources?.has_runtime_override) return;
     if (!await confirm({
-      title: "恢复 config 默认代理源？",
-      message: "此操作会删除完整托管运行时覆盖，并恢复后端启动时读取的 config 基线。",
-      confirmLabel: "删除覆盖并恢复",
+      title: "恢复配置文件中的节点来源？",
+      message: "将删除界面保存的节点来源，并恢复配置文件默认值。",
+      confirmLabel: "恢复默认设置",
       dangerous: true,
-      confirmationText: "不会停止或重载当前运行池；若 revision 不同，页面会继续显示等待重载。",
+      confirmationText: "运行中的代理池不会自动改变；有配置待应用时，页面会继续提示。",
     })) return;
     await runOperation({
       kind: "override-reset",
       request: (signal) => api.delete(PROXY_ENDPOINTS.override, { signal }),
-      successMessage: "✓ 已恢复 config 默认源；当前运行池未自动改变。",
+      successMessage: "已恢复配置文件默认值；运行中的代理池尚未改变。",
     });
   };
 
@@ -358,7 +358,7 @@ function createProxyController(context) {
         kind: "refresh",
         writes: false,
         request: null,
-        successMessage: "✓ 运行状态与代理源已手动刷新。",
+        successMessage: "代理状态和节点来源已刷新。",
       });
     }
     const request = {
@@ -368,10 +368,10 @@ function createProxyController(context) {
       probe: (signal) => api.post(PROXY_ENDPOINTS.probe, {}, { signal }),
     }[action];
     const successMessage = {
-      start: "✓ 代理池已启动，状态与代理源已刷新。",
-      stop: "✓ 代理池已非强制停止，状态与代理源已刷新。",
-      reload: "✓ 已应用源配置并重载，revision 状态已刷新。",
-      probe: "✓ 全池探活完成，状态与代理源已刷新。",
+      start: "代理池已启动，状态已刷新。",
+      stop: "代理池已停止，现有任务未被强制中断。",
+      reload: "节点来源已应用，配置版本已更新。",
+      probe: "全部节点检测完成，状态已刷新。",
     }[action];
     return runOperation({ kind: action, request, successMessage });
   };
@@ -395,7 +395,7 @@ function createProxyController(context) {
         view.clearSecretInputs(form);
         form.hidden = true;
       }
-      view.setOperationMessage("已取消替换；秘密输入已清空。");
+      view.setOperationMessage("已取消替换，敏感输入已清空。");
       return;
     }
     if (action === "subscription-delete") {
@@ -429,7 +429,7 @@ function createProxyController(context) {
         kind,
         input,
         request: (url, signal) => api.post(PROXY_ENDPOINTS.subscriptions, { url }, { signal }),
-        successMessage: "✓ 订阅已保存；未自动启动、停止或重载代理池。",
+        successMessage: "订阅已保存；点击“应用并重新加载”后生效。",
         transform: (value) => value.trim(),
       });
       return;
@@ -444,7 +444,7 @@ function createProxyController(context) {
           { url },
           { signal },
         ),
-        successMessage: "✓ 订阅已替换并保存；旧秘密未回填，运行池未自动重载。",
+        successMessage: "订阅已更新；原地址不会重新显示，点击“应用并重新加载”后生效。",
         transform: (value) => value.trim(),
       });
       form.hidden = true;
@@ -455,7 +455,7 @@ function createProxyController(context) {
         kind,
         input,
         request: (path, signal) => api.put(PROXY_ENDPOINTS.nodeFile, { path }, { signal }),
-        successMessage: "✓ 节点文件引用已保存；运行池未自动重载。",
+        successMessage: "节点文件已保存；点击“应用并重新加载”后生效。",
         transform: (value) => value.trim(),
       });
       return;
@@ -465,7 +465,7 @@ function createProxyController(context) {
         kind,
         input,
         request: (nodes, signal) => api.post(PROXY_ENDPOINTS.inlineNodes, { nodes }, { signal }),
-        successMessage: "✓ 批量内联节点已保存；节点原文已清空，运行池未自动重载。",
+        successMessage: "手动节点已保存；完整节点信息已清空，点击“应用并重新加载”后生效。",
         transform: splitInlineNodeInput,
       });
       return;
@@ -480,7 +480,7 @@ function createProxyController(context) {
           { node },
           { signal },
         ),
-        successMessage: "✓ 内联节点已替换并保存；旧秘密未回填，运行池未自动重载。",
+        successMessage: "手动节点已更新；原节点不会重新显示，点击“应用并重新加载”后生效。",
         transform: (value) => value.trim(),
       });
       form.hidden = true;
@@ -498,7 +498,7 @@ function createProxyController(context) {
       root.hidden = false;
       setElementInert(root, false);
       root.dataset.lifecycle = "active";
-      view.setOperationMessage("正在加载代理运行状态与托管源快照…");
+      view.setOperationMessage("正在加载代理状态和节点来源……");
       void readSources(null, { replace: true, report: true }).catch(() => {});
       polling.start({
         key: STATUS_POLL_KEY,

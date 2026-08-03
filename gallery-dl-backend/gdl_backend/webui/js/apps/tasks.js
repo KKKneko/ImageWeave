@@ -88,7 +88,7 @@ function createTasksController(context) {
   const handleMissingBatch = () => {
     actions.setActiveBatchId("");
     store.dispatch(actionCreators.batchSnapshotCleared());
-    view.setOperationMessage("批次不存在；已清除陈旧 session 批次 ID 并停止轮询。 ");
+    view.setOperationMessage("该批次已不存在，已停止自动刷新。请选择其他批次。");
     syncPolling();
   };
 
@@ -165,7 +165,7 @@ function createTasksController(context) {
     operationController = controller;
     view.clearError();
     setBusy(kind);
-    view.setOperationMessage("正在执行批次级操作；按钮已锁定，完成后读取后端权威状态…");
+    view.setOperationMessage("正在执行批次操作，完成后将读取最新状态……");
     let operationError = null;
     try {
       await request(batchId, controller.signal);
@@ -184,7 +184,7 @@ function createTasksController(context) {
         // 原操作错误更能解释当前状态，权威刷新失败不覆盖它。
       }
       if (active) view.showError(taskErrorGuidance(operationError));
-      view.setOperationMessage("操作未确认完成；已尽力刷新权威状态，不会制造强制恢复动作。 ");
+      view.setOperationMessage("操作失败，已重新读取最新状态；不会强制更改任务状态。");
       return false;
     } finally {
       operationError = null;
@@ -202,16 +202,16 @@ function createTasksController(context) {
     const batch = activeBatch();
     if (!batch || TERMINAL_BATCH_STATUSES.has(batch.status)) return;
     if (!await confirm({
-      title: "取消当前顺序批次？",
-      message: "后端会请求取消该批次及其活动图片任务，不会删除已完成文件。",
-      confirmLabel: "请求取消批次",
+      title: "取消当前批次？",
+      message: "系统将请求取消该批次及其活动图片任务，不会删除已完成文件。",
+      confirmLabel: "取消批次",
       dangerous: true,
-      confirmationText: "这是非强制批次级取消；完成状态仍以后端随后返回的权威结果为准。",
+      confirmationText: "取消请求可能需要片刻生效，请以刷新后的状态为准。",
     })) return;
     await runOperation({
       kind: "cancel",
       request: (batchId, signal) => api.post(batchPath(batchId, "/cancel"), {}, { signal }),
-      successMessage: "✓ 取消请求已接受，批次与最近列表已刷新。",
+      successMessage: "取消请求已接受，批次列表已刷新。",
     });
   };
 
@@ -219,11 +219,11 @@ function createTasksController(context) {
     const batch = activeBatch();
     if (!batch?.resumable || !TERMINAL_BATCH_STATUSES.has(batch.status)) return;
     if (!await confirm({
-      title: "补齐失败下载？",
-      message: "后端将重新排队失败图片并重新规划未完成地址，已成功文件会自动跳过。",
-      confirmLabel: "补齐失败下载",
+      title: "重试未完成项？",
+      message: "系统将重新排队失败图片并重新规划未完成地址，已完成文件会自动跳过。",
+      confirmLabel: "重试未完成项",
       dangerous: true,
-      confirmationText: "每个可恢复任务增加 2 次尝试；不会重置或覆盖成功任务。",
+      confirmationText: "失败任务将获得 2 次额外重试；已完成文件不会重复下载。",
     })) return;
     await runOperation({
       kind: "retry",
@@ -232,7 +232,7 @@ function createTasksController(context) {
         { additional_attempts: 2 },
         { signal },
       ),
-      successMessage: "✓ 可恢复任务已重新排队，后端权威批次状态已刷新。",
+      successMessage: "未完成项已重新排队，批次状态已刷新。",
     });
   };
 
@@ -240,16 +240,16 @@ function createTasksController(context) {
     const batch = activeBatch();
     if (!batch || !TERMINAL_BATCH_STATUSES.has(batch.status)) return;
     if (!await confirm({
-      title: "重新爬取当前批次？",
-      message: "后端会按原批次和原目录重新规划全部地址，默认只补新增、失败或取消内容。",
+      title: "重新规划当前批次？",
+      message: "系统将按原批次和原目录重新规划全部地址，默认只处理新增、失败或取消的内容。",
       confirmLabel: "重新规划批次",
       dangerous: true,
-      confirmationText: "进行中的去重审核会阻止此操作；界面不会绕过后端冲突保护。",
+      confirmationText: "去重审核进行中时不能重新规划。",
     })) return;
     await runOperation({
       kind: "rerun",
       request: (batchId, signal) => api.post(batchPath(batchId, "/rerun"), {}, { signal }),
-      successMessage: "✓ 批次已按后端语义重新规划，权威状态已刷新。",
+      successMessage: "批次已重新规划，最新状态已刷新。",
     });
   };
 
@@ -266,7 +266,7 @@ function createTasksController(context) {
     view.clearError();
     try {
       await readActive(null, { replace: true, report: true });
-      if (active) view.setOperationMessage("✓ 已载入选择的批次，并按状态启停应用级轮询。 ");
+      if (active) view.setOperationMessage("批次已加载，自动刷新状态已更新。");
     } catch {
       // readActive 已提供安全错误和陈旧 ID 恢复。
     } finally {
@@ -280,7 +280,7 @@ function createTasksController(context) {
     view.clearError();
     try {
       await refreshAuthority({ report: true });
-      if (active) view.setOperationMessage("✓ 当前批次与最近列表已手动刷新。 ");
+      if (active) view.setOperationMessage("当前批次和最近列表已刷新。");
     } catch {
       // 各读取路径已呈现安全错误。
     } finally {
@@ -314,7 +314,7 @@ function createTasksController(context) {
       setElementInert(root, false);
       root.dataset.lifecycle = "active";
       const restored = !activeBatchId() ? storage.readActiveBatchId() : null;
-      view.setOperationMessage("正在读取最近批次和活动批次；同一资源不会并发刷新…");
+      view.setOperationMessage("正在加载最近批次和活动批次……");
       queueMicrotask(() => {
         if (!active || destroyed) return;
         if (restored && !activeBatchId()) actions.setActiveBatchId(restored);
@@ -322,7 +322,7 @@ function createTasksController(context) {
         if (activeBatchId()) {
           void readActive(null, { replace: true, report: true })
             .then(() => {
-              if (active) view.setOperationMessage("✓ 批次已加载；活动批次每 1.5 秒刷新，终态自动停止。 ");
+              if (active) view.setOperationMessage("批次已加载；活动批次每 1.5 秒自动刷新，结束后停止。");
             })
             .catch(() => {});
         }

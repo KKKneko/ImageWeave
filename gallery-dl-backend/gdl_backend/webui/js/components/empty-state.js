@@ -102,9 +102,9 @@ export function createEmptyState({
 export function createDeferredApplication({ summary, capabilities, links = [] }) {
   return createApplicationShell({
     status: "warning",
-    statusLabel: "壳层就绪，业务待接入",
+    statusLabel: "页面已就绪，功能开发中",
     summary,
-    panelTitle: "后续阶段将接入",
+    panelTitle: "计划功能",
     capabilities,
     links,
   });
@@ -114,9 +114,9 @@ export function createPlaceholderShell({ responsibility }) {
   return createApplicationShell({
     status: "disabled",
     statusLabel: "功能开发中",
-    summary: "此入口用于明确产品边界，目前不提供可操作的业务功能。",
-    panelTitle: "预期职责",
-    capabilities: [responsibility, "在后端能力完成前，不会发送任何占位 API 请求。"],
+    summary: "功能正在开发，暂不可用。",
+    panelTitle: "计划功能",
+    capabilities: [responsibility],
     links: [],
   });
 }

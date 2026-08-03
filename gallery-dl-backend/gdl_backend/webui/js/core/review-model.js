@@ -10,8 +10,8 @@ const STABLE_STATUSES = new Set([
   "not_started", "waiting_for_crawl", "ready", "applied", "failed", "apply_failed", "disabled",
 ]);
 const STATUS_LABELS = Object.freeze({
-  not_started: "去重未开始", waiting_for_crawl: "等待手动启动", pending: "分析已排队",
-  analyzing: "去重分析中", auto_applying: "严格自动整理中", ready: "待审核",
+  not_started: "去重未开始", waiting_for_crawl: "待开始分析", pending: "分析已排队",
+  analyzing: "去重分析中", auto_applying: "自动去重中", ready: "待审核",
   applying: "正在应用", applied: "审核已应用", failed: "分析失败",
   apply_failed: "部分处理失败", disabled: "审核未启用",
 });
@@ -174,7 +174,7 @@ export function sanitizeReviewPage(value, { batchId, filter = "", requestedOffse
   }
   const offset = boundedCount(value.groups.offset, 1_000_000);
   if (Math.abs(offset - boundedCount(requestedOffset, 1_000_000)) > REVIEW_PAGE_LIMIT) {
-    throw new TypeError("审核分页 offset 与请求不一致");
+    throw new TypeError("审核分页位置与请求不一致");
   }
   return Object.freeze({
     batchId: safeBatchId,
@@ -191,14 +191,14 @@ export function sanitizeReviewPage(value, { batchId, filter = "", requestedOffse
 export function validateReviewState(value) {
   if (!isRecord(value) || !safeId(value.batchId) || !isRecord(value.summary) ||
       !Array.isArray(value.groups) || !FILTERS.has(value.filter) || typeof value.dirty !== "boolean") {
-    throw new TypeError("审核安全投影无效");
+    throw new TypeError("审核状态数据无效");
   }
   for (const group of value.groups) {
-    if (!safeId(group.id) || !Array.isArray(group.images)) throw new TypeError("审核分组投影无效");
+    if (!safeId(group.id) || !Array.isArray(group.images)) throw new TypeError("审核分组数据无效");
     for (const image of group.images) {
       if (!safeId(image.id) || Object.prototype.hasOwnProperty.call(image, "relative_path") ||
           Object.prototype.hasOwnProperty.call(image, "url")) {
-        throw new TypeError("审核图片投影包含不安全字段");
+        throw new TypeError("审核图片数据包含不允许的字段");
       }
     }
   }
@@ -339,13 +339,13 @@ export function reviewErrorGuidance(error) {
     requestId,
     conflict,
     missing,
-    title: missing ? "审核资源不存在" : conflict ? "审核状态已变化" : "审核请求未完成",
-    message: status === 0 ? "无法连接到 ImageWeave 后端。" : "后端没有接受本次审核操作。",
+    title: missing ? "审核内容不存在" : conflict ? "审核状态已变化" : "审核请求失败",
+    message: status === 0 ? "无法连接到 ImageWeave 服务。" : "服务未接受本次审核操作。",
     nextStep: missing
-      ? "返回终态批次列表并选择仍存在的批次。"
+      ? "返回已结束批次列表并选择仍存在的批次。"
       : conflict
-        ? "页面将重新读取权威状态；不会强制覆盖另一客户端的结果。"
-        : "保留本页选择并重试；若持续失败，请打开 DIAG.EXE。",
+        ? "页面将重新读取最新状态，不会覆盖其他页面已保存的结果。"
+        : "保留本页更改并重试；若持续失败，请打开系统诊断。",
   });
 }
 

@@ -77,10 +77,10 @@ export function createVaultView(context) {
     const anyActive = statuses.some((status) => status.session.active);
     const anyInvalidated = statuses.some((status) => status.invalidated);
     const complete = statuses.length === VAULT_SITE_IDS.length && snapshot.browserProfile && snapshot.authorizationProxy;
-    if (anyActive) updateStatusBadge(elements.headerBadge, "running", "共享浏览器授权进行中");
-    else if (anyInvalidated) updateStatusBadge(elements.headerBadge, "error", "存在失效授权材料");
-    else if (complete) updateStatusBadge(elements.headerBadge, "ready", "安全状态已加载");
-    else updateStatusBadge(elements.headerBadge, "disabled", "授权状态待加载");
+    if (anyActive) updateStatusBadge(elements.headerBadge, "running", "浏览器授权进行中");
+    else if (anyInvalidated) updateStatusBadge(elements.headerBadge, "error", "存在失效凭证");
+    else if (complete) updateStatusBadge(elements.headerBadge, "ready", "授权状态已加载");
+    else updateStatusBadge(elements.headerBadge, "disabled", "正在加载授权状态");
   };
 
   const renderSites = (bySite) => {
@@ -132,8 +132,8 @@ export function createVaultView(context) {
       const reason = createElement("p", {
         className: "vault-control-reason",
         text: reasons[0] || (definition.method === "anonymous"
-          ? "此目标没有授权写操作。"
-          : "可用操作由后端 actions 白名单决定。"),
+          ? "该站点无需授权操作。"
+          : "请根据当前状态选择可用操作。"),
       });
       const card = createElement("article", {
         className: "vault-site-card",
@@ -152,11 +152,11 @@ export function createVaultView(context) {
           createStatusBadge(model.badge.status, model.badge.label),
         ]),
         createElement("p", { className: "vault-site-headline", text: model.headline }),
-        createElement("p", { className: "vault-proof-note", text: model.proof }),
+        ...(model.proof ? [createElement("p", { className: "vault-proof-note", text: model.proof })] : []),
         vaultDefinitionList([
-          ["材料", model.material],
+          ["凭证", model.material],
           ["会话", model.session],
-          ["安全来源", model.source],
+          ["凭证来源", model.source],
           ["最近更新", model.updatedAt],
         ]),
         actionHost,
@@ -174,8 +174,8 @@ export function createVaultView(context) {
       elements.profileStatusHost.replaceChildren(createEmptyState({
         status: "error",
         label: "状态不可用",
-        title: "共享 Profile 状态尚未加载",
-        message: "其他授权目标仍可保留最后一次安全状态；请手动刷新。",
+        title: "授权浏览器数据尚未加载",
+        message: "其他站点仍会保留上次状态，请手动刷新。",
       }));
     } else {
       elements.profileStatusHost.replaceChildren(
@@ -184,7 +184,7 @@ export function createVaultView(context) {
           ["共享范围", "X / Twitter、Pixiv、EH"],
           ["磁盘状态", model.presence],
           ["运行状态", model.runtime],
-          ["导出材料", "单独管理，不随 Profile 自动删除"],
+          ["已保存凭证", "单独管理，不会随授权浏览器数据自动删除"],
         ]),
       );
     }
@@ -197,15 +197,15 @@ export function createVaultView(context) {
       elements.proxyStatusHost.replaceChildren(createEmptyState({
         status: "error",
         label: "状态不可用",
-        title: "授权代理状态尚未加载",
+        title: "登录代理状态尚未加载",
         message: "输入框不会回填任何旧值；请刷新后再提交。",
       }));
     } else {
       elements.proxyStatusHost.replaceChildren(
         createStatusBadge(model.badge.status, model.badge.label),
         vaultDefinitionList([
-          ["脱敏端点", model.endpoint],
-          ["配置来源", model.source],
+          ["地址", model.endpoint],
+          ["设置来源", model.source],
           ["生效说明", model.runtime],
           ["最近更新", model.updatedAt],
           ["凭据显示", proxy.credentialsRedacted ? "用户名和密码已隐藏" : "响应未包含代理凭据"],
@@ -230,10 +230,10 @@ export function createVaultView(context) {
     elements.proxyInput.disabled = Boolean(busy);
     elements.proxyInput.setAttribute("aria-disabled", String(Boolean(busy)));
     elements.profileReasons.textContent = controls.profileClear.reason ||
-      "清空前会再次确认；后端导出材料不会随 Profile 删除。";
+      "清除前会再次确认；已保存的站点凭证不会随授权浏览器数据删除。";
     const proxyReasons = [controls.proxySave.reason, controls.proxyReset.reason].filter(Boolean);
     elements.proxyReasons.textContent = proxyReasons[0] ||
-      "保存只改变后续授权线路；不会触碰 PROXY.CPL 的抓取代理池。";
+      "保存后仅影响后续登录，不会更改图片采集使用的代理池。";
     renderBusyAttributes();
   };
 
@@ -252,7 +252,7 @@ export function createVaultView(context) {
     elements.proxyInput.setAttribute("autocomplete", "new-password");
     elements.proxyInput.setAttribute("aria-invalid", "false");
     elements.revealButton.setAttribute("aria-pressed", "false");
-    elements.revealButton.setAttribute("aria-label", "显示授权代理输入");
+    elements.revealButton.setAttribute("aria-label", "显示登录代理输入");
     elements.revealButton.textContent = "显示代理输入";
     elements.proxyValidation.textContent = "";
     proxyInputTouched = false;
@@ -265,7 +265,7 @@ export function createVaultView(context) {
     elements.revealButton.setAttribute("aria-pressed", String(reveal));
     elements.revealButton.setAttribute(
       "aria-label",
-      reveal ? "隐藏授权代理输入" : "显示授权代理输入",
+      reveal ? "隐藏登录代理输入" : "显示登录代理输入",
     );
     elements.revealButton.textContent = reveal ? "隐藏代理输入" : "显示代理输入";
     elements.proxyInput.focus({ preventScroll: true });

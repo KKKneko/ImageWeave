@@ -24,7 +24,7 @@ const EH_ALIASES = Object.freeze({
   series: "parody", parody: "parody", r: "reclass", reclass: "reclass", temp: "temp",
 });
 const EVIDENCE_LABELS = Object.freeze({
-  site_search_work_evidence: "有站内作品证据",
+  site_search_work_evidence: "有站内作品结果",
   account_name_exact_match: "账号身份精确匹配",
   account_identity_unverified: "账号身份待核对",
   danbooru_artist_directory_match: "Danbooru 画师目录匹配",
@@ -32,7 +32,7 @@ const EVIDENCE_LABELS = Object.freeze({
   artist_tag_exact_match: "画师标签精确匹配",
   character_tag_exact_match: "角色标签精确匹配",
   keyword_gallery_search_only: "仅关键词画廊命中",
-  keyword_gallery_search: "站内关键词画廊候选",
+  keyword_gallery_search: "站内关键词画廊结果",
   keyword_creator_search: "站内画师目录命中",
   danbooru_artist_url: "Danbooru 人工维护主页",
   danbooru_alias_search: "Danbooru 别名扩搜命中",
@@ -96,7 +96,7 @@ function displayEndpoint(value, site, addressType) {
     const match = parsed.pathname.match(/^\/g\/(\d+)\//);
     return match ? `${host} · 画廊 ${match[1]} · 访问令牌已隐藏` : `${host} · EH 画廊`;
   }
-  return `${host} · ${safeText(addressType, "图库地址", 50)}`;
+  return `${host} · ${safeText(addressType, "来源地址", 50)}`;
 }
 
 function safeThumbnail(value, site) {
@@ -171,8 +171,8 @@ function sanitizeCandidate(raw, { site, sourceIndex, candidateIndex, weak }) {
   if (!isRecord(raw)) return null;
   const url = safeOperationalUrl(raw.url);
   if (!url) return null;
-  const addressType = safeText(raw.address_type, "图库地址", 64);
-  const label = safeText(raw.label || raw.tag || raw.title || raw.id, "未命名地址", 180);
+  const addressType = safeText(raw.address_type, "来源地址", 64);
+  const label = safeText(raw.label || raw.tag || raw.title || raw.id, "未命名来源", 180);
   const evidence = [];
   for (const reason of Array.isArray(raw.evidence_reasons) ? raw.evidence_reasons.slice(0, 12) : []) {
     if (typeof reason === "string" && Object.prototype.hasOwnProperty.call(EVIDENCE_LABELS, reason)) {
@@ -257,6 +257,7 @@ function sanitizeSource(raw, sourceIndex, operations) {
       ? raw.alias_keywords.slice(0, 16).map((item) => safeText(item, "", 80)).filter(Boolean)
       : [],
     errorCode: safeIdentifier(raw.error?.code, 128),
+    errorMessage: safeText(raw.error?.message, "", 500),
     enrichmentIssueCount: Array.isArray(raw.enrichment_errors)
       ? Math.min(raw.enrichment_errors.length, 1_000)
       : 0,
@@ -425,7 +426,7 @@ export function buildSearchPayload({ keyword, sites, limit, proxyMode, sourceOpt
   return {
     keyword: text,
     sites: orderedSites,
-    limit: boundedInteger(limit, 1, 200, 0) || (() => { throw new TypeError("证据上限需为 1–200 的整数"); })(),
+    limit: boundedInteger(limit, 1, 200, 0) || (() => { throw new TypeError("结果上限需为 1–200 的整数"); })(),
     proxy_mode: strictProxyMode(proxyMode),
     source_options: strictSourceOptions(sourceOptions, orderedSites),
   };
@@ -482,11 +483,11 @@ export function buildCrawlPayload({
     }
     selectedSources.push(item);
   }
-  if (!selectedSources.length) throw new TypeError("至少选择一个图库地址");
+  if (!selectedSources.length) throw new TypeError("至少选择一个采集来源");
   const payload = {
     sources: selectedSources,
-    concurrency: boundedInteger(concurrency, 1, 128, 0) || (() => { throw new TypeError("图片并发需为 1–128 的整数"); })(),
-    max_tasks: boundedInteger(maxTasks, 1, 100_000, 0) || (() => { throw new TypeError("任务上限需为 1–100000 的整数"); })(),
+    concurrency: boundedInteger(concurrency, 1, 128, 0) || (() => { throw new TypeError("每个地址并发数需为 1–128 的整数"); })(),
+    max_tasks: boundedInteger(maxTasks, 1, 100_000, 0) || (() => { throw new TypeError("最多任务数需为 1–100000 的整数"); })(),
     proxy_mode: strictProxyMode(proxyMode),
   };
   const output = strictOutputDir(outputDir);
@@ -504,12 +505,12 @@ export function crawlErrorGuidance(error) {
     code,
     requestId,
     targetApp: authentication ? "vault" : proxy ? "proxy" : "diagnostics",
-    title: status === 409 ? "当前状态不允许此操作" : status === 422 ? "请求配置未通过校验" : "抓取请求未完成",
-    message: status === 0 ? "无法连接到 ImageWeave 后端。" : "后端没有接受本次请求。",
+    title: status === 409 ? "当前状态不允许此操作" : status === 422 ? "采集设置有误" : "采集请求失败",
+    message: status === 0 ? "无法连接到 ImageWeave 服务。" : "服务未接受本次请求。",
     nextStep: authentication
-      ? "打开 VAULT.CPL 检查对应站点授权后重试。"
+      ? "打开授权管理，检查对应站点的授权后重试。"
       : proxy
-        ? "打开 PROXY.CPL 检查代理池与租约状态后重试。"
-        : "保留当前选择，修正输入或打开 DIAG.EXE 检查系统状态。",
+        ? "打开代理管理，检查代理池的运行状态后重试。"
+        : "保留当前选择，修正输入或打开系统诊断检查运行状态。",
   });
 }

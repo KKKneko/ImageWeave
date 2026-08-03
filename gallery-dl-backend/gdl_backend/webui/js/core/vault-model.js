@@ -57,6 +57,19 @@ const SESSION_STATES = new Set([
   "failed",
   "token_ready",
 ]);
+const SESSION_STATE_LABELS = Object.freeze({
+  none: "无记录",
+  starting: "正在开始",
+  starting_browser: "正在启动授权浏览器",
+  awaiting_login: "等待登录",
+  awaiting_code: "等待授权确认",
+  exchanging: "正在确认授权",
+  authorized: "已授权",
+  cancelled: "已取消",
+  timed_out: "已超时",
+  failed: "失败",
+  token_ready: "登录令牌已就绪",
+});
 const MANAGED_ACTIVE_STATES = new Set(["starting", "awaiting_login"]);
 const PIXIV_ACTIVE_STATES = new Set([
   "starting",
@@ -96,7 +109,7 @@ export function createVaultRequestGate() {
   };
 
   const beginRead = (lane) => {
-    if (!VAULT_REQUEST_LANES.has(lane)) throw new TypeError("未知 VAULT 请求通道");
+    if (!VAULT_REQUEST_LANES.has(lane)) throw new TypeError("未知授权请求通道");
     const laneVersion = laneVersions.get(lane) + 1;
     laneVersions.set(lane, laneVersion);
     return Object.freeze({ lane, laneVersion, lifecycleVersion, writeVersion });
@@ -189,36 +202,36 @@ function explicitPortFromUrl(text) {
 }
 
 function parseProxyUrl(value, { allowSecrets }) {
-  if (typeof value !== "string") throw new TypeError("授权代理地址必须是文本");
+  if (typeof value !== "string") throw new TypeError("登录代理地址必须是文本");
   const text = value.trim();
   if (!text) return Object.freeze({ mode: "direct", value: "" });
-  if (text.length > MAX_AUTH_PROXY_LENGTH) throw new TypeError("授权代理地址不能超过 300 个字符");
+  if (text.length > MAX_AUTH_PROXY_LENGTH) throw new TypeError("登录代理地址不能超过 300 个字符");
   if (CONTROL_CHARACTERS.test(text) || /\s/.test(text)) {
-    throw new TypeError("授权代理地址不能包含空白或控制字符");
+    throw new TypeError("登录代理地址不能包含空白或控制字符");
   }
 
   let parsed;
   try {
     parsed = new URL(text);
   } catch {
-    throw new TypeError("请输入完整的 scheme://host:port 授权代理地址");
+    throw new TypeError("请输入完整的协议://主机:端口登录代理地址");
   }
   const scheme = parsed.protocol.slice(0, -1).toLowerCase();
   if (!PROXY_SCHEMES.has(scheme)) {
     throw new TypeError("只支持 http、https、socks4、socks5 或 socks5h 代理");
   }
   if (parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== "/")) {
-    throw new TypeError("授权代理地址不能包含路径、查询参数或 fragment");
+    throw new TypeError("登录代理地址不能包含路径、查询参数或片段");
   }
   const host = safeHost(parsed.hostname);
   const port = explicitPortFromUrl(text);
-  if (!host || !port) throw new TypeError("授权代理地址必须包含有效主机和显式端口");
+  if (!host || !port) throw new TypeError("登录代理地址必须包含有效主机和端口");
   const hasCredentials = Boolean(parsed.username || parsed.password || text.slice(text.indexOf("://") + 3).includes("@"));
   if (scheme.startsWith("socks") && hasCredentials) {
-    throw new TypeError("SOCKS 授权代理不能携带用户名或密码");
+    throw new TypeError("SOCKS 登录代理不能包含用户名或密码");
   }
   if (!allowSecrets && hasCredentials && !text.includes("***@")) {
-    throw new TypeError("代理状态包含未脱敏凭据");
+    throw new TypeError("登录代理状态包含未隐藏的账号信息");
   }
   return Object.freeze({
     mode: "proxy",
@@ -260,7 +273,7 @@ function sanitizeProxyStatus(value) {
 }
 
 function sanitizeBrowserProfile(value) {
-  const profile = requireRecord(value, "共享浏览器状态");
+  const profile = requireRecord(value, "授权浏览器数据");
   return {
     shared: safeBoolean(profile.shared),
     present: safeBoolean(profile.present),
@@ -335,7 +348,7 @@ export function sanitizeVaultSiteStatus(value) {
 export function sanitizeVaultStatus(value) {
   const snapshot = requireRecord(value, "授权状态快照");
   if (snapshot.secrets_exposed !== false) {
-    throw new TypeError("后端未声明授权状态已经脱敏");
+    throw new TypeError("服务返回的授权状态不符合安全要求");
   }
   if (!Array.isArray(snapshot.items)) throw new TypeError("授权目标列表无效");
   const bySite = new Map();
@@ -373,7 +386,7 @@ const SESSION_VIEW_KEYS = new Set(["present", "active", "state", "createdAt", "e
 const CAPABILITY_KEYS = new Set(["authorize", "clear"]);
 
 export function validateVaultSiteViewModel(value) {
-  const site = requireRecord(value, "授权站点 view model");
+  const site = requireRecord(value, "站点授权状态数据");
   if (!hasOnlyKeys(site, SITE_VIEW_KEYS)) throw new TypeError("授权站点包含未知字段");
   const definition = SITE_DEFINITIONS[site.site];
   if (!definition || site.label !== definition.label || site.method !== definition.method) {
@@ -396,7 +409,7 @@ export function validateVaultSiteViewModel(value) {
     state: site.state,
     authorized: requireExactBoolean(site.authorized, "授权状态"),
     configured: requireExactBoolean(site.configured, "配置状态"),
-    materialValid: requireExactBoolean(site.materialValid, "材料状态"),
+    materialValid: requireExactBoolean(site.materialValid, "凭证有效状态"),
     invalidated: requireExactBoolean(site.invalidated, "失效状态"),
     updatedAt: requireNullableTimestamp(site.updatedAt, "更新时间"),
     cookieCount: site.cookieCount,
@@ -422,23 +435,23 @@ const PROXY_VIEW_KEYS = new Set([
 const SNAPSHOT_VIEW_KEYS = new Set(["bySite", "browserProfile", "authorizationProxy"]);
 
 function validateBrowserProfileView(value) {
-  const profile = requireRecord(value, "共享浏览器 view model");
-  if (!hasOnlyKeys(profile, PROFILE_VIEW_KEYS)) throw new TypeError("共享浏览器状态包含未知字段");
+  const profile = requireRecord(value, "授权浏览器状态数据");
+  if (!hasOnlyKeys(profile, PROFILE_VIEW_KEYS)) throw new TypeError("授权浏览器状态包含未知字段");
   return {
     shared: requireExactBoolean(profile.shared, "共享状态"),
-    present: requireExactBoolean(profile.present, "Profile 存在状态"),
+    present: requireExactBoolean(profile.present, "授权浏览器数据存在状态"),
     running: requireExactBoolean(profile.running, "浏览器运行状态"),
-    resetting: requireExactBoolean(profile.resetting, "Profile 清理状态"),
+    resetting: requireExactBoolean(profile.resetting, "授权浏览器数据清理状态"),
   };
 }
 
 function validateAuthorizationProxyView(value) {
-  const proxy = requireRecord(value, "授权代理 view model");
+  const proxy = requireRecord(value, "登录代理状态数据");
   if (!hasOnlyKeys(proxy, PROXY_VIEW_KEYS) || !PROXY_SOURCES.has(proxy.source)) {
     throw new TypeError("授权代理状态无效");
   }
   if (typeof proxy.scheme !== "string" || (proxy.scheme && !PROXY_SCHEMES.has(proxy.scheme))) {
-    throw new TypeError("授权代理 scheme 无效");
+    throw new TypeError("登录代理协议无效");
   }
   if (typeof proxy.displayEndpoint !== "string" || (
     proxy.displayEndpoint && !SAFE_PROXY_DISPLAY_PATTERN.test(proxy.displayEndpoint)
@@ -447,27 +460,27 @@ function validateAuthorizationProxyView(value) {
   }
   return {
     source: proxy.source,
-    configured: requireExactBoolean(proxy.configured, "代理配置状态"),
+    configured: requireExactBoolean(proxy.configured, "登录代理设置状态"),
     direct: requireExactBoolean(proxy.direct, "直连状态"),
     scheme: proxy.scheme,
     displayEndpoint: proxy.displayEndpoint,
-    credentialsRedacted: requireExactBoolean(proxy.credentialsRedacted, "代理脱敏状态"),
-    browserRunning: requireExactBoolean(proxy.browserRunning, "浏览器代理状态"),
-    restartPending: requireExactBoolean(proxy.restartPending, "代理重启状态"),
+    credentialsRedacted: requireExactBoolean(proxy.credentialsRedacted, "代理敏感信息隐藏状态"),
+    browserRunning: requireExactBoolean(proxy.browserRunning, "授权浏览器连接状态"),
+    restartPending: requireExactBoolean(proxy.restartPending, "登录代理待生效状态"),
     updatedAt: requireNullableTimestamp(proxy.updatedAt, "代理更新时间"),
     valid: requireExactBoolean(proxy.valid, "代理响应状态"),
   };
 }
 
 export function validateVaultSnapshot(value) {
-  const snapshot = requireRecord(value, "授权 Store payload");
+  const snapshot = requireRecord(value, "授权状态数据");
   if (!hasOnlyKeys(snapshot, SNAPSHOT_VIEW_KEYS) || !(snapshot.bySite instanceof Map)) {
-    throw new TypeError("授权 Store payload 无效");
+    throw new TypeError("授权状态数据无效");
   }
   const bySite = new Map();
   for (const [siteId, site] of snapshot.bySite) {
     if (siteId !== site?.site || !SITE_DEFINITIONS[siteId] || bySite.has(siteId)) {
-      throw new TypeError("授权 Store 目标无效");
+      throw new TypeError("授权状态中的站点无效");
     }
     bySite.set(siteId, validateVaultSiteViewModel(site));
   }
@@ -560,12 +573,12 @@ export function formatVaultSite(status, siteId = status?.site) {
       label: definition?.label || "未知目标",
       mark: definition?.mark || "?",
       badge: Object.freeze({ status: "error", label: "状态不可用" }),
-      headline: "尚未收到此目标的安全状态。",
-      proof: "可刷新重试；其他目标的最后安全状态不会被清空。",
+      headline: "尚未读取该站点状态。",
+      proof: "请刷新后重试。",
       material: "未知",
       session: "无活动会话",
       updatedAt: "尚无记录",
-      source: "后端状态未加载",
+      source: "状态未加载",
     });
   }
 
@@ -573,33 +586,33 @@ export function formatVaultSite(status, siteId = status?.site) {
   let headline;
   let proof;
   if (definition.method === "anonymous") {
-    badge = { status: "ready", label: "公开访问就绪" };
-    headline = "此目标按后端契约无需登录。";
-    proof = "这里只证明公开访问模式已启用，不代表外部站点始终在线。";
+    badge = { status: "ready", label: "无需登录" };
+    headline = "该站点无需登录即可使用。";
+    proof = "";
   } else if (status.session.active) {
     badge = { status: "running", label: "授权进行中" };
-    headline = "共享授权浏览器标签页正在等待操作。";
-    proof = "完成、失败或取消后，页面会刷新后端托管材料状态。";
+    headline = "请在授权浏览器中完成登录。";
+    proof = "完成后状态会自动更新。";
   } else if (status.invalidated) {
-    badge = { status: "error", label: "实际访问判定失效" };
-    headline = "后端在真实访问中判定现有材料不可用。";
-    proof = "请重新授权；页面不会显示原始失败文本或凭证片段。";
+    badge = { status: "error", label: "凭证已失效" };
+    headline = "站点已拒绝现有凭证。";
+    proof = "请重新授权。";
   } else if (status.authorized && status.materialValid) {
-    badge = { status: "warning", label: "已配置，未远端验证" };
-    headline = "后端检测到可供任务使用的托管授权材料。";
-    proof = "该状态只证明本地 Cookie 结构或缓存 Token 存在，不等于远端登录验证成功。";
+    badge = { status: "warning", label: "凭证已保存，待验证" };
+    headline = "已找到可供任务使用的登录凭证。";
+    proof = "凭证将在实际访问时验证。";
   } else if (status.configured) {
-    badge = { status: "error", label: "材料不完整" };
-    headline = "后端发现授权材料，但当前不满足使用条件。";
-    proof = "请重新授权；旧秘密不会回填到页面。";
+    badge = { status: "error", label: "凭证不可用" };
+    headline = "已保存凭证当前不可用。";
+    proof = "请重新授权。";
   } else if (["failed", "timed_out"].includes(status.session.state)) {
     badge = { status: "error", label: status.session.state === "timed_out" ? "授权已超时" : "授权失败" };
-    headline = "最近一次共享浏览器授权未完成。";
-    proof = "可重新开始；错误区只显示受控指引与安全 request id。";
+    headline = "最近一次浏览器授权未完成。";
+    proof = "可重新开始授权。";
   } else {
-    badge = { status: "disabled", label: "未配置" };
-    headline = "尚无可供任务使用的托管授权材料。";
-    proof = "使用共享授权浏览器完成一次授权后，后端会保存导出材料。";
+    badge = { status: "disabled", label: "未授权" };
+    headline = "尚未保存登录凭证。";
+    proof = "请使用授权浏览器完成登录。";
   }
 
   return Object.freeze({
@@ -611,66 +624,66 @@ export function formatVaultSite(status, siteId = status?.site) {
     material: definition.method === "anonymous"
       ? "无需凭证"
       : status.configured
-        ? status.materialValid ? "后端托管材料存在" : "材料存在但不可用"
+        ? status.materialValid ? "凭证已保存" : "凭证不可用"
         : "未保存",
     session: status.session.active
-      ? `活动会话 · ${status.session.state}`
+      ? `授权进行中 · ${SESSION_STATE_LABELS[status.session.state] || "未知状态"}`
       : status.session.present
-        ? `最近会话 · ${status.session.state}`
+        ? `最近会话 · ${SESSION_STATE_LABELS[status.session.state] || "未知状态"}`
         : "无活动会话",
     updatedAt: formatVaultTime(status.updatedAt),
     source: definition.method === "anonymous"
-      ? "后端公开访问契约"
+      ? "公开访问"
       : definition.method === "oauth"
-        ? "后端 gallery-dl 授权缓存"
-        : `后端导出 Cookie${status.cookieCount ? ` · ${status.cookieCount} 条` : ""}`,
+        ? "Pixiv 登录令牌"
+        : `已保存 Cookie${status.cookieCount ? ` · ${status.cookieCount} 条` : ""}`,
   });
 }
 
 export function formatBrowserProfile(profile) {
   if (!profile) return Object.freeze({
-    badge: Object.freeze({ status: "error", label: "Profile 状态不可用" }),
+    badge: Object.freeze({ status: "error", label: "授权浏览器数据不可用" }),
     presence: "未知",
     runtime: "未知",
   });
   const badge = profile.resetting
     ? { status: "running", label: "正在清空" }
     : profile.running
-      ? { status: "running", label: "共享浏览器运行中" }
+      ? { status: "running", label: "授权浏览器运行中" }
       : profile.present
-        ? { status: "warning", label: "Profile 已保存" }
-        : { status: "disabled", label: "Profile 尚未建立" };
+        ? { status: "warning", label: "授权浏览器数据已保存" }
+        : { status: "disabled", label: "尚无授权浏览器数据" };
   return Object.freeze({
     badge: Object.freeze(badge),
-    presence: profile.present ? "后端私有目录中存在" : "尚不存在",
-    runtime: profile.running ? "当前有共享 Chrome 进程" : "当前无共享 Chrome 进程",
+    presence: profile.present ? "已保存" : "尚未保存",
+    runtime: profile.running ? "授权浏览器正在运行" : "授权浏览器未运行",
   });
 }
 
 export function formatAuthorizationProxy(proxy) {
   if (!proxy || !proxy.valid) return Object.freeze({
     badge: Object.freeze({ status: "error", label: "代理状态不可用" }),
-    endpoint: "未采用后端展示值",
+    endpoint: "未读取服务返回的地址",
     source: "未知",
     runtime: "请刷新后重试",
     updatedAt: "尚无记录",
   });
-  const sourceNames = { runtime: "界面运行时覆盖", config: "config 基线", none: "未设置" };
+  const sourceNames = { runtime: "授权管理设置", config: "配置文件默认值", none: "未设置" };
   const configured = proxy.configured;
   const badge = proxy.restartPending
-    ? { status: "warning", label: "等待下次授权重启" }
+    ? { status: "warning", label: "下次授权时生效" }
     : configured
-      ? { status: "ready", label: "授权代理已配置" }
-      : { status: "disabled", label: "授权流量直连" };
+      ? { status: "ready", label: "登录代理已设置" }
+      : { status: "disabled", label: "登录流量直连" };
   return Object.freeze({
     badge: Object.freeze(badge),
-    endpoint: configured ? proxy.displayEndpoint : "直连（无授权代理）",
+    endpoint: configured ? proxy.displayEndpoint : "直连（未设置登录代理）",
     source: sourceNames[proxy.source] || "未知",
     runtime: proxy.restartPending
-      ? "已运行浏览器仍使用旧线路；下次授权会按新设置重启"
+      ? "当前授权浏览器仍使用原线路；下次授权时将应用新设置"
       : proxy.browserRunning
-        ? "共享浏览器当前正在运行"
-        : "新设置将在下一次授权启动时使用",
+        ? "授权浏览器正在运行"
+        : "新设置将在下次授权时使用",
     updatedAt: formatVaultTime(proxy.updatedAt),
   });
 }
@@ -688,7 +701,7 @@ export function deriveVaultControls(snapshot, {
   const proxy = snapshot?.authorizationProxy || null;
   const isBusy = Boolean(busy);
   const activeSite = SITE_ORDER.find((siteId) => bySite.get(siteId)?.session.active) || "";
-  const busyReason = "正在执行其他凭证操作";
+  const busyReason = "正在执行其他授权操作";
   const sites = {};
 
   for (const siteId of SITE_ORDER) {
@@ -700,15 +713,15 @@ export function deriveVaultControls(snapshot, {
     const authorizeReason = isBusy
       ? busyReason
       : !status
-        ? "请先刷新此目标状态"
+        ? "请先刷新该站点状态"
         : !status.capabilities.authorize
-          ? "后端未声明此目标支持浏览器授权"
+          ? "该站点不支持浏览器授权"
           : profile?.resetting
-            ? "共享浏览器 Profile 正在清空"
+            ? "正在清除授权浏览器数据"
             : activeSite && activeSite !== siteId
-              ? `共享浏览器正用于 ${SITE_DEFINITIONS[activeSite].label}`
+              ? `授权浏览器正用于 ${SITE_DEFINITIONS[activeSite].label}`
               : status.session.active
-                ? "此目标已有活动授权会话"
+                ? "该站点已有活动授权会话"
                 : "";
     const cancelReason = isBusy
       ? busyReason
@@ -718,9 +731,9 @@ export function deriveVaultControls(snapshot, {
     const clearReason = isBusy
       ? busyReason
       : !status?.capabilities.clear
-        ? "后端未声明此目标支持清除"
+        ? "该站点不支持删除凭证"
         : !status.configured
-          ? "当前没有可删除的后端导出材料"
+          ? "当前没有可删除的站点凭证"
           : status.session.active
             ? "请先取消当前授权会话"
             : "";
@@ -730,7 +743,7 @@ export function deriveVaultControls(snapshot, {
         authorizeReason,
         busy === authorizeKind
           ? "正在打开…"
-          : status?.authorized ? "重新授权" : "在共享浏览器中授权",
+          : status?.authorized ? "重新授权" : "在授权浏览器中登录",
       ),
       cancel: control(
         Boolean(cancelReason),
@@ -740,7 +753,7 @@ export function deriveVaultControls(snapshot, {
       clear: control(
         Boolean(clearReason),
         clearReason,
-        busy === clearKind ? "正在删除…" : "删除导出凭证",
+        busy === clearKind ? "正在删除…" : "删除站点凭证",
       ),
       showAuthorize: Boolean(definition.authorizeAction),
       showCancel: Boolean(status?.session.active),
@@ -751,46 +764,46 @@ export function deriveVaultControls(snapshot, {
   const profileReason = isBusy
     ? busyReason
     : !profile
-      ? "请先刷新共享浏览器状态"
+      ? "请先刷新授权浏览器状态"
       : profile.resetting
-        ? "共享浏览器 Profile 已在清空"
+        ? "正在清除授权浏览器数据"
         : activeSite
           ? `请先关闭 ${SITE_DEFINITIONS[activeSite].label} 授权标签页`
           : !profile.present
-            ? "当前没有可清空的共享 Profile"
+            ? "当前没有可清除的授权浏览器数据"
             : "";
   const saveReason = isBusy
     ? busyReason
     : !proxy
-      ? "请先刷新授权代理状态"
+      ? "请先刷新登录代理状态"
       : !proxyInputValid
-        ? "请修正授权代理地址格式"
+        ? "请修正登录代理地址格式"
         : "";
   const resetReason = isBusy
     ? busyReason
     : !proxy
-      ? "请先刷新授权代理状态"
+      ? "请先刷新登录代理状态"
       : proxy.source !== "runtime"
-        ? "当前没有界面运行时覆盖"
+        ? "当前没有授权管理中保存的设置"
         : "";
 
   return Object.freeze({
     sites: Object.freeze(sites),
-    refresh: control(isBusy, busyReason, busy === "refresh" ? "正在刷新…" : "刷新安全状态"),
+    refresh: control(isBusy, busyReason, busy === "refresh" ? "正在刷新…" : "刷新授权状态"),
     profileClear: control(
       Boolean(profileReason),
       profileReason,
-      busy === "profile-clear" ? "正在清空…" : "清空共享 Profile",
+      busy === "profile-clear" ? "正在清除…" : "清除授权浏览器数据",
     ),
     proxySave: control(
       Boolean(saveReason),
       saveReason,
-      busy === "proxy-save" ? "正在保存…" : "保存新代理 / 设置直连",
+      busy === "proxy-save" ? "正在保存…" : "保存登录代理设置",
     ),
     proxyReset: control(
       Boolean(resetReason),
       resetReason,
-      busy === "proxy-reset" ? "正在恢复…" : "恢复 config 默认",
+      busy === "proxy-reset" ? "正在恢复…" : "恢复默认设置",
     ),
     reveal: control(isBusy, busyReason, "显示或隐藏代理输入"),
     activeSite,
@@ -799,79 +812,79 @@ export function deriveVaultControls(snapshot, {
 
 const ERROR_GUIDANCE = Object.freeze({
   invalid_authorization_proxy: Object.freeze({
-    title: "授权代理格式无效",
-    message: "后端拒绝了授权代理地址；刚提交的值不会在错误区回显。",
-    nextStep: "请使用 scheme://host:port；不要添加路径、查询参数或 fragment。",
+    title: "登录代理格式无效",
+    message: "服务未接受该登录代理地址。",
+    nextStep: "请使用协议://主机:端口格式，不要添加路径或查询参数。",
   }),
   auth_request_too_large: Object.freeze({
-    title: "授权代理请求过大",
-    message: "请求超过授权代理接口的大小上限。",
+    title: "登录代理请求过大",
+    message: "请求超过登录代理接口的大小上限。",
     nextStep: "请缩短代理地址并确认没有粘贴 Cookie、Header 或配置文件内容。",
   }),
   invalid_content_length: Object.freeze({
     title: "请求大小信息无效",
-    message: "后端拒绝了异常的 Content-Length。",
+    message: "服务未接受请求大小信息。",
     nextStep: "请刷新页面后重新输入完整代理地址。",
   }),
   unsupported_auth_site: Object.freeze({
-    title: "授权目标不支持",
-    message: "当前后端版本不支持该授权目标。",
-    nextStep: "请刷新状态；不要改写地址栏尝试未声明的目标。",
+    title: "站点不支持授权",
+    message: "当前版本不支持该站点授权。",
+    nextStep: "请刷新状态并使用页面提供的操作。",
   }),
   managed_browser_unsupported: Object.freeze({
     title: "授权方式不支持",
-    message: "该目标不能使用共享浏览器登录流程。",
-    nextStep: "请刷新状态并使用目标卡片中后端声明的操作。",
+    message: "该站点不能使用授权浏览器登录。",
+    nextStep: "请刷新状态并使用站点卡片中提供的操作。",
   }),
   shared_browser_busy: Object.freeze({
-    title: "共享浏览器正忙",
-    message: "另一项授权或 Profile 清理正在占用共享浏览器。",
-    nextStep: "完成或取消当前授权后，刷新状态再试。",
+    title: "授权浏览器正忙",
+    message: "另一项授权或浏览器数据清理正在进行。",
+    nextStep: "请完成或取消当前授权，刷新状态后重试。",
   }),
   chrome_not_found: Object.freeze({
     title: "未找到 Chrome / Chromium",
-    message: "后端无法启动项目专属授权浏览器。",
-    nextStep: "请在后端配置 auth.chrome_executable，然后手动重试。",
+    message: "服务无法启动授权浏览器。",
+    nextStep: "请在服务配置中设置 auth.chrome_executable，然后重试。",
   }),
   browser_profile_busy: Object.freeze({
-    title: "共享 Profile 正在使用",
-    message: "后端无法安全取得共享授权 Profile。",
-    nextStep: "请关闭残留的项目授权 Chrome，再刷新状态重试。",
+    title: "授权浏览器数据正在使用",
+    message: "服务暂时无法使用授权浏览器数据。",
+    nextStep: "请关闭残留的授权 Chrome 窗口，再刷新后重试。",
   }),
   browser_login_start_failed: Object.freeze({
     title: "授权浏览器启动失败",
-    message: "后端未能打开共享授权浏览器标签页。",
+    message: "服务未能打开授权浏览器标签页。",
     nextStep: "请检查 Chrome 配置与桌面会话，然后手动重试。",
   }),
   browser_login_session_not_found: Object.freeze({
     title: "授权会话已失效",
-    message: "后端找不到刚才的共享浏览器会话。",
-    nextStep: "请刷新目标状态；如仍未配置，请重新开始授权。",
+    message: "服务找不到刚才的浏览器授权会话。",
+    nextStep: "请刷新站点状态；如仍未授权，请重新开始。",
   }),
   pixiv_oauth_session_not_found: Object.freeze({
     title: "Pixiv 会话已失效",
-    message: "后端找不到当前 Pixiv 授权会话。",
+    message: "服务找不到当前 Pixiv 授权会话。",
     nextStep: "请刷新 Pixiv 状态并重新开始授权。",
   }),
   pixiv_oauth_session_expired: Object.freeze({
     title: "Pixiv 授权已过期",
     message: "本次 Pixiv 授权没有在时限内完成。",
-    nextStep: "请重新开始，并在共享浏览器中完成登录。",
+    nextStep: "请重新开始，并在授权浏览器中完成登录。",
   }),
   pixiv_oauth_start_timeout: Object.freeze({
     title: "Pixiv 授权启动超时",
-    message: "后端未能及时建立 Pixiv 授权流程。",
+    message: "服务未能及时建立 Pixiv 授权流程。",
     nextStep: "请检查 Chrome 与网络线路，刷新状态后重试。",
   }),
   pixiv_oauth_start_failed: Object.freeze({
     title: "Pixiv 授权启动失败",
-    message: "后端未能启动 Pixiv OAuth 与共享浏览器流程。",
+    message: "服务未能启动 Pixiv OAuth 和浏览器授权。",
     nextStep: "请检查 gallery-dl、Chrome 与授权代理，然后重试。",
   }),
   pixiv_oauth_exchange_active: Object.freeze({
     title: "Pixiv 正在确认授权",
-    message: "后端正在交换已捕获的 Pixiv 回调。",
-    nextStep: "请等待状态轮询完成，不要重复提交。",
+    message: "服务正在处理 Pixiv 授权回调。",
+    nextStep: "请等待状态自动更新，不要重复提交。",
   }),
   pixiv_oauth_process_ended: Object.freeze({
     title: "Pixiv 授权进程已结束",
@@ -880,43 +893,43 @@ const ERROR_GUIDANCE = Object.freeze({
   }),
   pixiv_oauth_exchange_timeout: Object.freeze({
     title: "Pixiv 授权确认超时",
-    message: "后端未能在时限内完成 Token 交换。",
+    message: "服务未能在时限内完成 Token 交换。",
     nextStep: "请检查授权代理与外部网络，然后重新开始。",
   }),
   pixiv_oauth_exchange_failed: Object.freeze({
     title: "Pixiv 授权确认失败",
-    message: "后端没有保存可用的 Pixiv 授权缓存。",
+    message: "服务没有保存可用的 Pixiv 登录令牌。",
     nextStep: "请重新授权；不要把浏览器回调或 Token 粘贴到页面。",
   }),
   pixiv_oauth_cache_failed: Object.freeze({
     title: "Pixiv 授权保存失败",
-    message: "后端无法安全保存 Pixiv 授权缓存。",
+    message: "服务无法保存 Pixiv 登录令牌。",
     nextStep: "请检查 credentials 私有目录权限后重新授权。",
   }),
   auth_cache_clear_failed: Object.freeze({
-    title: "授权材料清理失败",
-    message: "后端未确认授权缓存已经删除。",
-    nextStep: "现有状态不会乐观标记为已清除；请检查权限后重试。",
+    title: "授权凭证清理失败",
+    message: "服务未确认授权凭证已删除。",
+    nextStep: "状态将在确认删除后更新；请检查权限后重试。",
   }),
   browser_profile_reset_active: Object.freeze({
-    title: "Profile 正在清空",
-    message: "共享授权 Profile 已有一个清理操作在执行。",
+    title: "正在清除授权浏览器数据",
+    message: "已有一个浏览器数据清理操作正在执行。",
     nextStep: "请等待并手动刷新状态。",
   }),
   invalid_browser_profile_path: Object.freeze({
-    title: "Profile 路径安全校验失败",
-    message: "后端拒绝清理不符合私有目录边界的 Profile。",
+    title: "授权浏览器数据路径校验失败",
+    message: "服务拒绝清理超出私有目录范围的浏览器数据。",
     nextStep: "请检查 credentials/managed 路径与符号链接，再重试。",
   }),
   network_error: Object.freeze({
-    title: "后端连接中断",
-    message: "VAULT 无法连接到 ImageWeave 后端。",
-    nextStep: "确认后端恢复后使用“刷新安全状态”手动刷新，无需重载整个桌面。",
+    title: "服务连接中断",
+    message: "授权管理无法连接到 ImageWeave 服务。",
+    nextStep: "服务恢复后使用“刷新授权状态”重试。",
   }),
   invalid_response: Object.freeze({
-    title: "授权响应未通过校验",
-    message: "页面拒绝采用包含未知或危险字段的授权响应。",
-    nextStep: "请刷新；若持续发生，请检查后端与桌面 WebUI 版本是否匹配。",
+    title: "授权状态数据无效",
+    message: "页面无法读取服务返回的授权状态。",
+    nextStep: "请刷新；若持续发生，请检查服务与桌面界面的版本是否匹配。",
   }),
 });
 
@@ -937,35 +950,35 @@ export function vaultErrorGuidance(error) {
   let guidance = ERROR_GUIDANCE[code];
   if (!guidance && (status === 401 || status === 403)) {
     guidance = {
-      title: "授权 API 拒绝访问",
-      message: "后端拒绝了当前 VAULT 请求。",
-      nextStep: "请确认仍通过同源 /ui/ 访问，并检查后端访问策略。",
+      title: "授权访问被拒绝",
+      message: "服务拒绝了当前授权请求。",
+      nextStep: "请从 ImageWeave 的 /ui/ 页面重新打开，并检查服务访问策略。",
     };
   } else if (!guidance && status === 409) {
     guidance = {
       title: "授权操作冲突",
-      message: "后端拒绝并发或状态冲突操作。",
-      nextStep: "请刷新安全状态，完成当前授权后再重试。",
+      message: "服务拒绝了并发或状态冲突操作。",
+      nextStep: "请刷新授权状态，完成当前授权后再重试。",
     };
   } else if (!guidance && status === 413) {
     guidance = ERROR_GUIDANCE.auth_request_too_large;
   } else if (!guidance && status === 422) {
     guidance = {
       title: "授权请求格式无效",
-      message: "后端未接受本次请求。",
-      nextStep: "请检查当前控件格式；页面不会显示原始请求或 details。",
+      message: "服务未接受本次请求。",
+      nextStep: "请检查当前输入格式后重试。",
     };
   } else if (!guidance && status >= 500) {
     guidance = {
-      title: "授权后端暂时不可用",
-      message: "后端未能完成本次授权操作。",
-      nextStep: "保留已加载状态，稍后手动刷新；必要时打开 DIAG.EXE。",
+      title: "授权服务暂时不可用",
+      message: "服务未能完成本次授权操作。",
+      nextStep: "已加载状态会继续保留，请稍后刷新；必要时打开系统诊断。",
     };
   } else if (!guidance) {
     guidance = {
-      title: "授权操作未完成",
-      message: "本次 VAULT 操作没有完成。",
-      nextStep: "请刷新安全状态后重试；页面不会渲染原始错误 details。",
+      title: "授权操作失败",
+      message: "本次授权操作失败。",
+      nextStep: "请刷新授权状态后重试。",
     };
   }
   return Object.freeze({

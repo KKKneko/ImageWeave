@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -14,6 +15,17 @@ from gdl_backend.crawl import CrawlUnit
 from gdl_backend.discovery import DiscoveryError
 
 from tests.helpers import make_settings
+
+
+class _TagCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tags: list[tuple[str, dict[str, str | None]]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.tags.append((tag, dict(attrs)))
 
 
 class ApiTests(unittest.TestCase):
@@ -110,7 +122,42 @@ class ApiTests(unittest.TestCase):
         index = self.client.get("/ui/")
         self.assertEqual(index.status_code, 200)
         self.assertIn("ImageWeave 应用快捷方式", index.text)
-        self.assertIn('data-cloud-background', index.text)
+
+        parser = _TagCollector()
+        parser.feed(index.text)
+        html_tags = [attrs for tag, attrs in parser.tags if tag == "html"]
+        self.assertEqual(len(html_tags), 1)
+        self.assertEqual(html_tags[0].get("data-motion"), "on")
+        wallpaper_tags = [
+            (tag, attrs)
+            for tag, attrs in parser.tags
+            if "data-desktop-wallpaper" in attrs
+        ]
+        self.assertEqual(len(wallpaper_tags), 1)
+        wallpaper_tag, wallpaper_attrs = wallpaper_tags[0]
+        self.assertEqual(wallpaper_tag, "div")
+        self.assertEqual(wallpaper_attrs.get("aria-hidden"), "true")
+        self.assertIn("inert", wallpaper_attrs)
+        self.assertNotIn("tabindex", wallpaper_attrs)
+        self.assertIn("desktop-wallpaper", wallpaper_attrs.get("class", "").split())
+        self.assertIn(
+            "desktop-wallpaper--graphite",
+            wallpaper_attrs.get("class", "").split(),
+        )
+        for layer_attribute in (
+            "data-desktop-wallpaper-image",
+            "data-desktop-wallpaper-mask",
+        ):
+            layer_tags = [
+                (tag, attrs)
+                for tag, attrs in parser.tags
+                if layer_attribute in attrs
+            ]
+            self.assertEqual(len(layer_tags), 1, layer_attribute)
+            self.assertEqual(layer_tags[0][0], "div", layer_attribute)
+            self.assertNotIn("tabindex", layer_tags[0][1], layer_attribute)
+
+        self.assertIn('data-desktop-icons', index.text)
         self.assertIn('data-application-window', index.text)
         self.assertIn('data-start-menu', index.text)
         self.assertIn('data-task-window', index.text)
@@ -122,11 +169,80 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(index.text.count("data-taskbar-diagnostics"), 1)
         self.assertIn('type="module" src="./js/main.js"', index.text)
         self.assertIn('href="./styles/tokens.css"', index.text)
+        self.assertIn('href="./styles/apps/personalization.css"', index.text)
         self.assertIn('href="./styles/responsive.css"', index.text)
         self.assertNotIn("聚合爬取测试台", index.text)
         self.assertNotIn('id="searchForm"', index.text)
         self.assertNotIn('href="#/', index.text)
         self.assertIn("text/html", index.headers["content-type"])
+
+        desktop_styles = self.client.get("/ui/styles/desktop.css")
+        self.assertEqual(desktop_styles.status_code, 200)
+        status_styles = self.client.get("/ui/styles/status.css")
+        self.assertEqual(status_styles.status_code, 200)
+        main_source = self.client.get("/ui/js/main.js")
+        self.assertEqual(main_source.status_code, 200)
+        self.assertIn(':root[data-motion="off"]', status_styles.text)
+        self.assertIn(
+            "@media (prefers-reduced-motion: reduce)",
+            status_styles.text,
+        )
+        for immediate_rule in (
+            "scroll-behavior: auto !important;",
+            "animation-duration: 0.001ms !important;",
+            "animation-delay: 0ms !important;",
+            "animation-iteration-count: 1 !important;",
+            "transition-duration: 0.001ms !important;",
+            "transition-delay: 0ms !important;",
+        ):
+            self.assertGreaterEqual(status_styles.text.count(immediate_rule), 2)
+        self.assertLess(
+            main_source.text.index("motionController = createMotionController({"),
+            main_source.text.index("desktopController = initializeDesktop("),
+        )
+        self.assertLess(
+            main_source.text.index("personalizationController = createPersonalizationRuntime({"),
+            main_source.text.index("desktopController = initializeDesktop("),
+        )
+        self.assertIn("motion: motionController", main_source.text)
+        self.assertIn("personalization: personalizationController", main_source.text)
+        separator = ".desktop-wallpaper {"
+        self.assertIn(separator, desktop_styles.text)
+        wallpaper_rule = desktop_styles.text.partition(separator)[2].partition("}")[0]
+        self.assertIn("background: #20242a;", wallpaper_rule.lower())
+        self.assertIn("pointer-events: none;", wallpaper_rule)
+        self.assertNotIn("animation", wallpaper_rule)
+        self.assertNotIn("transition", wallpaper_rule)
+        self.assertIn(
+            ".desktop-wallpaper__image,\n.desktop-wallpaper__mask {",
+            desktop_styles.text,
+        )
+        for color_id, color_value in {
+            "graphite": "#20242a",
+            "slate": "#384554",
+            "deep-ocean": "#20364a",
+            "forest": "#294039",
+            "plum-gray": "#403341",
+            "warm-paper": "#e7e1d6",
+        }.items():
+            self.assertIn(
+                f".desktop-wallpaper--{color_id} {{\n  background: {color_value};",
+                desktop_styles.text.lower(),
+            )
+
+        static_background_sources = "\n".join(
+            (index.text, desktop_styles.text, main_source.text)
+        ).lower()
+        for forbidden in (
+            "cloud-background",
+            "data-cloud",
+            "initializecloudbackground",
+            "webgl",
+            "<canvas",
+            "requestanimationframe",
+            "cancelanimationframe",
+        ):
+            self.assertNotIn(forbidden, static_background_sources)
 
         static_assets = [
             "/ui/styles/tokens.css",
@@ -137,6 +253,7 @@ class ApiTests(unittest.TestCase):
             "/ui/styles/apps/review.css",
             "/ui/styles/apps/policy.css",
             "/ui/styles/apps/diagnostics.css",
+            "/ui/styles/apps/personalization.css",
             "/ui/js/main.js",
             "/ui/js/core/api.js",
             "/ui/js/core/actions.js",
@@ -150,9 +267,13 @@ class ApiTests(unittest.TestCase):
             "/ui/js/core/tasks-model.js",
             "/ui/js/core/review-model.js",
             "/ui/js/core/diagnostics-model.js",
+            "/ui/js/core/motion.js",
+            "/ui/js/core/personalization-model.js",
+            "/ui/js/core/personalization.js",
+            "/ui/js/core/wallpaper-image-import.js",
+            "/ui/js/core/wallpaper-storage.js",
             "/ui/js/core/storage.js",
             "/ui/js/core/window-manager.js",
-            "/ui/js/components/cloud-background.js",
             "/ui/js/components/dialog.js",
             "/ui/js/components/error-view.js",
             "/ui/js/components/proxy-dom.js",
@@ -165,6 +286,7 @@ class ApiTests(unittest.TestCase):
             "/ui/js/components/tasks-view.js",
             "/ui/js/components/review-view.js",
             "/ui/js/components/diagnostics-view.js",
+            "/ui/js/components/personalization-view.js",
             "/ui/js/components/taskbar-summary.js",
             "/ui/js/apps/proxy.js",
             "/ui/js/apps/vault.js",
@@ -173,16 +295,22 @@ class ApiTests(unittest.TestCase):
             "/ui/js/apps/tasks.js",
             "/ui/js/apps/review.js",
             "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/personalization.js",
             "/ui/js/apps/placeholder.js",
         ]
         for path in static_assets:
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200, path)
 
-        fallback = self.client.get("/ui/assets/dithered-cloud-fallback.png")
-        self.assertEqual(fallback.status_code, 200)
-        self.assertEqual(fallback.content[:8], b"\x89PNG\r\n\x1a\n")
-        self.assertIn("image/png", fallback.headers["content-type"])
+        for removed_asset in (
+            "/ui/js/components/cloud-background.js",
+            "/ui/assets/dithered-cloud-fallback.png",
+        ):
+            self.assertEqual(
+                self.client.get(removed_asset).status_code,
+                404,
+                removed_asset,
+            )
 
         registry = self.client.get("/ui/js/core/app-registry.js")
         self.assertEqual(registry.status_code, 200)
@@ -194,6 +322,7 @@ class ApiTests(unittest.TestCase):
             "review": "/review",
             "policy": "/policy",
             "diagnostics": "/diagnostics",
+            "personalization": "/personalization",
             "gallery": "/gallery",
             "schedule": "/schedule",
             "export": "/export",
@@ -201,7 +330,7 @@ class ApiTests(unittest.TestCase):
         for app_id, route in app_contract.items():
             self.assertEqual(registry.text.count(f'id: "{app_id}"'), 1)
             self.assertEqual(registry.text.count(f'route: "{route}"'), 1)
-        self.assertEqual(registry.text.count('availability: "ready"'), 7)
+        self.assertEqual(registry.text.count('availability: "ready"'), 8)
         self.assertEqual(registry.text.count('availability: "placeholder"'), 3)
         self.assertIn('defaultWindowState: "maximized"', registry.text)
 
@@ -211,7 +340,6 @@ class ApiTests(unittest.TestCase):
             "/ui/js/core/router.js",
             "/ui/js/core/desktop.js",
             "/ui/js/core/window-manager.js",
-            "/ui/js/components/cloud-background.js",
             "/ui/js/components/empty-state.js",
             "/ui/js/apps/crawl.js",
             "/ui/js/apps/tasks.js",
@@ -220,6 +348,7 @@ class ApiTests(unittest.TestCase):
             "/ui/js/apps/review.js",
             "/ui/js/apps/policy.js",
             "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/personalization.js",
             "/ui/js/apps/placeholder.js",
         ]
         combined_javascript = "\n".join(
@@ -239,6 +368,11 @@ class ApiTests(unittest.TestCase):
             "/ui/js/core/app-registry.js",
             "/ui/js/core/desktop.js",
             "/ui/js/core/dom.js",
+            "/ui/js/core/motion.js",
+            "/ui/js/core/personalization-model.js",
+            "/ui/js/core/personalization.js",
+            "/ui/js/core/wallpaper-image-import.js",
+            "/ui/js/core/wallpaper-storage.js",
             "/ui/js/core/polling.js",
             "/ui/js/core/proxy-model.js",
             "/ui/js/core/vault-model.js",
@@ -253,7 +387,6 @@ class ApiTests(unittest.TestCase):
             "/ui/js/core/window-manager.js",
         ]
         component_paths = [
-            "/ui/js/components/cloud-background.js",
             "/ui/js/components/dialog.js",
             "/ui/js/components/empty-state.js",
             "/ui/js/components/error-view.js",
@@ -268,6 +401,7 @@ class ApiTests(unittest.TestCase):
             "/ui/js/components/tasks-view.js",
             "/ui/js/components/review-view.js",
             "/ui/js/components/diagnostics-view.js",
+            "/ui/js/components/personalization-view.js",
             "/ui/js/components/status.js",
             "/ui/js/components/taskbar-summary.js",
         ]
@@ -279,6 +413,7 @@ class ApiTests(unittest.TestCase):
             "/ui/js/apps/review.js",
             "/ui/js/apps/policy.js",
             "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/personalization.js",
             "/ui/js/apps/placeholder.js",
         ]
         module_sources = {
@@ -304,6 +439,7 @@ class ApiTests(unittest.TestCase):
         tasks_app_path = "/ui/js/apps/tasks.js"
         review_app_path = "/ui/js/apps/review.js"
         diagnostics_app_path = "/ui/js/apps/diagnostics.js"
+        personalization_app_path = "/ui/js/apps/personalization.js"
         proxy_endpoints = {
             "/api/v1/proxy/status",
             "/api/v1/proxy/start",
@@ -374,6 +510,11 @@ class ApiTests(unittest.TestCase):
                     source.count('"/api/v1/scheduler/status?view=diagnostics"'), 1
                 )
                 self.assertIn('DIAGNOSTICS_POLL_KEY = "diagnostics.snapshot"', source)
+            elif path == personalization_app_path:
+                self.assertNotIn("/api/", source)
+                self.assertNotIn("polling.", source)
+                self.assertIn("beforeLeave()", source)
+                self.assertIn("beforeWindowHide", source)
             else:
                 self.assertNotIn("/api/v1", source, path)
 
@@ -384,6 +525,27 @@ class ApiTests(unittest.TestCase):
                 self.assertNotIn("/api/v1/auth", source, path)
             if path != policy_app_path:
                 self.assertNotIn("/api/v1/sites", source, path)
+        personalization_view_source = module_sources[
+            "/ui/js/components/personalization-view.js"
+        ]
+        personalization_runtime_source = module_sources[
+            "/ui/js/core/personalization.js"
+        ]
+        wallpaper_import_source = module_sources[
+            "/ui/js/core/wallpaper-image-import.js"
+        ]
+        self.assertNotIn("innerHTML", personalization_view_source)
+        self.assertIn(
+            "已开启界面动效，但系统“减少动态效果”设置会限制部分效果。",
+            personalization_view_source,
+        )
+        self.assertIn('"background-image"', personalization_runtime_source)
+        self.assertIn("ownedObjectUrls.has(objectUrl)", personalization_runtime_source)
+        self.assertIn('objectUrl.startsWith("blob:")', personalization_runtime_source)
+        self.assertNotIn("cssText", personalization_runtime_source)
+        self.assertNotIn("dataset", personalization_runtime_source)
+        self.assertNotIn('image.src = ""', wallpaper_import_source)
+        self.assertIn("WALLPAPER_COLOR_CLASSES", personalization_runtime_source)
         self.assertIn(
             "context.actions.navigateToApp",
             module_sources["/ui/js/components/empty-state.js"],
@@ -714,36 +876,24 @@ class ApiTests(unittest.TestCase):
             "retry_limit": 2,
             "backoff_base_seconds": 2,
             "proxy_mode": "prefer",
-            "probe_url": None,
-            "probe_before_use": False,
-            "node_tags": [],
-            "http_timeout": 30,
-            "gallery_retries": 2,
-            "task_timeout_seconds": 0,
-            "download_stall_timeout_seconds": 180,
-            "eh_download": None,
-            "extra_args": [],
         }
         payload.update(overrides)
         return payload
 
     def test_site_policy_crud_and_proxy_status(self):
-        policy = {
-            "max_concurrency": 1,
-            "retry_limit": 1,
-            "backoff_base_seconds": 0,
-            "proxy_mode": "required",
-            "probe_url": "https://www.pixiv.net/",
-            "probe_before_use": True,
-            "node_tags": ["jp"],
-            "http_timeout": 15,
-            "gallery_retries": 1,
-            "task_timeout_seconds": 60,
-            "extra_args": [],
-        }
-        response = self.client.put("/api/v1/sites/policies/pixiv", headers=self.headers, json=policy)
+        policy = self._policy_view_payload(
+            max_concurrency=1,
+            retry_limit=1,
+            backoff_base_seconds=0,
+            proxy_mode="required",
+        )
+        response = self.client.put(
+            "/api/v1/sites/policies/pixiv",
+            headers=self.headers,
+            json=policy,
+        )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["policy"]["node_tags"], ["jp"])
+        self.assertEqual(response.json()["policy"], policy)
         status = self.client.get("/api/v1/proxy/status", headers=self.headers)
         self.assertEqual(status.status_code, 200)
         self.assertFalse(status.json()["running"])
@@ -752,10 +902,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status.json()["engine"], "native")
         self.assertFalse(status.json()["executable_required"])
 
-    def test_policy_view_contract_legacy_compatibility_and_real_roundtrip(self):
+    def test_policy_view_four_field_roundtrip_builds_fixed_runtime_policy(self):
         legacy = self.client.get("/api/v1/sites/policies")
         self.assertEqual(legacy.status_code, 200, legacy.text)
         self.assertEqual(set(legacy.json()), {"default", "items"})
+        self.assertEqual(legacy.json()["default"], self._policy_view_payload())
         self.assertNotIn("response_profile", legacy.json())
 
         listing = self.client.get("/api/v1/sites/policies?view=policy")
@@ -764,24 +915,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(snapshot["response_profile"], "policy")
         self.assertFalse(snapshot["secrets_exposed"])
         self.assertEqual(snapshot["effect_scope"], "new_requests_and_tasks")
-        self.assertEqual(snapshot["concurrency_protection"], "none")
-        self.assertEqual(snapshot["default_source"], "startup_snapshot")
-        self.assertEqual(snapshot["persistence"], "sqlite_atomic")
-        self.assertNotIn("revision", snapshot)
         self.assertEqual(
             [item["site"] for item in snapshot["items"]],
             ["danbooru", "twitter", "pixiv", "exhentai", "pawchive"],
         )
-        by_site = {item["site"]: item for item in snapshot["items"]}
-        self.assertEqual(by_site["danbooru"]["authorization"], "anonymous")
-        self.assertEqual(by_site["twitter"]["authorization"], "managed_browser")
-        self.assertEqual(by_site["pixiv"]["authorization"], "oauth")
-        self.assertEqual(
-            by_site["exhentai"]["authorization"],
-            "managed_browser_for_private_content",
+        self.assertTrue(
+            all(set(item["policy"]) == set(self._policy_view_payload()) for item in snapshot["items"])
         )
-        self.assertTrue(all(item["selection_mode"] == "per_request" for item in snapshot["items"]))
-        self.assertTrue(all(item["availability"] == "not_probed" for item in snapshot["items"]))
 
         old_snapshot = self.container.policy_for("pixiv")
         payload = self._policy_view_payload(
@@ -789,15 +929,6 @@ class ApiTests(unittest.TestCase):
             retry_limit=3,
             backoff_base_seconds=0.5,
             proxy_mode="required",
-            probe_url="https://example.com/health",
-            probe_before_use=True,
-            node_tags=["JP", "jp", "高速"],
-            http_timeout=12.5,
-            gallery_retries=4,
-            task_timeout_seconds=90,
-            download_stall_timeout_seconds=0,
-            eh_download={"image_mode": "original", "gp_policy": "stop"},
-            extra_args=["--no-mtime"],
         )
         saved = self.client.put(
             "/api/v1/sites/policies/pixiv?view=policy",
@@ -807,16 +938,32 @@ class ApiTests(unittest.TestCase):
         item = saved.json()
         self.assertTrue(item["has_override"])
         self.assertFalse(item["inherited"])
-        self.assertEqual(item["policy"]["node_tags"], ["jp", "高速"])
-        self.assertEqual(item["policy"]["eh_download"], payload["eh_download"])
-        self.assertEqual(self.container.db.get_site_policy("pixiv")["policy"], item["policy"])
+        self.assertEqual(item["policy"], payload)
+        self.assertEqual(
+            self.container.db.get_site_policy("pixiv")["policy"],
+            payload,
+        )
         current = self.container.policy_for("pixiv")
-        self.assertEqual(current.max_concurrency, 7)
+        self.assertEqual(
+            current.model_dump(),
+            {
+                **payload,
+                "probe_url": None,
+                "probe_before_use": True,
+                "node_tags": [],
+                "http_timeout": 60.0,
+                "gallery_retries": 2,
+                "task_timeout_seconds": 7200.0,
+                "download_stall_timeout_seconds": 300.0,
+                "eh_download": None,
+                "extra_args": [],
+            },
+        )
         self.assertEqual(old_snapshot.max_concurrency, 20)
 
         authoritative = self.client.get("/api/v1/sites/policies?view=policy").json()
         pixiv = next(entry for entry in authoritative["items"] if entry["site"] == "pixiv")
-        self.assertEqual(pixiv["policy"], item["policy"])
+        self.assertEqual(pixiv["policy"], payload)
         reset = self.client.delete("/api/v1/sites/policies/pixiv?view=policy")
         self.assertEqual(reset.status_code, 200, reset.text)
         self.assertEqual(
@@ -827,30 +974,65 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(inherited.status_code, 200, inherited.text)
         self.assertTrue(inherited.json()["inherited"])
         self.assertFalse(inherited.json()["has_override"])
-        self.assertEqual(
-            inherited.json()["policy"],
-            self._policy_view_payload(),
-        )
+        self.assertEqual(inherited.json()["policy"], self._policy_view_payload())
 
-    def test_policy_view_projects_loaded_config_default_without_hot_reload(self):
+    def test_request_level_eh_args_and_proxy_still_override_fixed_site_runtime(self):
+        saved = self.client.put(
+            "/api/v1/sites/policies/exhentai?view=policy",
+            json=self._policy_view_payload(
+                retry_limit=4,
+                proxy_mode="required",
+            ),
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+
+        created = self.client.post(
+            "/api/v1/tasks",
+            json={
+                "url": "https://e-hentai.org/g/123/cccccccccc/",
+                "proxy_mode": "direct",
+                "eh_download": {
+                    "image_mode": "original",
+                    "gp_policy": "stop",
+                },
+                "extra_args": ["--no-mtime"],
+            },
+        )
+        self.assertEqual(created.status_code, 202, created.text)
+        task = created.json()
+        self.assertEqual(task["proxy_mode"], "direct")
+        self.assertEqual(task["max_attempts"], 5)
+        self.assertEqual(task["extra_args"], ["--no-mtime"])
+        self.assertEqual(task["policy"]["extra_args"], [])
+        self.assertEqual(
+            task["policy"]["eh_download"],
+            {"image_mode": "original", "gp_policy": "stop"},
+        )
+        self.assertEqual(task["policy"]["http_timeout"], 60.0)
+        self.assertEqual(task["policy"]["task_timeout_seconds"], 7200.0)
+        self.assertEqual(task["policy"]["download_stall_timeout_seconds"], 300.0)
+
+    def test_policy_view_projects_loaded_four_field_default_without_hot_reload(self):
         self.settings.default_site_policy.update(
             {
                 "max_concurrency": 11,
                 "proxy_mode": "direct",
-                "node_tags": ["loaded-config"],
             }
         )
         first = self.client.get("/api/v1/sites/policies?view=policy")
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json()["default"]["policy"]["max_concurrency"], 11)
         self.assertEqual(first.json()["default"]["policy"]["proxy_mode"], "direct")
-        self.assertEqual(first.json()["default"]["policy"]["node_tags"], ["loaded-config"])
+        self.assertEqual(
+            set(first.json()["default"]["policy"]),
+            set(self._policy_view_payload()),
+        )
         self.assertTrue(all(item["inherited"] for item in first.json()["items"]))
         self.assertTrue(
             all(item["policy"] == first.json()["default"]["policy"] for item in first.json()["items"])
         )
 
-        # 外部文件变化不会改变进程启动时已经加载到 settings 的默认策略。
+        # 外部文件变化不会改变当前进程已经加载的统一默认。
         (Path(self.temp.name) / "missing-config.json").write_text(
             '{"default_site_policy":{"max_concurrency":99}}',
             encoding="utf-8",
@@ -876,18 +1058,37 @@ class ApiTests(unittest.TestCase):
                 ServiceContainer(settings)
             self.assertEqual(target.read_bytes(), sentinel)
 
-    def test_policy_view_projection_hides_unknown_or_unsafe_legacy_overrides(self):
+    def test_policy_views_never_expose_malformed_or_unknown_database_rows(self):
         secret = "POLICY_API_SECRET_83b1"
-        unsafe = self._policy_view_payload(
-            probe_url=f"https://user:{secret}@private.invalid/path?token={secret}",
-            node_tags=[f"token={secret}"],
-            extra_args=[f"--filter=token={secret}", f"/home/private/{secret}"],
-        )
-        self.container.db.put_site_policy("twitter", unsafe)
-        self.container.db.put_site_policy(
-            "unknown-private-source",
-            {"path": f"/home/private/{secret}", "token": secret},
-        )
+        with self.container.db._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO site_policies(site, policy_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "twitter",
+                    '{"max_concurrency":3,"retry_limit":1,'
+                    '"backoff_base_seconds":1,"proxy_mode":"prefer",'
+                    f'"extra_args":["token={secret}"]}}',
+                    1.0,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO site_policies(site, policy_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "unknown-private-source",
+                    f'{{"path":"/home/private/{secret}"}}',
+                    1.0,
+                ),
+            )
+        runtime = self.container.policy_for("twitter")
+        self.assertEqual(runtime.max_concurrency, 3)
+        self.assertEqual(runtime.http_timeout, 60.0)
+        self.assertEqual(runtime.extra_args, [])
 
         projected = self.client.get("/api/v1/sites/policies?view=policy")
         self.assertEqual(projected.status_code, 200, projected.text)
@@ -903,18 +1104,18 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(twitter["policy"])
         self.assertTrue(twitter["has_override"])
 
-        # 默认 legacy 响应继续保持原有形状与内容，安全最小化只对显式 profile 生效。
         legacy = self.client.get("/api/v1/sites/policies")
-        self.assertEqual(legacy.status_code, 200, legacy.text)
-        self.assertIn(secret, legacy.text)
-        self.assertIn("unknown-private-source", legacy.text)
+        self.assertEqual(legacy.status_code, 503, legacy.text)
+        self.assertNotIn(secret, legacy.text)
+        self.assertNotIn("/home/private", legacy.text)
 
-    def test_policy_view_validation_size_and_supported_source_boundaries(self):
+    def test_policy_writes_accept_exactly_four_fields_with_safe_boundaries(self):
         payload = self._policy_view_payload()
         for method, path in (
             ("get", "/api/v1/sites/policies/unknown?view=policy"),
             ("put", "/api/v1/sites/policies/unknown?view=policy"),
             ("delete", "/api/v1/sites/policies/unknown?view=policy"),
+            ("put", "/api/v1/sites/policies/unknown"),
         ):
             response = getattr(self.client, method)(
                 path,
@@ -926,33 +1127,44 @@ class ApiTests(unittest.TestCase):
         secret = "POLICY_INVALID_SECRET_51ca"
         invalid_payloads = [
             self._policy_view_payload(proxy_mode="automatic"),
+            self._policy_view_payload(max_concurrency=0),
             self._policy_view_payload(max_concurrency=129),
-            self._policy_view_payload(probe_url=f"https://user:{secret}@example.com/"),
-            self._policy_view_payload(probe_url="https://example.com/?health=1"),
-            self._policy_view_payload(probe_url="https://127.0.0.1/"),
-            self._policy_view_payload(node_tags=[f"ok\u0000{secret}"]),
-            self._policy_view_payload(extra_args=[f"/home/private/{secret}"]),
-            self._policy_view_payload(extra_args=[f"ftp://user:{secret}@example.com/file"]),
-            self._policy_view_payload(extra_args=[f"token={secret}"]),
-            self._policy_view_payload(extra_args=["--cookies", secret]),
+            self._policy_view_payload(max_concurrency=True),
+            self._policy_view_payload(max_concurrency="3"),
+            self._policy_view_payload(retry_limit=-1),
+            self._policy_view_payload(retry_limit=21),
+            self._policy_view_payload(retry_limit=False),
+            self._policy_view_payload(backoff_base_seconds=-0.1),
+            self._policy_view_payload(backoff_base_seconds=3600.1),
+            self._policy_view_payload(backoff_base_seconds="2"),
+            {**self._policy_view_payload(), "probe_url": f"https://{secret}.invalid/"},
+            {**self._policy_view_payload(), "probe_before_use": False},
+            {**self._policy_view_payload(), "node_tags": [secret]},
+            {**self._policy_view_payload(), "http_timeout": 1},
+            {**self._policy_view_payload(), "gallery_retries": 50},
+            {**self._policy_view_payload(), "task_timeout_seconds": 0},
+            {**self._policy_view_payload(), "download_stall_timeout_seconds": 0},
+            {
+                **self._policy_view_payload(),
+                "eh_download": {"image_mode": "resample", "gp_policy": "resized"},
+            },
+            {**self._policy_view_payload(), "extra_args": [f"token={secret}"]},
             {**self._policy_view_payload(), "unknown_secret": secret},
         ]
-        for invalid in invalid_payloads:
-            response = self.client.put(
-                "/api/v1/sites/policies/pixiv?view=policy",
-                json=invalid,
-            )
-            self.assertEqual(response.status_code, 422, response.text)
-            self.assertEqual(response.json()["error"]["code"], "invalid_policy")
-            self.assertNotIn(secret, response.text)
-            self.assertNotIn("/home/private", response.text)
-            self.assertNotIn('"input"', response.text)
-            details = response.json()["error"]["details"]
-            self.assertTrue(isinstance(details, (dict, list)))
-            self.assertIsNone(self.container.db.get_site_policy("pixiv"))
+        for suffix in ("?view=policy", ""):
+            for invalid in invalid_payloads:
+                response = self.client.put(
+                    f"/api/v1/sites/policies/pixiv{suffix}",
+                    json=invalid,
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()["error"]["code"], "invalid_policy")
+                self.assertNotIn(secret, response.text)
+                self.assertNotIn('"input"', response.text)
+                self.assertIsNone(self.container.db.get_site_policy("pixiv"))
 
         missing_field = self._policy_view_payload()
-        missing_field.pop("http_timeout")
+        missing_field.pop("retry_limit")
         missing = self.client.put(
             "/api/v1/sites/policies/pixiv?view=policy",
             json=missing_field,
@@ -960,20 +1172,31 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(missing.status_code, 422, missing.text)
         self.assertEqual(
             missing.json()["error"]["details"],
-            {"field": "http_timeout", "reason": "missing_field"},
+            {"field": "retry_limit", "reason": "missing_field"},
         )
 
-        too_large = self.client.put(
-            "/api/v1/sites/policies/pixiv?view=policy",
-            content=b"{}",
-            headers={
-                "Content-Type": "application/json",
-                "Content-Length": str(32 * 1024),
-            },
+        openapi = self.client.get("/openapi.json").json()
+        editable_schema = openapi["components"]["schemas"]["EditableSitePolicy"]
+        self.assertEqual(
+            set(editable_schema["properties"]),
+            {"max_concurrency", "retry_limit", "backoff_base_seconds", "proxy_mode"},
         )
-        self.assertEqual(too_large.status_code, 413, too_large.text)
-        self.assertEqual(too_large.json()["error"]["code"], "policy_request_too_large")
-        self.assertIsNone(self.container.db.get_site_policy("pixiv"))
+        self.assertFalse(editable_schema.get("additionalProperties", True))
+
+        for suffix in ("?view=policy", ""):
+            too_large = self.client.put(
+                f"/api/v1/sites/policies/pixiv{suffix}",
+                content=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(32 * 1024),
+                },
+            )
+            self.assertEqual(too_large.status_code, 413, too_large.text)
+            self.assertEqual(
+                too_large.json()["error"]["code"],
+                "policy_request_too_large",
+            )
 
         understated_large = self.client.put(
             "/api/v1/sites/policies/pixiv?view=policy",
@@ -989,19 +1212,6 @@ class ApiTests(unittest.TestCase):
             "policy_request_too_large",
         )
         self.assertIsNone(self.container.db.get_site_policy("pixiv"))
-
-        normalized_empty = self.client.put(
-            "/api/v1/sites/policies/pixiv?view=policy",
-            json=self._policy_view_payload(
-                probe_url="   ",
-                node_tags=["  ", "JP", "jp"],
-                extra_args=[],
-            ),
-        )
-        self.assertEqual(normalized_empty.status_code, 200, normalized_empty.text)
-        self.assertIsNone(normalized_empty.json()["policy"]["probe_url"])
-        self.assertEqual(normalized_empty.json()["policy"]["node_tags"], ["jp"])
-        self.assertEqual(normalized_empty.json()["policy"]["extra_args"], [])
 
     def test_policy_view_sqlite_failure_is_atomic_and_error_is_safe(self):
         first = self._policy_view_payload(max_concurrency=3)

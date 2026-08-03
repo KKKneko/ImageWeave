@@ -68,14 +68,14 @@ function buildDom(context) {
     }));
   }
   const bulkActions = createElement("div", { className: "review-bulk-actions" }, [
-    button("page-all", "本页全留", { small: true }),
-    button("page-none", "本页全不留", { dangerous: true, small: true }),
-    button("page-recommended", "每组仅留推荐", { small: true }),
+    button("page-all", "本页全部保留", { small: true }),
+    button("page-none", "本页全部移除", { dangerous: true, small: true }),
+    button("page-recommended", "每组仅保留推荐项", { small: true }),
   ]);
   const groupHost = createElement("div", { className: "review-groups", dataset: { reviewGroups: "" } });
   const dirtyLive = createElement("p", {
     className: "review-dirty-live",
-    text: "没有未保存选择。",
+    text: "本页已保存。",
     attributes: { "aria-live": "polite" },
     dataset: { reviewDirty: "false" },
   });
@@ -87,8 +87,8 @@ function buildDom(context) {
       button("next", "下一页", { small: true }),
     ]),
     createElement("div", { className: "review-save-actions" }, [
-      button("save", "保存本页选择", { primary: true }),
-      button("apply", "应用审核结果", { dangerous: true }),
+      button("save", "保存本页", { primary: true }),
+      button("apply", "应用并整理文件", { dangerous: true }),
     ]),
   ]);
   const workspace = createElement("section", {
@@ -99,7 +99,7 @@ function buildDom(context) {
     createElement("div", { className: "review-panel-heading" }, [
       createElement("div", {}, [
         createElement("h2", { text: "去重与质量审核", attributes: { id: "review-workspace-title" } }),
-        createElement("p", { text: "服务端分页固定为 8 组；图片由受限审核端点懒加载。" }),
+        createElement("p", { text: "每页显示 8 组图片，翻页时按需加载预览。" }),
       ]),
       statusBadge,
     ]),
@@ -118,10 +118,9 @@ function buildDom(context) {
     createElement("header", { className: "app-header review-app-header" }, [
       createElement("p", { className: "app-executable", text: app.windowTitle }),
       createElement("h1", { text: app.label, attributes: { id: headingId } }),
-      createStatusBadge("ready", "默认最大化 · 服务端分页"),
       createElement("p", {
         className: "app-summary",
-        text: "显式启动分析、分页审核、危险应用确认与写后权威刷新均保持后端真实语义。",
+        text: "启动分析后，可逐页确认保留项；应用结果前会再次确认。",
       }),
     ]),
     errorHost,
@@ -129,12 +128,12 @@ function buildDom(context) {
     createElement("section", { className: "review-panel review-picker", attributes: { "aria-labelledby": "review-picker-title" } }, [
       createElement("div", { className: "review-panel-heading" }, [
         createElement("div", {}, [
-          createElement("h2", { text: "终态批次", attributes: { id: "review-picker-title" } }),
-          createElement("p", { text: "进行中的批次不能启动或应用审核。" }),
+          createElement("h2", { text: "已结束批次", attributes: { id: "review-picker-title" } }),
+          createElement("p", { text: "仅已结束的采集批次可以开始去重分析。" }),
         ]),
-        createStatusBadge("running", "分析状态按需轮询"),
+        createStatusBadge("running", "分析状态自动刷新"),
       ]),
-      createElement("div", { className: "review-picker-row" }, [batchSelect, loadButton, refreshButton, button("open-tasks", "打开 TASKMGR.EXE")]),
+      createElement("div", { className: "review-picker-row" }, [batchSelect, loadButton, refreshButton, button("open-tasks", "打开批次管理")]),
     ]),
     emptyHost,
     workspace,
@@ -165,8 +164,8 @@ function syncSelections(elements, review) {
   }
   elements.dirtyLive.dataset.reviewDirty = String(review.dirty);
   elements.dirtyLive.textContent = review.dirty
-    ? "△ 本页选择尚未保存；翻页、筛选或离开应用前会先保存，失败则阻止切换。"
-    : "✓ 本页选择与最后一次服务器确认一致。";
+    ? "本页有未保存的更改；翻页、筛选或离开前会先保存。"
+    : "本页已保存。";
 }
 
 function imageFacts(image) {
@@ -183,7 +182,7 @@ function renderGroups(elements, review) {
   for (const image of elements.groupHost.querySelectorAll("img")) image.removeAttribute("src");
   if (!review.groups.length) {
     elements.groupHost.replaceChildren(createEmptyState({
-      label: "当前筛选为空", title: "没有可显示的审核组", message: "可切换筛选或返回其他批次。",
+      label: "暂无匹配结果", title: "没有可显示的审核组", message: "可切换筛选或选择其他批次。",
     }));
     return;
   }
@@ -200,9 +199,9 @@ function renderGroups(elements, review) {
     ]);
     if (editable) {
       header.append(createElement("div", { className: "review-group-actions" }, [
-        button("group-all", "全留", { small: true }),
-        button("group-none", "全不留", { dangerous: true, small: true }),
-        button("group-recommended", "仅推荐", { small: true }),
+        button("group-all", "全部保留", { small: true }),
+        button("group-none", "全部移除", { dangerous: true, small: true }),
+        button("group-recommended", "保留推荐项", { small: true }),
       ]));
     }
     const grid = createElement("div", { className: "review-image-grid" });
@@ -225,11 +224,11 @@ function renderGroups(elements, review) {
         fallback.hidden = false;
       }, { once: true });
       const media = createElement("div", { className: "review-image-media" }, [preview, fallback]);
-      if (image.recommended) media.append(createElement("span", { className: "review-recommended", text: "质量推荐" }));
+      if (image.recommended) media.append(createElement("span", { className: "review-recommended", text: "建议保留" }));
       const details = [createElement("span", { text: imageFacts(image) })];
       if (image.sharpness !== null || image.noiseSigma !== null) {
         details.push(createElement("span", {
-          text: `细节 ${Number(image.sharpness || 0).toFixed(1)} · 噪声 ${Number(image.noiseSigma || 0).toFixed(2)}`,
+          text: `清晰度 ${Number(image.sharpness || 0).toFixed(1)} · 噪声 ${Number(image.noiseSigma || 0).toFixed(2)}`,
         }));
       }
       if (image.metrics) {
@@ -316,7 +315,7 @@ export function createReviewView(context) {
     }
     if (status === "failed") actionsList.push(button("retry", "重试分析", { primary: true }));
     if (review.dirty && status !== "ready") {
-      actionsList.push(button("discard-reload", "放弃陈旧选择并重载", { dangerous: true }));
+      actionsList.push(button("discard-reload", "放弃更改并重新加载", { dangerous: true }));
     }
     elements.actionHost.replaceChildren(...actionsList);
   };
@@ -324,8 +323,8 @@ export function createReviewView(context) {
   const renderStats = (summary) => {
     elements.stats.replaceChildren(
       metric("全部图片", summary.totalImageCount),
-      metric("严格自动组", summary.automaticGroupCount),
-      metric("严格自动淘汰", summary.automaticRejectedImageCount),
+      metric("自动去重组", summary.automaticGroupCount),
+      metric("自动移除", summary.automaticRejectedImageCount),
       metric("重复组", summary.duplicateGroupCount),
       metric("当前保留", summary.selectedImageCount),
       metric("已确认组", `${summary.decidedGroupCount}/${summary.totalGroupCount}`),
@@ -359,7 +358,7 @@ export function createReviewView(context) {
     save.hidden = review.summary.status !== "ready";
     save.disabled = Boolean(busy || !review.groups.length || !review.dirty);
     apply.hidden = !["ready", "apply_failed"].includes(review.summary.status);
-    apply.textContent = review.summary.status === "apply_failed" ? "重试应用结果" : "应用审核结果";
+    apply.textContent = review.summary.status === "apply_failed" ? "重试整理文件" : "应用并整理文件";
     apply.disabled = Boolean(busy || (review.summary.status === "ready" &&
       review.summary.decidedGroupCount < review.summary.totalGroupCount && !review.dirty));
   };
@@ -370,7 +369,7 @@ export function createReviewView(context) {
     elements.emptyHost.replaceChildren(...(!hasReview ? [createEmptyState({
       label: "尚未选择审核批次",
       title: "选择已结束批次后打开审核",
-      message: "审核不会由读取操作隐式启动。",
+      message: "打开批次不会自动开始分析。",
     })] : []));
     if (!hasReview) return;
     updateStatusBadge(elements.statusBadge, review.summary.statusKind, review.summary.statusLabel);
@@ -413,7 +412,7 @@ export function createReviewView(context) {
     },
     applyConfirmationText() {
       const counts = reviewApplyCounts(store.getState().review.summary);
-      return `严格自动淘汰 ${counts.automatic} 张；最终保留 ${counts.selected} 张，预计移出 ${counts.rejected} 张。`;
+      return `自动移除 ${counts.automatic} 张；最终保留 ${counts.selected} 张，预计移出 ${counts.rejected} 张。`;
     },
     destroy() {
       unsubscribeRecent();

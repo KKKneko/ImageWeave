@@ -83,56 +83,67 @@ block 512 且不主动改变 Torch 线程；CPU 服务器应明确使用 `device
 基线。桌面化入口 `/ui/#/proxy` 的 `PROXY.CPL` 已提供这些操作及运行池控制；保存与应用严格
 分离，修改后需显式执行“应用并重载”，活动租约存在时仍返回冲突。
 
-`/ui/` 的七个主应用已完成真实 API 接入：
+`/ui/` 的八个主应用已可用，其中七个业务应用完成真实 API 接入，桌面个性化应用严格保持本地：
 
 - `CRAWL.EXE`：autocomplete、聚合搜索、弱证据/EH 标签过滤、来源与地址排序，以及严格批次提交；
 - `TASKMGR.EXE`：最近/活动批次、图片任务、1.5 秒活动态轮询、批次取消、失败补齐和重新规划；
 - `PROXY.CPL`：运行池控制、脱敏代理源编辑，以及保存/显式重载分离；
 - `VAULT.CPL`：五个目标的安全状态、X/Pixiv/EH 共享浏览器授权、材料/Profile 清理和授权专用代理；
 - `REVIEW.EXE`：显式分析、服务端分页、逐页决定、离页前保存和危险应用确认；
-- `POLICY.CPL`：Danbooru、X、Pixiv、EH 与 Pawchive 的站点运行策略；
-- `DIAG.EXE`：20 秒只读轮询健康、就绪、最小配置能力和调度摘要，离线时保留安全旧快照。
+- `POLICY.CPL`：为 Danbooru、X、Pixiv、EH 与 Pawchive 调整四项“各站运行设置”；
+- `DIAG.EXE`：20 秒只读轮询健康、就绪、最小配置能力和调度摘要，离线时保留安全旧快照；
+- `DESKTOP.CPL`：安全自定义强调色与窗口底色，并管理六种静态纯色、本地静态图片、可读性、动效二态和 92%–100% 窗口不透明度；不发起网络请求或调用业务 API。
+
+界面主题默认值为墨灰纸白 `#46515D / #F4F1EA`。两个字段只接受规范化严格六位 HEX；任意
+对比度（包括相同颜色和约 `1.00:1` 的组合）都可预览、应用并恢复，界面只同步显示实际对比度。
+窗口底色自动派生 `light/dark` `color-scheme`；forced-colors 使用系统色。主题与其余个性化字段
+共用同一完整草稿、Apply/Cancel 和既有 UI preference key。
 
 `GALLERY.EXE`、`SCHEDULE.EXE` 与 `EXPORT.EXE` 仍是明确的“功能开发中”边界入口，不发送业务
 API。`VAULT.CPL` 不提供后端不存在的手工 Cookie/Token、浏览器导入、文件路径导入或远端验证
 按钮；来源勾选/排序、每请求路由和 EH 标签 include/exclude 过滤只属于 `CRAWL.EXE`。
 
-### POLICY.CPL 契约与边界
+### 各站运行设置（POLICY.CPL）
 
-桌面 WebUI 只使用同一路由的 `?view=policy` 最小 profile；不传 query 时 legacy 响应与写入语义保持
-兼容。实际操作如下（PUT/DELETE 尝试无论成功或失败都会再 GET 权威快照；失败时 DOM 草稿恢复，
-若基线已被其他客户端改变则进入显式冲突态）：
+页面面向 Danbooru、X / Twitter、Pixiv、EH 与 Pawchive，每个网站只提供四项设置：
 
-| 操作 | method 与 endpoint | 请求/响应 | 语义 |
-| --- | --- | --- | --- |
-| 读取 | `GET /api/v1/sites/policies?view=policy` | 五个受控来源、启动默认和站点覆盖的安全投影 | 激活、保存/reset 后及手动刷新读取；不轮询 |
-| 保存 | `PUT /api/v1/sites/policies/{site}?view=policy` | 完整 `SitePolicy` 白名单；返回单站安全投影 | SQLite 单行事务 upsert；随后 UI 再 GET 权威快照 |
-| 重置 | `DELETE /api/v1/sites/policies/{site}?view=policy` | 不带请求体；返回受控删除确认 | 删除该站点 override，重新继承进程启动默认 |
+| 页面名称 | API 字段 | 范围或选项 |
+| --- | --- | --- |
+| 并发任务 | `max_concurrency` | 1–128 |
+| 重试次数 | `retry_limit` | 0–20 |
+| 重试间隔 | `backoff_base_seconds` | 0–3600 |
+| 代理方案 | `proxy_mode` | `direct`、`prefer`、`required` |
 
-`SitePolicy` 可编辑字段是 `max_concurrency`（1–128）、`retry_limit`（0–20）、
-`backoff_base_seconds`（0–3600）、`proxy_mode`（`direct|prefer|required`）、安全 HTTPS
-`probe_url`、`probe_before_use`、最多 32 个 `node_tags`、`http_timeout`（1–3600）、
-`gallery_retries`（0–50）、`task_timeout_seconds` 与 EH 专用
-`download_stall_timeout_seconds`（0–604800），以及最多 128 个受后端托管参数禁用表保护的
-`extra_args`。UI 每行输入一个标签/argv：纯空行过滤；标签 trim、转小写、稳定去重；argv 保留顺序
-与重复。`probe_url=null` 表示没有站点专用目标，空标签/argv 数组表示不增加约束；缺失字段不是
-PATCH，保存始终发送完整白名单。`SitePolicy.eh_download` 是已知后端字段，但旧 UI 将其作为每请求
-抓取选项，4B 只安全原样保留，不提供编辑器。
+桌面页面使用 `?view=policy` 读取五站快照，并通过
+`PUT /api/v1/sites/policies/{site}?view=policy` 保存所选网站的完整四字段对象。默认响应形状仍可供
+旧客户端读取，但所有 PUT 形状都使用同一个四字段请求模型：缺字段、未知字段以及旧高级字段一律
+返回 422，不会忽略后写入。`DELETE` 删除该网站的四字段覆盖，让它重新使用统一默认。
 
-启动默认是进程启动时“内置常量 + 所选 config 文件”的内存快照；外部修改 config 不会热重载。
-保存后，后续新搜索、新规划与新建任务会读取新策略；已创建（包括排队或运行）的任务保留创建时
-持久化的策略快照。SQLite 使用 `BEGIN IMMEDIATE` 单事务、私有数据库权限与 symlink 拒绝，失败
-回滚，不存在多文件部分写。后端没有 revision、ETag 或版本前置条件，多个客户端采用最后完成写入
-生效；前端 `lifecycle/write/read` 世代门只防止本页旧 GET 覆盖写后状态，不伪装跨客户端冲突保护。
+以下运行参数由后端固定，不属于 POLICY API 或 `default_site_policy` 的配置面：
 
-POLICY profile 不返回未知站点 ID 的配置，只给出计数；不返回绝对路径、URL 凭据/query/fragment、
-疑似秘密赋值、Cookie、Token、代理凭据或完整 config。写入另有 16 KiB UTF-8 JSON 请求边界及
-字段/数量/长度校验；前端按最终序列化字节数预检，后端同时核对声明值与实际 body。前端
-`policy-model.js` 再次白名单投影后才通过 `policy/configReceived` 进入独立 Store slice；
-未保存草稿只在当前 DOM/控制器中，放弃、reset、刷新覆盖、最小化、关闭、路由切换和销毁都会清除，
-不会进入 Storage、URL、通知历史或 diagnostics。来源“后端支持”、每请求“选择/启用”、VAULT 的
-“本地授权材料”与“当前远端可用”分别展示；POLICY 不读取 Auth Store、不发起登录、探活、抓取或
-代理重载。
+```text
+probe_url                         = null
+probe_before_use                  = true
+node_tags                         = []
+http_timeout                      = 60.0
+gallery_retries                   = 2
+task_timeout_seconds              = 7200.0
+download_stall_timeout_seconds    = 300.0
+eh_download                       = null
+extra_args                        = []
+```
+
+`default_site_policy` 也只读取前述四字段；旧配置文件中的高级键会被丢弃，不能改变新任务运行参数。
+运行时由后端把四字段与固定值合成为完整 `SitePolicy`。单次任务或 CRAWL 请求的显式
+`proxy_mode` 仍优先；CRAWL 的 EH 图片版本/GP 选择与受控单次附加参数仍按请求进入任务快照，不会
+被站点固定值误删。
+
+保存只影响之后新建的搜索、规划和任务。已经创建、排队或运行的任务继续使用创建时持久化的完整
+快照。数据库 schema v8 在首次升级时与版本标记同一事务清空全部旧 `site_policies` 行；升级完成后
+新建的四字段覆盖会在后续重启中保留，不会反复清除。
+
+页面不轮询；激活和写入后读取一次最新值。未保存内容只留在当前表单，切换网站、切换应用、最小化、
+关闭和浏览器离开都会先确认。错误只显示受控提示和请求 ID，不回显提交原文。
 
 `HTTP_PROXY`/`HTTPS_PROXY` 和 setup 的 `--proxy` 只服务于 git/pip/Mihomo/模型下载，不会写入
 config，也不会被 doctor 当作抓取代理池节点。Mihomo 是抓取池中 VLESS/VMess/Trojan 等隧道
@@ -203,11 +214,12 @@ Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件
 
 ## WebUI 工作流
 
-1. 查看代理池状态，按需启动、重载或探活。
-2. 在“站点登录授权”中完成所需站点登录。
-3. 输入关键词搜索来源，核对候选和弱证据，并调整来源/地址顺序。
-4. 设置单地址图片并发数，提交批次并查看地址与图片任务状态。
-5. 批次结束后按需启动去重，再审核剩余重复组与独立图片，保存选择并应用整理结果。
+1. （可选）在 `DESKTOP.CPL` 调整严格六位 HEX 的强调色、窗口底色及其他本地个性化设置；任意颜色组合均可直接预览和应用。
+2. 查看代理池状态，按需启动、重载或探活。
+3. 在“站点登录授权”中完成所需站点登录。
+4. 输入关键词搜索来源，核对候选和弱证据，并调整来源/地址顺序。
+5. 设置单地址图片并发数，提交批次并查看地址与图片任务状态。
+6. 批次结束后按需启动去重，再审核剩余重复组与独立图片，保存选择并应用整理结果。
 
 界面直接调用下述 API；搜索归并、执行顺序、代理租约和任务状态均以后端数据库为准。
 
@@ -216,8 +228,21 @@ Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件
 所有业务请求只经同源 `js/core/api.js` 和应用 `context.api` 发出；应用模块不直接调用
 `fetch`/XHR。后端响应必须先经过对应 model 白名单投影，再通过受控 action 进入中央 Store。
 爬取提交所需的原始地址只在 CRAWL 控制器内短暂保留，批次/任务/review 响应中的 URL、绝对路径、
-原始错误和内部载荷不会进入 Store 或 DOM。Storage 只保存当前应用 ID、活动批次 UUID、窗口最大化
-布尔值和受控 UI 偏好，不保存凭据、代理源、搜索词、审核选择或响应快照。
+原始错误和内部载荷不会进入 Store 或 DOM。`sessionStorage` 只保存当前应用 ID 与活动批次 UUID；
+`LocalStorage` 只保存窗口最大化状态及规范化后的 UI 偏好白名单。既有
+`imageweave.ui:ui-preferences` 中的个性化值始终是完整偏好对象，主题只占
+`themeAccent/themeSurface` 两个规范化严格六位 HEX 字段；不建立主题专用 key，也不保存 CSS 声明、
+选择器、`var()`、颜色函数或其他 CSS 文本。LocalStorage 仍不接受图片内容、文件名、路径、
+Base64/Data URL 或 Blob URL。
+
+`DESKTOP.CPL` 不发起网络请求、调用业务 API、增加后端端点或上传主题/图片。本地 JPG/PNG/WebP 经
+解码与 Canvas 静态重编码后，只有重编码 Blob 会写入 IndexedDB；原始 `File`、文件名、路径和临时
+Object URL 不进入中央 Store 或 LocalStorage，图片也不会上传。IndexedDB 不可用或配额写入失败时
+保留旧壁纸并给出安全提示；偏好指向的记录缺失或损坏时清理无效记录并回退默认 `graphite`，这些
+故障不阻断桌面壳层启动。主题颜色不进入 IndexedDB、中央 Store、dataset、业务 API 或上传路径；
+只有通过严格六位 HEX 整对投影后的两个字段随完整偏好写入 LocalStorage；对比度不参与合法性判断。桌面与主题设计/验收分别见
+[`../docs/webui-desktop-personalization.md`](../docs/webui-desktop-personalization.md) 与
+[`../docs/webui-interface-theme-personalization.md`](../docs/webui-interface-theme-personalization.md)。
 
 `TASKMGR.EXE` 仅对活动批次执行一个 1.5 秒、生命周期受控且不重叠的轮询，终态、404、最小化、
 关闭或切出应用即停止；写操作加锁并在完成后读取权威快照。`REVIEW.EXE` 只在分析处理中轮询，翻页、
@@ -412,9 +437,9 @@ DELETE /api/v1/sites/policies/{site}
 
 EH/EHX 来源的 `eh_download.image_mode` 接受 `original` 或 `resample`。原图模式下，
 `gp_policy=stop` 保持严格原图并在 GP 响应时停止，`gp_policy=resized` 允许 gallery-dl
-降级为 1280 查看图。WebUI 默认提交 `original + stop`。EH 图片任务还使用
-`download_stall_timeout_seconds` 作为单进程无进展保护，超时会结束当前尝试并按任务的
-`max_attempts` 自动换代理重试；已存在的完整文件仍由 gallery-dl 跳过。
+降级为 1280 查看图。WebUI 默认提交 `original + stop`。EH 图片任务使用后端固定的 300 秒
+无进展保护，超时会结束当前尝试并按任务的 `max_attempts` 自动换代理重试；已存在的完整文件仍由
+gallery-dl 跳过。
 批次终态若仍有失败图片，可调用 `POST /api/v1/crawls/{batch_id}/retry`（或 WebUI 的“补齐失败下载”），
 只重新排队失败任务，不会重跑成功任务。
 
@@ -429,8 +454,8 @@ EH/EHX 来源的 `eh_download.image_mode` 接受 `original` 或 `resample`。原
 中提醒，不会回退直连，修复核心后在 WebUI 重新启动代理池再重试。其余场景（代理池被停止、
 未启动或运行中暂无可租节点）行为不变。
 
-站点策略可配置并发、重试、探活地址、节点标签和任务超时。完整字段由
-`PUT /api/v1/sites/policies/{site}` 的 Swagger 模型定义。
+各站运行设置只开放并发任务、重试次数、重试间隔和代理方案。其余运行参数由后端固定；完整四字段
+请求模型由 `PUT /api/v1/sites/policies/{site}` 的 Swagger 定义。
 
 ## 失败与恢复
 

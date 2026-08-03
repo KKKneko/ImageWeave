@@ -1,0 +1,662 @@
+.personalization-app {
+  display: grid;
+  gap: 18px;
+  max-width: 980px;
+  min-width: 0;
+}
+
+.personalization-app-header {
+  margin-bottom: 0;
+}
+
+.personalization-form {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.personalization-panel {
+  min-width: 0;
+  margin: 0;
+  padding: clamp(14px, 2.5vw, 24px);
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: var(--imageweave-small-shadow);
+}
+
+.personalization-fieldset > legend {
+  padding: 0 8px 0 0;
+  font-size: 1.18rem;
+  font-weight: 900;
+}
+
+.personalization-help {
+  margin: 0 0 13px;
+  overflow-wrap: anywhere;
+  font-size: 0.84rem;
+}
+
+.personalization-theme-panel {
+  display: grid;
+  gap: 13px;
+}
+
+.personalization-theme-panel > .personalization-help,
+.personalization-theme-panel > .personalization-theme-status {
+  margin: 0;
+}
+
+.personalization-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  min-width: 0;
+}
+
+.personalization-theme-control {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+}
+
+.personalization-theme-color-row {
+  display: grid;
+  grid-template-columns: minmax(44px, 1fr) minmax(0, auto);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.personalization-theme-color {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 44px;
+  min-height: 44px;
+  height: 44px;
+  margin: 0;
+  padding: 3px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  cursor: pointer;
+}
+
+.personalization-theme-color::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.personalization-theme-color::-webkit-color-swatch {
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+}
+
+.personalization-theme-color::-moz-color-swatch {
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+}
+
+.personalization-theme-color[aria-invalid="true"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.personalization-theme-color:disabled {
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.personalization-theme-color:focus-visible {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.personalization-theme-hex {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  padding: 8px 9px;
+  overflow: hidden;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+}
+
+.personalization-theme-status {
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  font-weight: 850;
+}
+
+.personalization-theme-status[data-personalization-theme-status="invalid"],
+.personalization-theme-status[data-personalization-theme-status="error"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.personalization-theme-status[data-personalization-theme-status="error"] {
+  border-left-width: 8px;
+}
+
+.personalization-image-settings,
+.personalization-window-panel {
+  display: grid;
+  gap: 13px;
+}
+
+.personalization-image-settings[hidden] {
+  display: none;
+}
+
+.personalization-image-settings h2 {
+  margin: 0;
+}
+
+.personalization-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  min-width: 0;
+}
+
+.personalization-control-group,
+.personalization-control {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+}
+
+.personalization-control-group {
+  padding: 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+}
+
+.personalization-control-group > .personalization-help,
+.personalization-window-panel > .personalization-help,
+.personalization-opacity-note {
+  margin: 0;
+}
+
+.personalization-control__label {
+  font-weight: 900;
+}
+
+.personalization-select {
+  width: 100%;
+  min-height: 44px;
+  padding: 7px 36px 7px 10px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  font: inherit;
+  font-weight: 800;
+}
+
+.personalization-select:disabled,
+.personalization-range:disabled,
+.personalization-position-fieldset:disabled .personalization-position-choice {
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.personalization-select:focus-visible,
+.personalization-range:focus-visible {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.personalization-position-fieldset {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+}
+
+.personalization-position-fieldset > legend {
+  padding: 0 7px 0 0;
+  font-weight: 900;
+}
+
+.personalization-position-fieldset > .personalization-help,
+.personalization-position-fieldset > .personalization-position-note {
+  margin: 0;
+}
+
+.personalization-position-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  min-width: 0;
+}
+
+.personalization-position-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  min-height: 46px;
+  padding: 7px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.personalization-position-choice input {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--imageweave-accent);
+}
+
+.personalization-position-choice:has(input:checked) {
+  border-style: double;
+  border-width: 4px;
+  box-shadow: 2px 2px 0 var(--imageweave-accent);
+}
+
+.personalization-position-choice:has(input:focus-visible) {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.personalization-range-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+
+.personalization-range {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  margin: 0;
+  accent-color: var(--imageweave-accent);
+  animation: none;
+  transition: none;
+}
+
+.personalization-range-output {
+  min-width: 4ch;
+  padding: 7px 8px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+}
+
+.personalization-motion-options,
+.personalization-source-options,
+.personalization-color-options {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.personalization-motion-options,
+.personalization-source-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.personalization-color-options {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.personalization-choice {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+  min-height: 86px;
+  padding: 11px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  cursor: pointer;
+}
+
+.personalization-motion-choice {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.personalization-source-choice {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "input label selection"
+    ". description description";
+  align-items: center;
+}
+
+.personalization-source-choice input {
+  grid-area: input;
+}
+
+.personalization-source-choice strong {
+  grid-area: label;
+}
+
+.personalization-source-choice__description {
+  grid-area: description;
+  overflow-wrap: anywhere;
+  font-size: 0.78rem;
+}
+
+.personalization-source-choice .personalization-choice__selection {
+  grid-area: selection;
+}
+
+.personalization-color-choice {
+  grid-template-columns: 24px minmax(58px, auto) minmax(0, 1fr);
+  grid-template-areas:
+    "input swatch label"
+    "selection selection selection";
+  align-items: center;
+}
+
+.personalization-choice:has(input:checked) {
+  border-style: double;
+  border-width: 4px;
+  box-shadow: 3px 3px 0 var(--imageweave-accent);
+}
+
+.personalization-choice:has(input:focus-visible) {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.personalization-choice input {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--imageweave-accent);
+}
+
+.personalization-color-choice input {
+  grid-area: input;
+}
+
+.personalization-color-choice strong {
+  grid-area: label;
+  overflow-wrap: anywhere;
+}
+
+.personalization-choice__selection {
+  justify-self: end;
+  font-size: 0.75rem;
+  font-weight: 850;
+}
+
+.personalization-color-choice .personalization-choice__selection {
+  grid-area: selection;
+  justify-self: start;
+}
+
+.personalization-swatch {
+  display: block;
+  grid-area: swatch;
+  width: 58px;
+  height: 42px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  box-shadow: 2px 2px 0 var(--imageweave-accent);
+}
+
+.personalization-swatch--graphite {
+  background: #20242A;
+}
+
+.personalization-swatch--slate {
+  background: #384554;
+}
+
+.personalization-swatch--deep-ocean {
+  background: #20364A;
+}
+
+.personalization-swatch--forest {
+  background: #294039;
+}
+
+.personalization-swatch--plum-gray {
+  background: #403341;
+}
+
+.personalization-swatch--warm-paper {
+  background: #E7E1D6;
+}
+
+.personalization-motion-limit,
+.personalization-image-state,
+.personalization-import-status,
+.personalization-save-status,
+.personalization-settings-status,
+.personalization-position-note {
+  margin: 13px 0 0;
+  padding: 10px 12px;
+  border: var(--imageweave-border-width) dashed var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  overflow-wrap: anywhere;
+  font-weight: 800;
+}
+
+.personalization-motion-limit {
+  border-left: 6px double var(--imageweave-accent);
+}
+
+.personalization-settings-status {
+  margin: 0;
+}
+
+.personalization-settings-status[data-personalization-image-controls="missing"],
+.personalization-settings-status[data-personalization-image-controls="loading"],
+.personalization-settings-status[data-personalization-image-controls="busy"] {
+  border-left: 6px double var(--imageweave-accent);
+}
+
+.personalization-position-note {
+  border-left: 6px double var(--imageweave-accent);
+  font-size: 0.82rem;
+}
+
+.personalization-image-panel {
+  display: grid;
+  gap: 11px;
+}
+
+.personalization-image-panel > .personalization-help,
+.personalization-image-panel > .personalization-image-state,
+.personalization-image-panel > .personalization-import-status {
+  margin: 0;
+}
+
+.personalization-image-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.personalization-image-state[data-personalization-image-state="pending"],
+.personalization-import-status[data-personalization-import-status="loading"],
+.personalization-import-status[data-personalization-import-status="warning"] {
+  border-left: 6px double var(--imageweave-accent);
+}
+
+.personalization-image-state[data-personalization-image-state="saved"],
+.personalization-import-status[data-personalization-import-status="success"] {
+  border-style: solid;
+}
+
+.personalization-image-state[data-personalization-image-state="unavailable"],
+.personalization-import-status[data-personalization-import-status="error"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.personalization-image-note {
+  padding-top: 2px;
+  border-top: var(--imageweave-border-width) dotted var(--imageweave-accent);
+}
+
+.personalization-actions-panel {
+  display: grid;
+  gap: 13px;
+}
+
+.personalization-actions-panel h2 {
+  margin: 0;
+}
+
+.personalization-actions-panel .personalization-save-status {
+  margin: 0;
+}
+
+.personalization-save-status[data-personalization-status="dirty"],
+.personalization-save-status[data-personalization-status="saving"] {
+  border-style: dashed;
+}
+
+.personalization-save-status[data-personalization-status="error"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.personalization-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.personalization-button {
+  min-width: 112px;
+  min-height: 44px;
+  padding: 7px 13px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: 2px 2px 0 var(--imageweave-accent);
+  font-weight: 850;
+}
+
+.personalization-button:hover:not(:disabled),
+.personalization-button:focus-visible:not(:disabled),
+.personalization-button--primary {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+}
+
+.personalization-button:focus-visible {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.personalization-button--primary:hover:not(:disabled),
+.personalization-button--primary:focus-visible:not(:disabled) {
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+}
+
+.personalization-button--dangerous {
+  border-style: double;
+  border-width: 4px;
+}
+
+.personalization-button--dangerous:hover:not(:disabled),
+.personalization-button--dangerous:focus-visible:not(:disabled) {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+}
+
+.personalization-button[aria-busy="true"] {
+  border-style: dashed;
+}
+
+@media (max-width: 767px) {
+  .personalization-app {
+    gap: 13px;
+  }
+
+  .personalization-panel {
+    padding: 12px;
+    box-shadow: 2px 2px 0 var(--imageweave-accent);
+  }
+
+  .personalization-color-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .personalization-theme-grid,
+  .personalization-control-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .personalization-image-actions,
+  .personalization-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .personalization-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 420px) {
+  .personalization-motion-options,
+  .personalization-source-options,
+  .personalization-color-options {
+    grid-template-columns: 1fr;
+  }
+
+  .personalization-position-choice {
+    gap: 4px;
+    padding: 6px;
+    font-size: 0.76rem;
+  }
+
+  .personalization-position-choice input {
+    width: 18px;
+    height: 18px;
+  }
+
+  .personalization-range-row {
+    gap: 8px;
+  }
+
+  .personalization-theme-color-row {
+    grid-template-columns: minmax(44px, 1fr) auto;
+    gap: 8px;
+  }
+}
+
+@media (forced-colors: active) {
+  .personalization-theme-control,
+  .personalization-theme-color,
+  .personalization-theme-hex,
+  .personalization-theme-status {
+    border-color: CanvasText;
+    color: CanvasText;
+    background: Canvas;
+    forced-color-adjust: auto;
+  }
+
+  .personalization-theme-color:focus-visible {
+    outline-color: Highlight;
+  }
+}

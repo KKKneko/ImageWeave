@@ -13,8 +13,11 @@ from typing import Any, Iterator
 
 from .file_security import ensure_private_directory, secure_sqlite_files
 from .redaction import redact_data, redact_text
+from .site_policy import EditableSitePolicy
 
 
+CURRENT_SCHEMA_VERSION = 8
+SITE_POLICY_SIMPLIFICATION_SCHEMA_VERSION = 8
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 ACTIVE_STATUSES = {"starting", "running", "cancelling"}
 TERMINAL_BATCH_STATUSES = {"succeeded", "completed_with_errors", "cancelled"}
@@ -45,6 +48,7 @@ class Database:
             secure_sqlite_files(self.path)
 
     def _initialize(self) -> None:
+        # 先读取持久版本，再创建缺失结构；不能在数据迁移前提前抬高版本号。
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -52,7 +56,22 @@ class Database:
                 value TEXT NOT NULL
             );
             INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
+            """
+        )
+        raw_version = self._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            schema_version = int(raw_version[0])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise RuntimeError("SQLite schema_version 无效") from exc
+        if not 1 <= schema_version <= CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"SQLite schema_version={schema_version} 不受当前后端支持"
+            )
 
+        self._conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 idempotency_key TEXT UNIQUE,
@@ -309,8 +328,6 @@ class Database:
                 ON crawl_review_images(batch_id, group_id, ordinal);
             CREATE INDEX IF NOT EXISTS idx_crawl_review_images_selection
                 ON crawl_review_images(batch_id, selected, disposition);
-
-            UPDATE meta SET value='7' WHERE key='schema_version';
             """
         )
         address_columns = {
@@ -355,7 +372,16 @@ class Database:
                 "ALTER TABLE tasks ADD COLUMN "
                 "backoff_anchor_attempt INTEGER NOT NULL DEFAULT 0"
             )
-        self._conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
+
+        if schema_version < SITE_POLICY_SIMPLIFICATION_SCHEMA_VERSION:
+            # v8 产品迁移：旧行可能带高级字段，必须与版本标记在同一事务中
+            # 一次性清除。提交 v8 后新建的四字段覆盖在后续启动中会保留。
+            with self._transaction() as conn:
+                conn.execute("DELETE FROM site_policies")
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key='schema_version'",
+                    (str(CURRENT_SCHEMA_VERSION),),
+                )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -2660,6 +2686,7 @@ class Database:
             return int(linked.rowcount) + int(pending.rowcount)
 
     def put_site_policy(self, site: str, policy: dict[str, Any]) -> dict[str, Any]:
+        normalized = EditableSitePolicy.model_validate(policy).model_dump()
         now = time.time()
         with self._transaction() as conn:
             conn.execute(
@@ -2667,9 +2694,9 @@ class Database:
                 INSERT INTO site_policies(site, policy_json, updated_at) VALUES (?, ?, ?)
                 ON CONFLICT(site) DO UPDATE SET policy_json=excluded.policy_json, updated_at=excluded.updated_at
                 """,
-                (site, json.dumps(policy, ensure_ascii=False), now),
+                (site, json.dumps(normalized, ensure_ascii=False), now),
             )
-        return {"site": site, "policy": policy, "updated_at": now}
+        return {"site": site, "policy": normalized, "updated_at": now}
 
     def get_site_policy(self, site: str) -> dict[str, Any] | None:
         with self._lock:

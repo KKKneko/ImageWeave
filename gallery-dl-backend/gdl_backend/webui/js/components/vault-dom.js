@@ -36,23 +36,11 @@ export function vaultDefinitionList(items, className = "vault-definition-list") 
   return list;
 }
 
-function securityBoundaryList() {
-  const list = createElement("ul", { className: "vault-security-list" });
-  for (const item of [
-    "Cookie、Token 与 OAuth 回调只由后端私有目录管理，页面没有手工粘贴入口。",
-    "授权代理输入只存在于当前密码控件和提交函数局部；提交、失败、取消或离开页面都会清空。",
-    "“已配置”不等于远端验证成功；只有实际任务认证失败时，后端才会标记相应材料失效。",
-  ]) {
-    list.append(createElement("li", { text: item }));
-  }
-  return list;
-}
-
 export function buildVaultDom(context) {
   const { root, app } = context;
   const headingId = "vault-heading";
-  const headerBadge = createStatusBadge("disabled", "授权状态待加载");
-  const refreshButton = vaultButton("refresh", "刷新安全状态", "正在刷新…");
+  const headerBadge = createStatusBadge("disabled", "正在加载授权状态");
+  const refreshButton = vaultButton("refresh", "刷新授权状态", "正在刷新…");
   const operationLive = createElement("p", {
     className: "vault-operation-live",
     text: "等待操作。",
@@ -70,9 +58,9 @@ export function buildVaultDom(context) {
   }, [
     createElement("div", { className: "vault-panel-heading" }, [
       createElement("div", {}, [
-        createElement("h2", { text: "授权目标概览", attributes: { id: "vault-sites-heading" } }),
+        createElement("h2", { text: "站点授权", attributes: { id: "vault-sites-heading" } }),
         createElement("p", {
-          text: "Danbooru 与 Pawchive 无需登录；X、Pixiv、EH 共用后端项目授权 Chrome。",
+          text: "Danbooru 和 Pawchive 无需登录；X、Pixiv 和 EH 共用一个独立的授权浏览器。",
         }),
       ]),
       refreshButton,
@@ -83,7 +71,7 @@ export function buildVaultDom(context) {
   const profileStatusHost = createElement("div", { className: "vault-profile-status" });
   const profileClearButton = vaultButton(
     "profile-clear",
-    "清空共享 Profile",
+    "清除授权浏览器数据",
     "正在清空…",
     { dangerous: true },
   );
@@ -98,16 +86,16 @@ export function buildVaultDom(context) {
   }, [
     createElement("div", { className: "vault-panel-heading" }, [
       createElement("div", {}, [
-        createElement("h2", { text: "共享授权浏览器 Profile", attributes: { id: "vault-profile-heading" } }),
+        createElement("h2", { text: "授权浏览器数据", attributes: { id: "vault-profile-heading" } }),
         createElement("p", {
-          text: "X、Pixiv 与 EH 共享同一份项目专属 Profile；不会读取日常浏览器资料。",
+          text: "X、Pixiv 和 EH 共用一份独立的授权浏览器数据，不会读取日常浏览器资料。",
         }),
       ]),
       profileClearButton,
     ]),
     createElement("p", {
       className: "vault-impact-note",
-      text: "清空 Profile 会关闭活动授权会话并删除浏览器登录状态，但不会删除已经导出的单站 Cookie 或 Pixiv Token。",
+      text: "清除后会关闭活动授权并删除浏览器登录状态，但不会删除各站点已保存的 Cookie 或 Pixiv Token。",
       attributes: { id: "vault-profile-impact" },
     }),
     profileReasons,
@@ -138,7 +126,7 @@ export function buildVaultDom(context) {
   revealButton.removeAttribute("data-operation-kind");
   revealButton.setAttribute("aria-controls", "vault-proxy-input");
   revealButton.setAttribute("aria-pressed", "false");
-  revealButton.setAttribute("aria-label", "显示授权代理输入");
+  revealButton.setAttribute("aria-label", "显示登录代理输入");
 
   const proxyValidation = createElement("p", {
     className: "vault-field-error",
@@ -146,7 +134,7 @@ export function buildVaultDom(context) {
   });
   const proxySaveButton = vaultButton(
     "proxy-save",
-    "保存新代理 / 设置直连",
+    "保存登录代理设置",
     "正在保存…",
     { primary: true },
   );
@@ -154,7 +142,7 @@ export function buildVaultDom(context) {
   proxySaveButton.removeAttribute("data-vault-action");
   const proxyResetButton = vaultButton(
     "proxy-reset",
-    "恢复 config 默认",
+    "恢复默认设置",
     "正在恢复…",
     { dangerous: true },
   );
@@ -171,7 +159,7 @@ export function buildVaultDom(context) {
     dataset: { vaultForm: "proxy" },
   }, [
     createElement("fieldset", {}, [
-      createElement("legend", { text: "替换授权专用代理" }),
+      createElement("legend", { text: "设置登录代理" }),
       createElement("label", {
         text: "完整代理地址",
         attributes: { for: "vault-proxy-input" },
@@ -179,7 +167,7 @@ export function buildVaultDom(context) {
       createElement("div", { className: "vault-secret-row" }, [proxyInput, revealButton]),
       createElement("p", {
         className: "vault-field-help",
-        text: "支持 http、https、socks4、socks5、socks5h，必须带显式端口且不能含路径/query/fragment。HTTP(S) 可含凭据；SOCKS 不可含凭据。旧值永不回填，留空提交会建立“运行时直连”覆盖。",
+        text: "格式：协议://主机:端口。支持 HTTP(S)、SOCKS4、SOCKS5 和 SOCKS5H；地址不能包含路径或查询参数。HTTP(S) 可包含账号密码，SOCKS 不支持。",
         attributes: { id: "vault-proxy-help" },
       }),
       proxyValidation,
@@ -189,7 +177,7 @@ export function buildVaultDom(context) {
       ]),
       createElement("p", {
         className: "vault-field-help",
-        text: "恢复 config 默认会删除界面运行时覆盖；它与提交空值形成的“运行时直连”不同。",
+        text: "留空保存表示始终直连；“恢复默认设置”则重新采用配置文件中的值。",
         attributes: { id: "vault-proxy-reset-help" },
       }),
       proxyReasons,
@@ -202,26 +190,15 @@ export function buildVaultDom(context) {
   }, [
     createElement("div", { className: "vault-panel-heading" }, [
       createElement("div", {}, [
-        createElement("h2", { text: "授权专用代理", attributes: { id: "vault-proxy-heading" } }),
+        createElement("h2", { text: "登录代理", attributes: { id: "vault-proxy-heading" } }),
         createElement("p", {
-          text: "仅用于共享授权 Chrome 与 Pixiv Token 交换；和抓取代理池完全独立。",
+          text: "仅用于授权浏览器和 Pixiv Token 交换，与图片采集使用的代理池相互独立。",
         }),
       ]),
       createIcon("network", { size: 28, strokeWidth: 1.8, className: "vault-panel-icon" }),
     ]),
     proxyStatusHost,
     proxyForm,
-  ]);
-
-  const boundarySection = createElement("section", {
-    className: "vault-panel vault-boundary-panel",
-    attributes: { "aria-labelledby": "vault-boundary-heading" },
-  }, [
-    createElement("div", { className: "vault-panel-heading" }, [
-      createElement("h2", { text: "秘密边界", attributes: { id: "vault-boundary-heading" } }),
-      createIcon("key", { size: 28, strokeWidth: 1.8, className: "vault-panel-icon" }),
-    ]),
-    securityBoundaryList(),
   ]);
 
   root.classList.add("app-view", "vault-app");
@@ -233,7 +210,7 @@ export function buildVaultDom(context) {
       headerBadge,
       createElement("p", {
         className: "app-summary",
-        text: "查看后端脱敏授权状态，启动共享浏览器授权，并管理单站导出材料、共享 Profile 与授权专用代理。",
+        text: "查看各站授权状态，打开独立浏览器完成登录，并管理登录凭证和登录代理。",
       }),
     ]),
     operationLive,
@@ -241,7 +218,6 @@ export function buildVaultDom(context) {
     sitesSection,
     profileSection,
     proxySection,
-    boundarySection,
   );
 
   return {

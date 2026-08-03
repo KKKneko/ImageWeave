@@ -59,7 +59,7 @@ export function normalizeApiError({
     return new ApiError({
       status,
       code: boundedString(backendError.code, "backend_error", 128),
-      message: boundedString(backendError.message, "后端拒绝了该请求"),
+      message: boundedString(backendError.message, "服务拒绝了该请求"),
       details: Object.prototype.hasOwnProperty.call(backendError, "details")
         ? backendError.details
         : null,
@@ -71,7 +71,7 @@ export function normalizeApiError({
     return new ApiError({
       status: 0,
       code: "network_error",
-      message: "无法连接到 ImageWeave 后端",
+      message: "无法连接到 ImageWeave 服务",
       details: null,
       requestId: resolvedRequestId,
     });
@@ -81,7 +81,7 @@ export function normalizeApiError({
     return new ApiError({
       status,
       code: "invalid_response",
-      message: "服务器返回了无法解析的 JSON 响应",
+      message: "服务返回的数据格式无效",
       details: null,
       requestId: resolvedRequestId,
     });

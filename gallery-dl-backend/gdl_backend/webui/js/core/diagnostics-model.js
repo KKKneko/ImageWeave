@@ -1,17 +1,24 @@
 const COMPONENT_STATUSES = new Set(["ok", "error", "disabled", "optional_missing", "optional_warning"]);
+const COMPONENT_STATUS_LABELS = Object.freeze({
+  ok: "正常",
+  error: "异常",
+  disabled: "已禁用",
+  optional_missing: "可选组件缺失",
+  optional_warning: "提示",
+});
 const COMPONENTS = Object.freeze([
-  Object.freeze({ id: "process", label: "后端进程", next: "刷新诊断；若持续离线，请重新启动本地服务。" }),
-  Object.freeze({ id: "database", label: "SQLite", next: "运行 doctor 检查数据库目录与权限。" }),
-  Object.freeze({ id: "gallery_source", label: "gallery-dl", next: "运行 doctor 检查 gallery-dl 子模块。" }),
-  Object.freeze({ id: "project_proxy", label: "项目代理池", next: "打开 PROXY.CPL 检查节点源与运行状态。", app: "proxy" }),
-  Object.freeze({ id: "mihomo", label: "Mihomo", next: "打开 PROXY.CPL 检查传输核心安装与状态。", app: "proxy" }),
-  Object.freeze({ id: "scheduler", label: "任务调度器", next: "打开 TASKMGR.EXE 查看活动批次。", app: "tasks" }),
-  Object.freeze({ id: "ordered_crawls", label: "顺序批次管理器", next: "打开 TASKMGR.EXE 查看活动批次。", app: "tasks" }),
-  Object.freeze({ id: "dedup", label: "去重环境", next: "运行 doctor 检查去重 Python、Torch 与模型缓存。" }),
-  Object.freeze({ id: "dedup_python", label: "去重 Python", next: "运行 doctor 检查根虚拟环境。" }),
-  Object.freeze({ id: "torch", label: "Torch / 设备", next: "运行 doctor 核对 CPU/CUDA 环境。" }),
-  Object.freeze({ id: "sscd_model", label: "SSCD 模型", next: "运行 doctor 检查模型缓存。" }),
-  Object.freeze({ id: "dino_model", label: "DINOv2 模型", next: "运行 doctor 检查模型缓存。" }),
+  Object.freeze({ id: "process", label: "服务进程", next: "刷新诊断；若持续离线，请重新启动本地服务。" }),
+  Object.freeze({ id: "database", label: "SQLite", next: "请检查数据库目录和权限。" }),
+  Object.freeze({ id: "gallery_source", label: "gallery-dl", next: "请检查 gallery-dl 子模块。" }),
+  Object.freeze({ id: "project_proxy", label: "代理池", next: "打开代理管理检查节点来源和运行状态。", app: "proxy" }),
+  Object.freeze({ id: "mihomo", label: "Mihomo", next: "打开代理管理检查传输核心的安装和状态。", app: "proxy" }),
+  Object.freeze({ id: "scheduler", label: "任务调度器", next: "打开批次管理查看活动批次。", app: "tasks" }),
+  Object.freeze({ id: "ordered_crawls", label: "批次调度", next: "打开批次管理查看活动批次。", app: "tasks" }),
+  Object.freeze({ id: "dedup", label: "去重环境", next: "请检查去重运行环境和模型缓存。" }),
+  Object.freeze({ id: "dedup_python", label: "去重运行环境", next: "请检查虚拟环境。" }),
+  Object.freeze({ id: "torch", label: "计算环境", next: "请核对 CPU/CUDA 环境。" }),
+  Object.freeze({ id: "sscd_model", label: "SSCD 模型", next: "请检查模型缓存。" }),
+  Object.freeze({ id: "dino_model", label: "DINOv2 模型", next: "请检查模型缓存。" }),
 ]);
 
 export const DIAGNOSTICS_POLL_INTERVAL_MS = 20_000;
@@ -52,7 +59,7 @@ function uiStatus(status) {
 function componentDetail(id, raw) {
   if (!isRecord(raw)) return "";
   if (id === "project_proxy") {
-    return `节点源 ${boundedCount(raw.source_count)} · 健康 ${boundedCount(raw.healthy)} · ${raw.running ? "运行中" : "未运行"}`;
+    return `节点来源 ${boundedCount(raw.source_count)} · 健康 ${boundedCount(raw.healthy)} · ${raw.running ? "运行中" : "未运行"}`;
   }
   if (id === "torch") {
     const actual = ["cpu", "cuda", "unknown"].includes(raw.actual_device) ? raw.actual_device : "unknown";
@@ -62,7 +69,7 @@ function componentDetail(id, raw) {
   }
   if (id === "dedup") {
     const resources = isRecord(raw.configured_resources) ? raw.configured_resources : {};
-    return `workers ${boundedCount(resources.workers, 64)} · batch ${boundedCount(resources.deep_batch_size, 128)} · block ${boundedCount(resources.neighbor_block_size, 8192)}`;
+    return `工作线程 ${boundedCount(resources.workers, 64)} · 批大小 ${boundedCount(resources.deep_batch_size, 128)} · 分块 ${boundedCount(resources.neighbor_block_size, 8192)}`;
   }
   if (id === "scheduler") {
     const details = isRecord(raw.details) ? raw.details : {};
@@ -72,7 +79,7 @@ function componentDetail(id, raw) {
     const details = isRecord(raw.details) ? raw.details : {};
     return `活动批次 ${boundedCount(details.active_batches)}`;
   }
-  if (id === "mihomo") return raw.required === false ? "当前配置不要求传输核心" : "按当前代理配置检查";
+  if (id === "mihomo") return raw.required === false ? "当前设置不需要传输核心" : "按当前代理设置检查";
   return "";
 }
 
@@ -98,6 +105,7 @@ export function sanitizeReadinessDiagnostics(value) {
       id: definition.id,
       label: definition.label,
       status,
+      statusLabel: COMPONENT_STATUS_LABELS[status] || "异常",
       uiStatus: uiStatus(status),
       required: raw.required !== false,
       detail: componentDetail(definition.id, raw),
@@ -110,7 +118,7 @@ export function sanitizeReadinessDiagnostics(value) {
 
 export function sanitizeDiagnosticsConfig(value) {
   if (!isRecord(value) || value.response_profile !== "diagnostics" || value.secrets_exposed !== false) {
-    throw new TypeError("诊断配置投影无效");
+    throw new TypeError("安全配置数据无效");
   }
   const configuredDevice = ["auto", "cpu", "cuda"].includes(value.dedup?.configured_device)
     ? value.dedup.configured_device
@@ -133,7 +141,7 @@ export function sanitizeDiagnosticsConfig(value) {
 
 export function sanitizeDiagnosticsScheduler(value) {
   if (!isRecord(value) || value.response_profile !== "diagnostics" || value.secrets_exposed !== false) {
-    throw new TypeError("诊断调度投影无效");
+    throw new TypeError("任务调度数据无效");
   }
   return Object.freeze({
     tasksRunning: Boolean(value.tasks?.running),
@@ -143,11 +151,11 @@ export function sanitizeDiagnosticsScheduler(value) {
     crawlsRunning: Boolean(value.ordered_crawls?.running),
     activeBatches: boundedCount(value.ordered_crawls?.active_batches),
     executionOrder: value.ordered_crawls?.execution_order === "source_then_address"
-      ? "source_then_address"
-      : "unknown",
+      ? "按来源和地址顺序"
+      : "未知",
     addressParallelism: value.ordered_crawls?.address_parallelism === "media_tasks"
-      ? "media_tasks"
-      : "unknown",
+      ? "图片任务并发"
+      : "未知",
   });
 }
 
@@ -205,10 +213,10 @@ export function buildDiagnosticsSnapshot({ health, readiness, config, scheduler,
 export function validateDiagnosticsSnapshot(value) {
   if (!isRecord(value) || typeof value.connected !== "boolean" || typeof value.offline !== "boolean" ||
       typeof value.stale !== "boolean" || !isRecord(value.errors) || !Number.isFinite(value.lastCheckedAt)) {
-    throw new TypeError("诊断安全投影无效");
+    throw new TypeError("诊断数据无效");
   }
   if (value.readiness && !Array.isArray(value.readiness.components)) {
-    throw new TypeError("诊断组件投影无效");
+    throw new TypeError("组件状态数据无效");
   }
   return value;
 }
@@ -216,14 +224,14 @@ export function validateDiagnosticsSnapshot(value) {
 export function diagnosticsCopyText(snapshot) {
   validateDiagnosticsSnapshot(snapshot);
   const lines = [
-    "ImageWeave 脱敏诊断摘要",
-    `连接：${snapshot.offline ? "离线" : snapshot.stale ? "部分陈旧" : "在线"}`,
-    `健康：${snapshot.health?.ok ? "通过" : "异常或未知"}`,
-    `就绪：${snapshot.readiness?.ready ? "通过" : "未完全就绪"}`,
-    `调度：${snapshot.scheduler ? `${snapshot.scheduler.activeTasks}/${snapshot.scheduler.maxConcurrent} 活动任务，${snapshot.scheduler.activeBatches} 活动批次` : "未知"}`,
+    "ImageWeave 诊断摘要（敏感信息已隐藏）",
+    `连接：${snapshot.offline ? "离线" : snapshot.stale ? "部分状态未更新" : "在线"}`,
+    `服务状态：${snapshot.health?.ok ? "正常" : "异常或未知"}`,
+    `功能状态：${snapshot.readiness?.ready ? "已就绪" : "未完全就绪"}`,
+    `任务调度：${snapshot.scheduler ? `${snapshot.scheduler.activeTasks}/${snapshot.scheduler.maxConcurrent} 个活动任务，${snapshot.scheduler.activeBatches} 个活动批次` : "未知"}`,
   ];
   for (const component of snapshot.readiness?.components || []) {
-    lines.push(`${component.label}：${component.status}${component.detail ? `（${component.detail}）` : ""}`);
+    lines.push(`${component.label}：${component.statusLabel}${component.detail ? `（${component.detail}）` : ""}`);
   }
   lines.push(`检查时间：${new Date(snapshot.lastCheckedAt).toISOString()}`);
   return lines.join("\n");

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from gdl_backend.config import AppSettings, normalize_authorization_proxy
+from gdl_backend.schemas import build_runtime_site_policy
 
 
 class ConfigDefaultsTests(unittest.TestCase):
@@ -82,6 +83,70 @@ class ConfigDefaultsTests(unittest.TestCase):
             )
             floored = AppSettings.load(config_path)
         self.assertEqual(floored.scheduler.retry_backoff_cap_seconds, 1.0)
+    def test_default_site_policy_ignores_retired_advanced_config_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "dedup": {"enabled": False},
+                        "default_site_policy": {
+                            "max_concurrency": 7,
+                            "retry_limit": 4,
+                            "backoff_base_seconds": 1.5,
+                            "proxy_mode": "direct",
+                            "probe_url": "https://config.invalid/",
+                            "probe_before_use": False,
+                            "node_tags": ["legacy"],
+                            "http_timeout": 1,
+                            "gallery_retries": 50,
+                            "task_timeout_seconds": 0,
+                            "download_stall_timeout_seconds": 0,
+                            "eh_download": {
+                                "image_mode": "resample",
+                                "gp_policy": "resized",
+                            },
+                            "extra_args": ["--legacy"],
+                            "unknown_legacy_field": "ignored",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = AppSettings.load(config_path)
+
+        self.assertEqual(
+            settings.default_site_policy,
+            {
+                "max_concurrency": 7,
+                "retry_limit": 4,
+                "backoff_base_seconds": 1.5,
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(
+            settings.public_dict()["default_site_policy"],
+            settings.default_site_policy,
+        )
+        self.assertEqual(
+            build_runtime_site_policy(settings.default_site_policy).model_dump(),
+            {
+                "max_concurrency": 7,
+                "retry_limit": 4,
+                "backoff_base_seconds": 1.5,
+                "proxy_mode": "direct",
+                "probe_url": None,
+                "probe_before_use": True,
+                "node_tags": [],
+                "http_timeout": 60.0,
+                "gallery_retries": 2,
+                "task_timeout_seconds": 7200.0,
+                "download_stall_timeout_seconds": 300.0,
+                "eh_download": None,
+                "extra_args": [],
+            },
+        )
 
 
 class DedupResourceConfigTests(unittest.TestCase):

@@ -459,6 +459,12 @@ class ProxyPoolAdapter:
             for record in records:
                 status = pool_status.get(record.endpoint, {})
                 cooldown_left = float(status.get("cooldown_left") or 0.0)
+                eligible = bool(
+                    running
+                    and record.healthy
+                    and cooldown_left <= 0
+                    and not status.get("leased")
+                )
                 rows.append(
                     {
                         "id": record.id,
@@ -466,7 +472,7 @@ class ProxyPoolAdapter:
                         "protocol": record.protocol,
                         "endpoint": mask_proxy(record.endpoint),
                         "healthy": bool(running and record.healthy),
-                        "retry_eligible": bool(running and cooldown_left <= 0),
+                        "retry_eligible": eligible,
                         "ref_count": 1 if status.get("leased") else 0,
                         "success_count": record.success_count,
                         "fail_count": record.fail_count,
@@ -668,6 +674,7 @@ class ProxyPoolAdapter:
                     if record.id not in excluded
                     and (allowed_node_ids is None or record.id in allowed_node_ids)
                     and (not wanted or wanted.intersection(record.tags))
+                    and (probe_before_use or record.healthy)
                 ]
                 self._pending_acquires[task_id] = threading.Event()
         if wait_event is not None:
@@ -687,6 +694,12 @@ class ProxyPoolAdapter:
                     pool.release(pool_lease.token)
                     remaining.discard(pool_lease.endpoint)
                     continue
+                with self._lock:
+                    healthy = record.healthy
+                if not probe_before_use and not healthy:
+                    pool.release(pool_lease.token)
+                    remaining.discard(record.endpoint)
+                    continue
                 if probe_before_use:
                     result = self._probe_endpoint(
                         record.id,
@@ -704,6 +717,10 @@ class ProxyPoolAdapter:
                         )
                         remaining.discard(record.endpoint)
                         continue
+                    with self._lock:
+                        record.healthy = True
+                        record.last_error = ""
+                        record.cooldown_until = 0.0
                 endpoint = record.endpoint
                 forwarder: LocalHTTPForwarder | None = None
                 parsed = urlsplit(record.endpoint)

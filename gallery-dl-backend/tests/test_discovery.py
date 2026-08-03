@@ -59,6 +59,45 @@ class _FakeProxy:
         self.released.append((task_id, kwargs))
 
 
+class _SequenceGallery:
+    def __init__(self, stdout_sequence: list[str]):
+        self.stdout_sequence = list(stdout_sequence)
+        self.calls = []
+
+    async def capture(self, operation_id, **kwargs):
+        self.calls.append((operation_id, kwargs))
+        stdout = self.stdout_sequence[len(self.calls) - 1]
+        return GalleryCaptureResult(0, stdout, "", False, "marker", 123)
+
+
+class _RotatingFakeProxy:
+    def __init__(self, count: int = 2):
+        self.nodes = [f"node-{index}" for index in range(1, count + 1)]
+        self.acquired = []
+        self.released = []
+
+    def acquire(self, task_id, **kwargs):
+        excluded = set(kwargs.get("exclude_ids") or set())
+        recorded = {**kwargs, "exclude_ids": excluded}
+        self.acquired.append((task_id, recorded))
+        node_id = next((item for item in self.nodes if item not in excluded), None)
+        if node_id is None:
+            return None
+        index = self.nodes.index(node_id) + 1
+        return ProxyLease(
+            task_id=task_id,
+            node_id=node_id,
+            endpoint=f"http://127.0.0.1:{29000 + index}",
+            name=f"fixture-node-{index}",
+            protocol="http",
+            tags=["fixture"],
+            acquired_at=1.0,
+        )
+
+    def release(self, task_id, **kwargs):
+        self.released.append((task_id, kwargs))
+
+
 class _FakeProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b""):
         self.stdout = asyncio.StreamReader()
@@ -1253,6 +1292,27 @@ class DiscoveryParserTests(unittest.TestCase):
         self.assertEqual(enriched["preview_count"], 30)
         self.assertEqual(enriched["preview_missing_count"], 0)
 
+    def test_protocol_error_after_candidate_remains_a_soft_partial_result(self):
+        payload = [
+            [
+                6,
+                "https://e-hentai.org/g/1531036/91cbde3481/",
+                {"gallery_id": 1531036, "gallery_token": "91cbde3481"},
+            ],
+            [-1, {
+                "error": "HttpError",
+                "message": "SSLError: UNEXPECTED_EOF_WHILE_READING",
+            }],
+        ]
+        candidates, authors = parse_discovery_output(
+            "exhentai",
+            json.dumps(payload),
+            source_url="https://e-hentai.org/?f_search=ogipote",
+            limit=20,
+        )
+        self.assertEqual([item["id"] for item in candidates], ["1531036"])
+        self.assertEqual(authors, [])
+
     def test_protocol_errors_and_managed_args(self):
         with self.assertRaises(DiscoveryError):
             parse_discovery_output(
@@ -1351,6 +1411,140 @@ class DiscoveryParserTests(unittest.TestCase):
                 "(rating == 'g') and (num == 0)",
             ],
         )
+
+    def test_tls_eof_protocol_error_rotates_proxy_then_succeeds(self):
+        tls_error = json.dumps(
+            [[-1, {
+                "error": "HttpError",
+                "message": "SSLError: UNEXPECTED_EOF_WHILE_READING; "
+                "EOF occurred in violation of protocol (_ssl.c:1082)",
+            }]]
+        )
+        success = json.dumps(
+            [[
+                6,
+                "https://e-hentai.org/g/1531036/91cbde3481/",
+                {"gallery_id": 1531036, "gallery_token": "91cbde3481"},
+            ]]
+        )
+        gallery = _SequenceGallery([tls_error, success])
+        proxy = _RotatingFakeProxy()
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(gallery, proxy, Path(temporary))
+            result = asyncio.run(
+                service.search(
+                    site="exhentai",
+                    keyword="ogipote",
+                    limit=20,
+                    policy=SitePolicy(
+                        proxy_mode="required",
+                        retry_limit=1,
+                        backoff_base_seconds=0,
+                    ),
+                    proxy_mode="required",
+                    credentials_ref=None,
+                    cookies_file=None,
+                    config_file=None,
+                    extra_args=[],
+                    timeout_seconds=30,
+                )
+            )
+
+        self.assertEqual(len(gallery.calls), 2)
+        self.assertEqual(proxy.acquired[1][1]["exclude_ids"], {"node-1"})
+        self.assertEqual(proxy.released[0][1]["proxy_fault"], True)
+        self.assertEqual(proxy.released[1][1]["proxy_fault"], False)
+        self.assertNotEqual(
+            gallery.calls[0][1]["proxy_url"],
+            gallery.calls[1][1]["proxy_url"],
+        )
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["proxy"]["node_id"], "node-2")
+
+    def test_tls_eof_protocol_error_exhaustion_reports_actual_attempts(self):
+        tls_error = json.dumps(
+            [[-1, {
+                "error": "HttpError",
+                "message": "requests.exceptions.SSLEOFError: "
+                "EOF occurred in violation of protocol (_ssl.c:1082)",
+            }]]
+        )
+        gallery = _SequenceGallery([tls_error, tls_error])
+        proxy = _RotatingFakeProxy()
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(gallery, proxy, Path(temporary))
+            with self.assertRaises(DiscoveryError) as caught:
+                asyncio.run(
+                    service.search(
+                        site="exhentai",
+                        keyword="ogipote",
+                        limit=20,
+                        policy=SitePolicy(
+                            proxy_mode="required",
+                            retry_limit=1,
+                            backoff_base_seconds=0,
+                        ),
+                        proxy_mode="required",
+                        credentials_ref=None,
+                        cookies_file=None,
+                        config_file=None,
+                        extra_args=[],
+                        timeout_seconds=30,
+                    )
+                )
+
+        self.assertEqual(caught.exception.code, "discovery_failed")
+        self.assertEqual(caught.exception.details["attempts"], 2)
+        self.assertEqual(caught.exception.details["proxy"]["node_id"], "node-2")
+        self.assertNotIn("endpoint", caught.exception.details["proxy"])
+        self.assertEqual(len(gallery.calls), 2)
+        self.assertTrue(all(item[1]["proxy_fault"] for item in proxy.released))
+
+    def test_non_retryable_extractor_error_keeps_safe_attempt_details(self):
+        raw_message = (
+            "ExtractionError: unable to parse gallery page "
+            "Cookie=session-fixture "
+            "proxy=http://user:pass@proxy.invalid:8080 "
+            "token=fixture-token"
+        )
+        gallery = _SequenceGallery(
+            [json.dumps([[-1, {"error": "ExtractionError", "message": raw_message}]])]
+        )
+        proxy = _RotatingFakeProxy()
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(gallery, proxy, Path(temporary))
+            with self.assertRaises(DiscoveryError) as caught:
+                asyncio.run(
+                    service.search(
+                        site="exhentai",
+                        keyword="ogipote",
+                        limit=20,
+                        policy=SitePolicy(
+                            proxy_mode="required",
+                            retry_limit=2,
+                            backoff_base_seconds=0,
+                        ),
+                        proxy_mode="required",
+                        credentials_ref=None,
+                        cookies_file=None,
+                        config_file=None,
+                        extra_args=[],
+                        timeout_seconds=30,
+                    )
+                )
+
+        error = caught.exception
+        self.assertEqual(error.code, "extractor_error")
+        self.assertEqual(error.details["attempts"], 1)
+        self.assertEqual(error.details["message"], error.message)
+        self.assertIn("unable to parse gallery page", error.message)
+        for secret in ("session-fixture", "user:pass", "fixture-token"):
+            self.assertNotIn(secret, error.message)
+            self.assertNotIn(secret, str(error.details))
+        self.assertEqual(error.details["proxy"]["node_id"], "node-1")
+        self.assertNotIn("endpoint", error.details["proxy"])
+        self.assertEqual(len(gallery.calls), 1)
+        self.assertFalse(proxy.released[0][1]["proxy_fault"])
 
     def test_cloudflare_parse_error_retries_and_reports_attempts(self):
         gallery = _FakeGallery(

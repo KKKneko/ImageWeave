@@ -6,40 +6,230 @@
   isolation: isolate;
 }
 
-.cloud-background {
+.desktop-wallpaper {
   position: fixed;
   inset: 0;
   z-index: 0;
   overflow: hidden;
-  background: var(--imageweave-surface);
+  background: #20242A;
   pointer-events: none;
   user-select: none;
 }
 
-.cloud-background img,
-.cloud-background canvas {
+.desktop-wallpaper--graphite {
+  background: #20242A;
+}
+
+.desktop-wallpaper--slate {
+  background: #384554;
+}
+
+.desktop-wallpaper--deep-ocean {
+  background: #20364A;
+}
+
+.desktop-wallpaper--forest {
+  background: #294039;
+}
+
+.desktop-wallpaper--plum-gray {
+  background: #403341;
+}
+
+.desktop-wallpaper--warm-paper {
+  background: #E7E1D6;
+}
+
+.desktop-wallpaper__image-layer {
   position: absolute;
   inset: 0;
+  overflow: hidden;
+  background-position: 0 0;
+  background-repeat: no-repeat;
+  background-size: auto;
+  animation: none;
+  filter: none;
+  pointer-events: none;
+  transform: none;
+  transition: none;
+}
+
+.desktop-wallpaper__image,
+.desktop-wallpaper__mask {
+  position: absolute;
+  inset: 0;
+  animation: none;
+  pointer-events: none;
+  transition: none;
+}
+
+.desktop-wallpaper__image {
+  z-index: 0;
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  image-rendering: pixelated;
+  object-position: center;
 }
 
-.cloud-background [data-cloud-fallback] {
-  visibility: visible;
+.desktop-wallpaper__mask {
+  z-index: 1;
+  display: none;
+  background: rgb(0 0 0);
+  opacity: 0;
 }
 
-.cloud-background canvas {
-  visibility: hidden;
+.desktop-wallpaper--custom .desktop-wallpaper__mask {
+  display: block;
 }
 
-.cloud-background[data-cloud-state="ready"] [data-cloud-fallback] {
-  visibility: hidden;
+.desktop-wallpaper--custom.desktop-wallpaper--fit-cover .desktop-wallpaper__image {
+  object-fit: cover;
 }
 
-.cloud-background[data-cloud-state="ready"] canvas[data-ready] {
-  visibility: visible;
+.desktop-wallpaper--custom.desktop-wallpaper--fit-contain .desktop-wallpaper__image {
+  object-fit: contain;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--fit-stretch .desktop-wallpaper__image {
+  object-fit: fill;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--fit-tile .desktop-wallpaper__image-layer {
+  background-position: 0 0;
+  background-repeat: repeat;
+  background-size: auto;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--fit-tile .desktop-wallpaper__image {
+  display: none;
+}
+
+.desktop-wallpaper--position-top-left .desktop-wallpaper__image {
+  object-position: left top;
+}
+
+.desktop-wallpaper--position-top .desktop-wallpaper__image {
+  object-position: center top;
+}
+
+.desktop-wallpaper--position-top-right .desktop-wallpaper__image {
+  object-position: right top;
+}
+
+.desktop-wallpaper--position-left .desktop-wallpaper__image {
+  object-position: left center;
+}
+
+.desktop-wallpaper--position-center .desktop-wallpaper__image {
+  object-position: center;
+}
+
+.desktop-wallpaper--position-right .desktop-wallpaper__image {
+  object-position: right center;
+}
+
+.desktop-wallpaper--position-bottom-left .desktop-wallpaper__image {
+  object-position: left bottom;
+}
+
+.desktop-wallpaper--position-bottom .desktop-wallpaper__image {
+  object-position: center bottom;
+}
+
+.desktop-wallpaper--position-bottom-right .desktop-wallpaper__image {
+  object-position: right bottom;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-tone-dark .desktop-wallpaper__mask {
+  background: rgb(0 0 0);
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-tone-light .desktop-wallpaper__mask {
+  background: rgb(255 255 255);
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-0 .desktop-wallpaper__mask {
+  opacity: 0;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-5 .desktop-wallpaper__mask {
+  opacity: 0.05;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-10 .desktop-wallpaper__mask {
+  opacity: 0.1;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-15 .desktop-wallpaper__mask {
+  opacity: 0.15;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-20 .desktop-wallpaper__mask {
+  opacity: 0.2;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-25 .desktop-wallpaper__mask {
+  opacity: 0.25;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-30 .desktop-wallpaper__mask {
+  opacity: 0.3;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-35 .desktop-wallpaper__mask {
+  opacity: 0.35;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-40 .desktop-wallpaper__mask {
+  opacity: 0.4;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-45 .desktop-wallpaper__mask {
+  opacity: 0.45;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-50 .desktop-wallpaper__mask {
+  opacity: 0.5;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-55 .desktop-wallpaper__mask {
+  opacity: 0.55;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-60 .desktop-wallpaper__mask {
+  opacity: 0.6;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-65 .desktop-wallpaper__mask {
+  opacity: 0.65;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-70 .desktop-wallpaper__mask {
+  opacity: 0.7;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-75 .desktop-wallpaper__mask {
+  opacity: 0.75;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--mask-strength-80 .desktop-wallpaper__mask {
+  opacity: 0.8;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--blur-off .desktop-wallpaper__image-layer {
+  inset: 0;
+  filter: none;
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--blur-soft .desktop-wallpaper__image-layer {
+  inset: -4px;
+  filter: blur(4px);
+}
+
+.desktop-wallpaper--custom.desktop-wallpaper--blur-medium .desktop-wallpaper__image-layer {
+  inset: -10px;
+  filter: blur(10px);
 }
 
 .desktop-icons {
@@ -80,6 +270,28 @@
   box-shadow: var(--imageweave-small-shadow);
 }
 
+.desktop-wallpaper--custom ~ .desktop-icons .desktop-icon {
+  background: var(--imageweave-surface);
+  box-shadow: 0 0 0 1px var(--imageweave-surface), var(--imageweave-small-shadow);
+}
+
+.desktop-wallpaper--custom ~ .desktop-icons .desktop-icon .application-label {
+  text-shadow:
+    -1px 0 0 var(--imageweave-surface),
+    1px 0 0 var(--imageweave-surface),
+    0 -1px 0 var(--imageweave-surface),
+    0 1px 0 var(--imageweave-surface);
+}
+
+.desktop-wallpaper--custom ~ .desktop-icons .desktop-icon:hover,
+.desktop-wallpaper--custom ~ .desktop-icons .desktop-icon:focus-visible,
+.desktop-wallpaper--custom ~ .desktop-icons .desktop-icon[aria-current="page"] {
+  border-color: var(--imageweave-accent);
+  outline: var(--imageweave-focus-width) solid var(--imageweave-surface);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 5px var(--imageweave-accent), var(--imageweave-small-shadow);
+}
+
 .desktop-icon .application-label {
   max-width: 100%;
   overflow-wrap: anywhere;
@@ -102,6 +314,20 @@
   background: var(--imageweave-surface);
   box-shadow: var(--imageweave-hard-shadow);
   transform: translate(-50%, -50%);
+}
+
+.application-window--opacity-solid {
+  background: var(--imageweave-surface);
+}
+
+.application-window--opacity-subtle {
+  background: var(--imageweave-surface);
+  background: color-mix(in srgb, var(--imageweave-surface) 96%, transparent);
+}
+
+.application-window--opacity-soft {
+  background: var(--imageweave-surface);
+  background: color-mix(in srgb, var(--imageweave-surface) 92%, transparent);
 }
 
 .application-window[data-maximized] {
@@ -275,4 +501,13 @@
   align-items: center;
   margin-left: auto;
   white-space: nowrap;
+}
+
+@media (forced-colors: active), (prefers-contrast: more) {
+  .application-window,
+  .application-window--opacity-solid,
+  .application-window--opacity-subtle,
+  .application-window--opacity-soft {
+    background: var(--imageweave-surface) !important;
+  }
 }

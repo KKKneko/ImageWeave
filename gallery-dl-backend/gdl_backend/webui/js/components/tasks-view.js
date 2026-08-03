@@ -52,17 +52,17 @@ function buildDom(context) {
   });
   const errorHost = createElement("div", { className: "tasks-error-host", dataset: { tasksError: "" } });
   const actionsRow = createElement("div", { className: "tasks-actions" }, [
-    button("load", "载入批次", { primary: true }),
-    button("refresh", "立即刷新"),
-    button("retry", "补齐失败下载"),
-    button("rerun", "重新爬取"),
+    button("load", "查看批次", { primary: true }),
+    button("refresh", "刷新"),
+    button("retry", "重试未完成项"),
+    button("rerun", "重新规划"),
     button("cancel", "取消批次", { dangerous: true }),
   ]);
   const emptyHost = createElement("div", { dataset: { tasksEmpty: "" } });
   const metricsHost = createElement("div", { className: "tasks-metrics", dataset: { tasksMetrics: "" } });
   const progress = createElement("progress", {
     className: "tasks-progress",
-    attributes: { max: "100", value: "0", "aria-label": "批次任务进度" },
+    attributes: { max: "100", value: "0", "aria-label": "批次进度" },
     dataset: { tasksProgress: "" },
   });
   const progressText = createElement("p", { className: "tasks-progress-text", dataset: { tasksProgressText: "" } });
@@ -104,10 +104,10 @@ function buildDom(context) {
     createElement("header", { className: "app-header tasks-app-header" }, [
       createElement("p", { className: "app-executable", text: app.windowTitle }),
       createElement("h1", { text: app.label, attributes: { id: headingId } }),
-      createStatusBadge("running", "应用级自动刷新"),
+      createStatusBadge("running", "自动刷新"),
       createElement("p", {
         className: "app-summary",
-        text: "批次级取消、补齐失败和重新规划均使用后端真实状态机；没有单任务强制操作。",
+        text: "查看批次进度，并可取消批次、重试未完成项或重新规划。暂不支持操作单个任务。",
       }),
     ]),
     errorHost,
@@ -116,9 +116,9 @@ function buildDom(context) {
       createElement("div", { className: "tasks-panel-heading" }, [
         createElement("div", {}, [
           createElement("h2", { text: "最近批次", attributes: { id: "tasks-picker-title" } }),
-          createElement("p", { text: "只保存后端生成的 active batch ID 到受限会话键。" }),
+          createElement("p", { text: "选择最近批次查看状态和任务详情。" }),
         ]),
-        createStatusBadge("running", "活动批次 1.5 秒刷新"),
+        createStatusBadge("running", "每 1.5 秒自动刷新"),
       ]),
       createElement("div", { className: "tasks-picker-row" }, [recent, actionsRow]),
     ]),
@@ -147,7 +147,7 @@ function renderSources(elements, batch) {
     ]);
     if (!source.addresses.length) {
       card.append(createEmptyState({
-        label: "暂无地址", title: "来源地址尚未建立", message: "批次规划后会显示安全摘要。",
+        label: "暂无地址", title: "来源地址尚未建立", message: "批次开始规划后会显示摘要。",
       }));
     }
     for (const address of source.addresses) {
@@ -158,7 +158,7 @@ function renderSources(elements, batch) {
       ];
       if (address.preDedupSkippedCount) facts.push(`预去重 ${address.preDedupSkippedCount}`);
       if (address.probedProxyCount) facts.push(`代理 ${address.healthyProxyCount}/${address.probedProxyCount}`);
-      if (address.hasPlanningIssue) facts.push("存在受控规划错误");
+      if (address.hasPlanningIssue) facts.push("规划异常");
       card.append(createElement("div", {
         className: `tasks-address${batch.current?.addressId === address.id ? " tasks-address--current" : ""}`,
       }, [
@@ -183,8 +183,8 @@ function renderTasks(elements, batch, tasks) {
   if (!tasks.length) {
     elements.taskHost.replaceChildren(createEmptyState({
       label: batch.current?.status === "planning" ? "正在规划" : "暂无任务",
-      title: batch.current?.status === "planning" ? "正在枚举当前地址图片" : "当前还没有图片任务",
-      message: "任务建立后会显示顺序、来源、状态与尝试次数；原始 URL 和任务载荷不会进入 DOM。",
+      title: batch.current?.status === "planning" ? "正在查找当前地址中的图片" : "暂无图片任务",
+      message: "任务建立后会显示顺序、来源、状态和尝试次数。",
     }));
     return;
   }
@@ -202,7 +202,7 @@ function renderTasks(elements, batch, tasks) {
         ? "需要重新授权"
         : task.errorClass.includes("proxy")
           ? "需要检查代理"
-          : `受控错误：${task.errorClass}`
+          : `错误类型：${task.errorClass}`
       : task.artifactCount
         ? `已记录 ${task.artifactCount} 个文件`
         : "—";
@@ -240,10 +240,10 @@ export function createTasksView(context) {
       statusLabel: guidance.title,
       nextStep: guidance.nextStep,
       actionLabel: guidance.targetApp === "vault"
-        ? "打开 VAULT.CPL"
+        ? "打开授权管理"
         : guidance.targetApp === "proxy"
-          ? "打开 PROXY.CPL"
-          : "打开 DIAG.EXE",
+          ? "打开代理管理"
+          : "打开系统诊断",
       onAction: () => actions.navigateToApp(guidance.targetApp),
     });
     elements.errorHost.replaceChildren(renderedError.element);
@@ -272,23 +272,23 @@ export function createTasksView(context) {
     if (targets.authSites.length) {
       notices.push(createElement("section", { className: "tasks-recovery-card" }, [
         createStatusBadge("warning", `${targets.authSites.length} 个来源需要授权`),
-        createElement("p", { text: "任务只暴露 authentication 分类，不显示 Cookie、Token 或原始错误。" }),
-        button("open-vault", "打开 VAULT.CPL", { small: true }),
+        createElement("p", { text: "仅显示授权问题类型，不展示 Cookie、Token 或原始错误。" }),
+        button("open-vault", "打开授权管理", { small: true }),
       ]));
     }
     if (targets.proxyIssue) {
       notices.push(createElement("section", { className: "tasks-recovery-card" }, [
         createStatusBadge("warning", "检测到代理类失败"),
-        createElement("p", { text: "先检查代理池，再使用批次级补齐；不会强制中断租约。" }),
-        button("open-proxy", "打开 PROXY.CPL", { small: true }),
+        createElement("p", { text: "请先检查代理池，再重试未完成项；正在运行的任务不会被中断。" }),
+        button("open-proxy", "打开代理管理", { small: true }),
       ]));
     }
     if (batch.status === "completed_with_errors") {
       notices.push(createElement("section", { className: "tasks-recovery-card" }, [
         createStatusBadge("warning", "批次部分失败"),
         createElement("p", { text: batch.resumable
-          ? "可使用“补齐失败下载”恢复；成功文件会跳过。"
-          : "后端当前未标记可恢复，请刷新权威状态后决定下一步。" }),
+          ? "可使用“重试未完成项”恢复；已完成文件会跳过。"
+          : "当前没有可恢复项，请刷新最新状态后再决定下一步。" }),
       ]));
     }
     elements.recoveryHost.replaceChildren(...notices);
@@ -304,8 +304,8 @@ export function createTasksView(context) {
       createStatusBadge(review.kind, review.label),
       createElement("p", { text: review.status === "ready"
         ? `待审核 ${review.totalGroupCount} 组；已确认 ${review.decidedGroupCount} 组。`
-        : "审核状态由 REVIEW.EXE 独立读取和轮询。" }),
-      button("open-review", "在 REVIEW.EXE 中打开", { primary: true }),
+        : "审核状态由去重审核页单独更新。" }),
+      button("open-review", "打开去重审核", { primary: true }),
     ]));
   };
 
@@ -316,19 +316,19 @@ export function createTasksView(context) {
     elements.workspace.hidden = !batch;
     elements.emptyHost.replaceChildren(...(!batch ? [createEmptyState({
       label: "尚未选择批次",
-      title: "从最近批次载入，或先在 CRAWL.EXE 创建",
-      message: "切换、最小化或隐藏页面时不会继续应用级轮询。",
+      title: "从最近批次中选择，或先在图片采集页创建",
+      message: "离开页面后将暂停自动刷新。",
     })] : []));
     if (!batch) return;
     updateStatusBadge(elements.headerBadge, batch.statusKind, batch.statusLabel);
     const progress = batchProgress(batch);
     elements.progress.value = progress.percent;
-    elements.progressText.textContent = `${progress.terminal} / ${progress.total} 个任务终态 · ${progress.percent}%`;
+    elements.progressText.textContent = `${progress.terminal} / ${progress.total} 个任务已结束 · ${progress.percent}%`;
     elements.metricsHost.replaceChildren(
       metric("批次 ID", shortBatchId(batch.id)),
       metric("当前地址", batch.current ? `${SITE_LABELS[batch.current.site] || batch.current.site} · ${batch.current.statusLabel}` : "—"),
       metric("成功 / 失败 / 取消", `${batch.succeededTaskCount} / ${batch.failedTaskCount} / ${batch.cancelledTaskCount}`),
-      metric("图片并发", batch.concurrency || "—"),
+      metric("并发数", batch.concurrency || "—"),
       metric("预去重跳过", batch.preDedupSkippedCount),
     );
     renderSources(elements, batch);
@@ -356,14 +356,14 @@ export function createTasksView(context) {
         control.disabled = Boolean(kind);
       }
       const labels = {
-        load: "正在载入…", refresh: "正在刷新…", retry: "正在补齐…",
+        load: "正在加载…", refresh: "正在刷新…", retry: "正在重试…",
         rerun: "正在重新规划…", cancel: "正在取消…",
       };
       for (const [action, label] of Object.entries(labels)) {
         const control = findButton(elements, action);
         control.textContent = kind === action ? label : {
-          load: "载入批次", refresh: "立即刷新", retry: "补齐失败下载",
-          rerun: "重新爬取", cancel: "取消批次",
+          load: "查看批次", refresh: "刷新", retry: "重试未完成项",
+          rerun: "重新规划", cancel: "取消批次",
         }[action];
       }
       render(store.getState().batches);

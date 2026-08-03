@@ -1,8 +1,6 @@
 :root {
-  --imageweave-hue: 345;
-  --imageweave-accent: #a43d63;
-  --imageweave-accent: oklch(0.55 0.12 var(--imageweave-hue));
-  --imageweave-surface: #fff;
+  --imageweave-accent: #46515D;
+  --imageweave-surface: #F4F1EA;
   --imageweave-border-width: 2px;
   --imageweave-hard-shadow: 5px 5px 0 var(--imageweave-accent);
   --imageweave-small-shadow: 3px 3px 0 var(--imageweave-accent);
@@ -15,4 +13,21 @@
   background: var(--imageweave-surface);
   font-family: "Cascadia Mono", "SFMono-Regular", Consolas, "Microsoft YaHei UI", monospace;
   font-synthesis: none;
+}
+
+:root[data-theme-tone="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme-tone="dark"] {
+  color-scheme: dark;
+}
+
+@media (forced-colors: active) {
+  :root {
+    --imageweave-accent: CanvasText !important;
+    --imageweave-surface: Canvas !important;
+    color: CanvasText;
+    background: Canvas;
+  }
 }

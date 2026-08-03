@@ -44,15 +44,6 @@ const CONFIG_KEYS = Object.freeze([
   "retry_limit",
   "backoff_base_seconds",
   "proxy_mode",
-  "probe_url",
-  "probe_before_use",
-  "node_tags",
-  "http_timeout",
-  "gallery_retries",
-  "task_timeout_seconds",
-  "download_stall_timeout_seconds",
-  "eh_download",
-  "extra_args",
 ]);
 const CONFIG_KEY_SET = new Set(CONFIG_KEYS);
 const PROXY_MODES = new Set(["direct", "prefer", "required"]);
@@ -76,48 +67,25 @@ const CONCURRENCY_PROTECTIONS = new Set(["none"]);
 const DEFAULT_SOURCES = new Set(["startup_snapshot"]);
 const PERSISTENCE_KINDS = new Set(["sqlite_atomic"]);
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
-const ABSOLUTE_PATH = /(?:^|[\s=])(?:[A-Za-z]:[\\/]|\/[^/\s]|\\\\[^\\\s]+\\)/;
-const URL_LIKE = /[a-z][a-z0-9+.-]*:\/\//i;
-const SENSITIVE_ASSIGNMENT = /(?:^|[^a-z0-9_])(?:token|cookie|password|secret|authorization|api[_-]?key)\s*[:=]/i;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 export const POLICY_SITE_IDS = SITE_ORDER;
 export const POLICY_LIMITS = Object.freeze({
   requestBytes: 16 * 1024,
-  probeUrlLength: 2048,
-  nodeTagCount: 32,
-  nodeTagLength: 64,
-  extraArgCount: 128,
-  extraArgLength: 512,
-  extraArgsTotalChars: 8192,
 });
 
 const NUMERIC_RULES = Object.freeze({
   max_concurrency: Object.freeze({ minimum: 1, maximum: 128, integer: true }),
   retry_limit: Object.freeze({ minimum: 0, maximum: 20, integer: true }),
   backoff_base_seconds: Object.freeze({ minimum: 0, maximum: 3600, integer: false }),
-  http_timeout: Object.freeze({ minimum: 1, maximum: 3600, integer: false }),
-  gallery_retries: Object.freeze({ minimum: 0, maximum: 50, integer: true }),
-  task_timeout_seconds: Object.freeze({ minimum: 0, maximum: 604800, integer: false }),
-  download_stall_timeout_seconds: Object.freeze({ minimum: 0, maximum: 604800, integer: false }),
 });
 
 const FIELD_LABELS = Object.freeze({
-  policy: "策略",
-  max_concurrency: "最大并发",
+  policy: "站点设置",
+  max_concurrency: "最大并发数",
   retry_limit: "重试次数",
-  backoff_base_seconds: "退避基数",
-  proxy_mode: "默认代理模式",
-  probe_url: "HTTPS 探活地址",
-  probe_before_use: "使用前探活",
-  node_tags: "节点标签",
-  http_timeout: "HTTP 超时",
-  gallery_retries: "gallery-dl 重试",
-  task_timeout_seconds: "任务总超时",
-  download_stall_timeout_seconds: "EH 无进展超时",
-  eh_download: "EH 下载默认值",
-  extra_args: "额外 gallery-dl 参数",
+  backoff_base_seconds: "首次重试等待",
+  proxy_mode: "连接方式",
 });
 
 function isRecord(value) {
@@ -137,10 +105,6 @@ function hasOnlyKeys(value, allowed) {
 
 function hasDangerousOwnKey(value) {
   return isRecord(value) && Object.keys(value).some((key) => DANGEROUS_KEYS.has(key));
-}
-
-function codePointLength(value) {
-  return [...value].length;
 }
 
 function exactBoolean(value, label) {
@@ -171,93 +135,19 @@ function safeErrorCode(value) {
 }
 
 export class PolicyValidationError extends TypeError {
-  constructor(field, reason, { index = null } = {}) {
+  constructor(field, reason) {
     const safeField = CONFIG_KEY_SET.has(field) ? field : "policy";
     const safeReason = typeof reason === "string" && /^[a-z0-9_.:-]{1,64}$/i.test(reason)
       ? reason
       : "invalid_value";
-    super(`${FIELD_LABELS[safeField] || "策略字段"}无效`);
+    super(`${FIELD_LABELS[safeField] || "站点设置"}无效`);
     this.name = "PolicyValidationError";
     this.code = "invalid_policy_draft";
     this.status = 0;
     this.field = safeField;
     this.reason = safeReason;
-    this.index = Number.isInteger(index) && index >= 0 ? index : null;
+    this.index = null;
   }
-}
-
-function validateSafeText(value, {
-  field,
-  index = null,
-  maximum,
-  rejectUrls = true,
-} = {}) {
-  if (typeof value !== "string") throw new PolicyValidationError(field, "not_text", { index });
-  if (CONTROL_CHARACTERS.test(value)) {
-    throw new PolicyValidationError(field, "control_characters", { index });
-  }
-  if (codePointLength(value) > maximum) {
-    throw new PolicyValidationError(field, "too_long", { index });
-  }
-  if (ABSOLUTE_PATH.test(value)) {
-    throw new PolicyValidationError(field, "absolute_path", { index });
-  }
-  if (rejectUrls && URL_LIKE.test(value)) {
-    throw new PolicyValidationError(field, "url_not_allowed", { index });
-  }
-  if (SENSITIVE_ASSIGNMENT.test(value)) {
-    throw new PolicyValidationError(field, "sensitive_assignment", { index });
-  }
-  return value;
-}
-
-function privateIpv4(host) {
-  const parts = host.split(".");
-  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return false;
-  const octets = parts.map(Number);
-  if (octets.some((part) => part > 255)) return true;
-  return octets[0] === 10 || octets[0] === 127 || octets[0] === 0 ||
-    (octets[0] === 169 && octets[1] === 254) ||
-    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-    (octets[0] === 192 && octets[1] === 168) ||
-    octets[0] >= 224;
-}
-
-function validateProbeUrl(value) {
-  if (value === null) return null;
-  if (typeof value !== "string") throw new PolicyValidationError("probe_url", "not_text");
-  const text = value.trim();
-  if (!text) return null;
-  validateSafeText(text, {
-    field: "probe_url",
-    maximum: POLICY_LIMITS.probeUrlLength,
-    rejectUrls: false,
-  });
-  if (/\s/.test(text)) throw new PolicyValidationError("probe_url", "control_characters");
-  let parsed;
-  try {
-    parsed = new URL(text);
-  } catch {
-    throw new PolicyValidationError("probe_url", "url_host_invalid");
-  }
-  if (parsed.protocol !== "https:" || !parsed.hostname) {
-    throw new PolicyValidationError("probe_url", "url_host_invalid");
-  }
-  if (parsed.username || parsed.password || text.slice(text.indexOf("://") + 3).includes("@")) {
-    throw new PolicyValidationError("probe_url", "url_credentials");
-  }
-  if (parsed.search || parsed.hash) {
-    throw new PolicyValidationError("probe_url", "url_query_or_fragment");
-  }
-  const host = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-  if (
-    host === "localhost" || host === "localhost.localdomain" || host.endsWith(".local") ||
-    privateIpv4(host) || host === "::1" || host === "::" || /^f[cd][0-9a-f:]*$/i.test(host) ||
-    /^fe[89ab][0-9a-f:]*$/i.test(host)
-  ) {
-    throw new PolicyValidationError("probe_url", "url_target_forbidden");
-  }
-  return text;
 }
 
 function numericValue(value, field, { allowString = false } = {}) {
@@ -279,86 +169,20 @@ function numericValue(value, field, { allowString = false } = {}) {
   return value;
 }
 
-function inputLines(value, field) {
-  if (typeof value === "string") return value.split(/\r?\n/);
-  if (Array.isArray(value)) return [...value];
-  throw new PolicyValidationError(field, "not_list");
-}
-
-export function normalizePolicyLines(value, kind) {
-  if (kind !== "node_tags" && kind !== "extra_args") {
-    throw new TypeError("未知 POLICY 逐行字段");
-  }
-  const lines = inputLines(value, kind);
-  const maximumCount = kind === "node_tags"
-    ? POLICY_LIMITS.nodeTagCount
-    : POLICY_LIMITS.extraArgCount;
-  const maximumLength = kind === "node_tags"
-    ? POLICY_LIMITS.nodeTagLength
-    : POLICY_LIMITS.extraArgLength;
-  const items = [];
-  const seen = new Set();
-  let duplicatesRemoved = 0;
-  let totalChars = 0;
-
-  for (let sourceIndex = 0; sourceIndex < lines.length; sourceIndex += 1) {
-    const raw = lines[sourceIndex];
-    if (typeof raw !== "string") {
-      throw new PolicyValidationError(kind, "not_text", { index: sourceIndex });
-    }
-    if (!raw.trim()) continue;
-    const item = kind === "node_tags" ? raw.trim().toLowerCase() : raw;
-    validateSafeText(item, {
-      field: kind,
-      index: sourceIndex,
-      maximum: maximumLength,
-    });
-    totalChars += codePointLength(item);
-    if (kind === "node_tags") {
-      if (seen.has(item)) {
-        duplicatesRemoved += 1;
-        continue;
-      }
-      seen.add(item);
-    }
-    items.push(item);
-    if (items.length > maximumCount) {
-      throw new PolicyValidationError(kind, "too_many_items", { index: sourceIndex });
-    }
-  }
-  if (kind === "extra_args" && totalChars > POLICY_LIMITS.extraArgsTotalChars) {
-    throw new PolicyValidationError(kind, "total_too_large");
-  }
-  return Object.freeze({ items, duplicatesRemoved });
-}
-
-function normalizeEhDownload(value) {
-  if (value === null) return null;
-  const options = requireRecord(value, "EH 下载策略");
-  if (hasDangerousOwnKey(options)) throw new PolicyValidationError("eh_download", "dangerous_key");
-  const imageMode = options.image_mode;
-  const gpPolicy = options.gp_policy;
-  if (!new Set(["original", "resample"]).has(imageMode) ||
-      !new Set(["stop", "resized"]).has(gpPolicy)) {
-    throw new PolicyValidationError("eh_download", "invalid_enum");
-  }
-  return { image_mode: imageMode, gp_policy: gpPolicy };
-}
-
 function normalizePolicyConfig(value, { allowStringNumbers = false } = {}) {
-  const policy = requireRecord(value, "站点策略");
+  const policy = requireRecord(value, "站点设置");
   if (hasDangerousOwnKey(policy)) throw new PolicyValidationError("policy", "dangerous_key");
+  if (!hasOnlyKeys(policy, CONFIG_KEY_SET)) {
+    throw new PolicyValidationError("policy", "unknown_field");
+  }
   for (const key of CONFIG_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(policy, key)) {
       throw new PolicyValidationError(key, "missing_field");
     }
   }
-  const proxyMode = policy.proxy_mode;
-  if (typeof proxyMode !== "string" || !PROXY_MODES.has(proxyMode)) {
+  if (typeof policy.proxy_mode !== "string" || !PROXY_MODES.has(policy.proxy_mode)) {
     throw new PolicyValidationError("proxy_mode", "invalid_enum");
   }
-  const nodeTags = normalizePolicyLines(policy.node_tags, "node_tags");
-  const extraArgs = normalizePolicyLines(policy.extra_args, "extra_args");
   return {
     max_concurrency: numericValue(policy.max_concurrency, "max_concurrency", {
       allowString: allowStringNumbers,
@@ -369,26 +193,7 @@ function normalizePolicyConfig(value, { allowStringNumbers = false } = {}) {
     backoff_base_seconds: numericValue(policy.backoff_base_seconds, "backoff_base_seconds", {
       allowString: allowStringNumbers,
     }),
-    proxy_mode: proxyMode,
-    probe_url: validateProbeUrl(policy.probe_url),
-    probe_before_use: exactBoolean(policy.probe_before_use, "使用前探活"),
-    node_tags: nodeTags.items,
-    http_timeout: numericValue(policy.http_timeout, "http_timeout", {
-      allowString: allowStringNumbers,
-    }),
-    gallery_retries: numericValue(policy.gallery_retries, "gallery_retries", {
-      allowString: allowStringNumbers,
-    }),
-    task_timeout_seconds: numericValue(policy.task_timeout_seconds, "task_timeout_seconds", {
-      allowString: allowStringNumbers,
-    }),
-    download_stall_timeout_seconds: numericValue(
-      policy.download_stall_timeout_seconds,
-      "download_stall_timeout_seconds",
-      { allowString: allowStringNumbers },
-    ),
-    eh_download: normalizeEhDownload(policy.eh_download),
-    extra_args: extraArgs.items,
+    proxy_mode: policy.proxy_mode,
   };
 }
 
@@ -467,17 +272,17 @@ function unavailablePolicyItem(siteId) {
 }
 
 export function sanitizePolicyResponse(value) {
-  const snapshot = requireRecord(value, "POLICY 响应");
-  if (hasDangerousOwnKey(snapshot)) throw new TypeError("POLICY 响应包含危险键");
+  const snapshot = requireRecord(value, "站点设置响应");
+  if (hasDangerousOwnKey(snapshot)) throw new TypeError("站点设置响应包含危险键");
   if (snapshot.response_profile !== "policy" || snapshot.secrets_exposed !== false) {
-    throw new TypeError("后端未返回 POLICY 安全投影");
+    throw new TypeError("服务没有返回可用的站点设置");
   }
   if (!EFFECT_SCOPES.has(snapshot.effect_scope) ||
       !CONCURRENCY_PROTECTIONS.has(snapshot.concurrency_protection) ||
       !DEFAULT_SOURCES.has(snapshot.default_source) ||
       !PERSISTENCE_KINDS.has(snapshot.persistence) ||
       !Array.isArray(snapshot.items)) {
-    throw new TypeError("POLICY 契约元数据无效");
+    throw new TypeError("站点设置响应格式无效");
   }
 
   const defaultState = sanitizePolicyState(snapshot.default, "unsafe_default_policy");
@@ -525,31 +330,31 @@ const SNAPSHOT_VIEW_KEYS = new Set([
 ]);
 
 function validatePolicyConfigView(value) {
-  const config = requireRecord(value, "POLICY config view model");
-  if (!hasOnlyKeys(config, POLICY_VIEW_KEYS)) throw new TypeError("POLICY config 包含未知字段");
+  const config = requireRecord(value, "站点设置数据");
+  if (!hasOnlyKeys(config, POLICY_VIEW_KEYS)) throw new TypeError("站点设置包含未知字段");
   return normalizePolicyConfig(config);
 }
 
 function validatePolicyItemView(value) {
-  const item = requireRecord(value, "POLICY 来源 view model");
-  if (!hasOnlyKeys(item, ITEM_VIEW_KEYS)) throw new TypeError("POLICY 来源包含未知字段");
+  const item = requireRecord(value, "站点设置项目");
+  if (!hasOnlyKeys(item, ITEM_VIEW_KEYS)) throw new TypeError("站点设置项目包含未知字段");
   const definition = SITE_DEFINITIONS[item.site];
   if (!definition || item.label !== definition.label || item.mark !== definition.mark ||
       item.authorization !== definition.authorization || !AUTHORIZATION_KINDS.has(item.authorization)) {
-    throw new TypeError("POLICY 来源标识无效");
+    throw new TypeError("站点标识无效");
   }
   if (!SELECTION_MODES.has(item.selectionMode) || !AVAILABILITY_MODES.has(item.availability) ||
       !ITEM_REASONS.has(item.reason)) {
-    throw new TypeError("POLICY 来源能力无效");
+    throw new TypeError("站点状态无效");
   }
-  const inherited = exactBoolean(item.inherited, "继承状态");
-  const hasOverride = exactBoolean(item.hasOverride, "覆盖状态");
-  if (inherited === hasOverride) throw new TypeError("POLICY 覆盖状态矛盾");
+  const inherited = exactBoolean(item.inherited, "默认状态");
+  const hasOverride = exactBoolean(item.hasOverride, "单独设置状态");
+  if (inherited === hasOverride) throw new TypeError("站点设置状态矛盾");
   const editable = exactBoolean(item.editable, "可编辑状态");
   let policy = null;
   if (item.policy !== null) policy = validatePolicyConfigView(item.policy);
   if (editable !== Boolean(policy) || (editable && item.reason)) {
-    throw new TypeError("POLICY 可编辑状态无效");
+    throw new TypeError("站点可编辑状态无效");
   }
   return {
     site: definition.id,
@@ -569,34 +374,34 @@ function validatePolicyItemView(value) {
 }
 
 export function validatePolicySnapshot(value) {
-  const snapshot = requireRecord(value, "POLICY Store payload");
+  const snapshot = requireRecord(value, "站点设置数据");
   if (!hasOnlyKeys(snapshot, SNAPSHOT_VIEW_KEYS) || !(snapshot.bySite instanceof Map)) {
-    throw new TypeError("POLICY Store payload 无效");
+    throw new TypeError("站点设置数据无效");
   }
   const bySite = new Map();
   for (const [siteId, item] of snapshot.bySite) {
     if (!SITE_DEFINITIONS[siteId] || siteId !== item?.site || bySite.has(siteId)) {
-      throw new TypeError("POLICY Store 来源无效");
+      throw new TypeError("站点设置来源无效");
     }
     bySite.set(siteId, validatePolicyItemView(item));
   }
-  if (bySite.size !== SITE_ORDER.length) throw new TypeError("POLICY Store 来源不完整");
+  if (bySite.size !== SITE_ORDER.length) throw new TypeError("站点列表不完整");
   const defaultPolicy = snapshot.defaultPolicy === null
     ? null
     : validatePolicyConfigView(snapshot.defaultPolicy);
-  const defaultEditable = exactBoolean(snapshot.defaultEditable, "默认策略可编辑状态");
+  const defaultEditable = exactBoolean(snapshot.defaultEditable, "默认设置可编辑状态");
   if (defaultEditable !== Boolean(defaultPolicy) || !ITEM_REASONS.has(snapshot.defaultReason)) {
-    throw new TypeError("POLICY 默认策略状态无效");
+    throw new TypeError("默认设置状态无效");
   }
   if (!EFFECT_SCOPES.has(snapshot.effectScope) ||
       !CONCURRENCY_PROTECTIONS.has(snapshot.concurrencyProtection) ||
       !DEFAULT_SOURCES.has(snapshot.defaultSource) ||
       !PERSISTENCE_KINDS.has(snapshot.persistence)) {
-    throw new TypeError("POLICY Store 契约元数据无效");
+    throw new TypeError("站点设置数据格式无效");
   }
   if (!Number.isInteger(snapshot.unknownOverrideCount) || snapshot.unknownOverrideCount < 0 ||
       snapshot.unknownOverrideCount > 1_000_000) {
-    throw new TypeError("POLICY 未知覆盖计数无效");
+    throw new TypeError("站点设置计数无效");
   }
   return {
     bySite,
@@ -622,15 +427,6 @@ export function policyConfigToDraft(config) {
     retry_limit: String(normalized.retry_limit),
     backoff_base_seconds: String(normalized.backoff_base_seconds),
     proxy_mode: normalized.proxy_mode,
-    probe_url: normalized.probe_url || "",
-    probe_before_use: normalized.probe_before_use,
-    node_tags: normalized.node_tags.join("\n"),
-    http_timeout: String(normalized.http_timeout),
-    gallery_retries: String(normalized.gallery_retries),
-    task_timeout_seconds: String(normalized.task_timeout_seconds),
-    download_stall_timeout_seconds: String(normalized.download_stall_timeout_seconds),
-    eh_download: normalized.eh_download ? { ...normalized.eh_download } : null,
-    extra_args: normalized.extra_args.join("\n"),
   };
 }
 
@@ -641,15 +437,6 @@ export function buildPolicyPayload(draft) {
     retry_limit: normalized.retry_limit,
     backoff_base_seconds: normalized.backoff_base_seconds,
     proxy_mode: normalized.proxy_mode,
-    probe_url: normalized.probe_url,
-    probe_before_use: normalized.probe_before_use,
-    node_tags: [...normalized.node_tags],
-    http_timeout: normalized.http_timeout,
-    gallery_retries: normalized.gallery_retries,
-    task_timeout_seconds: normalized.task_timeout_seconds,
-    download_stall_timeout_seconds: normalized.download_stall_timeout_seconds,
-    eh_download: normalized.eh_download ? { ...normalized.eh_download } : null,
-    extra_args: [...normalized.extra_args],
   };
   const requestBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
   if (requestBytes > POLICY_LIMITS.requestBytes) {
@@ -683,14 +470,12 @@ export function isPolicyDirty(currentConfig, draft) {
 export function validatePolicyDraft(draft) {
   try {
     const payload = buildPolicyPayload(draft);
-    const tags = normalizePolicyLines(draft.node_tags, "node_tags");
     return Object.freeze({
       valid: true,
       payload,
       field: "",
       index: null,
       reason: "",
-      duplicateNodeTags: tags.duplicatesRemoved,
     });
   } catch (error) {
     const validation = error instanceof PolicyValidationError
@@ -700,9 +485,8 @@ export function validatePolicyDraft(draft) {
       valid: false,
       payload: null,
       field: validation.field,
-      index: validation.index,
+      index: null,
       reason: validation.reason,
-      duplicateNodeTags: 0,
     });
   }
 }
@@ -715,162 +499,131 @@ export function derivePolicyControls(item, {
   busy = "",
   dirty = false,
   valid = true,
-  conflict = false,
 } = {}) {
   const isBusy = Boolean(busy);
   const loaded = Boolean(item);
   const editable = Boolean(item?.editable);
-  const busyReason = "正在执行其他策略操作";
-  const conflictReason = "服务器配置可能已变化，请先刷新后重新编辑";
-  const readOnlyReason = item?.reason === "unsafe_stored_policy"
-    ? "现有覆盖含 UI 不会读取的危险值；只能恢复默认或在后端修复"
-    : "当前来源没有可安全编辑的策略投影";
+  const busyReason = "请等待当前操作完成";
+  const readOnlyReason = "当前站点设置暂时无法编辑";
   const saveReason = isBusy
     ? busyReason
-    : conflict
-      ? conflictReason
-      : !loaded
-        ? "请先加载策略"
-        : !editable
-          ? readOnlyReason
-          : !valid
-            ? "请修正表单校验错误"
-            : !dirty
-              ? "当前表单与服务器权威配置一致"
-              : "";
+    : !loaded
+      ? "请先等待设置加载"
+      : !editable
+        ? readOnlyReason
+        : !valid
+          ? "请先修正填写内容"
+          : !dirty
+            ? "当前内容没有变化"
+            : "";
   const resetReason = isBusy
     ? busyReason
-    : conflict
-      ? conflictReason
-      : !loaded
-        ? "请先加载策略"
-        : !item.hasOverride
-          ? "当前已经继承启动默认值"
-          : "";
-  const discardReason = isBusy
-    ? busyReason
-    : !dirty
-      ? "当前没有未保存更改"
-      : "";
+    : !loaded
+      ? "请先等待设置加载"
+      : !item.hasOverride && !dirty
+        ? "当前已使用默认设置"
+        : "";
   return Object.freeze({
-    save: control(Boolean(saveReason), saveReason, busy === "save" ? "正在保存…" : "保存站点覆盖"),
-    reset: control(Boolean(resetReason), resetReason, busy === "reset" ? "正在恢复…" : "恢复启动默认"),
-    discard: control(Boolean(discardReason), discardReason, "放弃未保存更改"),
-    refresh: control(isBusy, busyReason, busy === "refresh" ? "正在刷新…" : "手动刷新"),
-    siteSelect: control(isBusy, busyReason, "切换来源"),
-    vault: control(
-      isBusy || item?.authorization === "anonymous",
-      isBusy ? busyReason : "此来源不需要 VAULT 授权",
-      "打开 VAULT.CPL",
-    ),
+    save: control(Boolean(saveReason), saveReason, busy === "save" ? "正在保存…" : "保存设置"),
+    reset: control(Boolean(resetReason), resetReason, busy === "reset" ? "正在恢复…" : "恢复默认设置"),
+    siteSelect: control(isBusy, busyReason, "切换站点"),
   });
-}
-
-export function formatPolicyTime(value) {
-  const timestamp = safeTimestamp(value);
-  if (timestamp === null) return "继承值没有单独更新时间";
-  try {
-    return new Intl.DateTimeFormat("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-    }).format(new Date(timestamp * 1000));
-  } catch {
-    return "时间不可用";
-  }
 }
 
 export function formatPolicySource(item) {
   if (!item) return Object.freeze({
-    badge: Object.freeze({ status: "disabled", label: "策略待加载" }),
-    policyState: "未知",
-    support: "尚未加载",
-    enablement: "POLICY 不管理来源开关",
-    authorization: "尚未加载",
-    availability: "未探测",
-    updatedAt: "尚无记录",
+    badge: Object.freeze({ status: "disabled", label: "正在加载" }),
+    policyState: "正在加载",
   });
-  const authorization = {
-    anonymous: "无需登录材料",
-    managed_browser: "需要共享浏览器导出材料；状态请到 VAULT 查看",
-    oauth: "需要后端 OAuth 缓存；状态请到 VAULT 查看",
-    managed_browser_for_private_content: "E-Hentai 公开搜索可直连；ExHentai 私有内容需要共享浏览器材料",
-  }[item.authorization];
   const badge = !item.editable
-    ? { status: "error", label: "策略只读" }
+    ? { status: "error", label: "暂时无法设置" }
     : item.hasOverride
-      ? { status: "running", label: "站点覆盖生效" }
-      : { status: "ready", label: "继承启动默认" };
+      ? { status: "running", label: "自定义设置" }
+      : { status: "ready", label: "默认设置" };
   return Object.freeze({
     badge: Object.freeze(badge),
-    policyState: item.hasOverride ? "SQLite 站点覆盖" : "进程启动默认快照",
-    support: item.supported ? "后端聚合来源已支持" : "后端未声明支持",
-    enablement: "由每次搜索/批次请求选择；POLICY 没有启用开关",
-    authorization,
-    availability: "未执行远端探测；支持、授权与当前可用互不等价",
-    updatedAt: formatPolicyTime(item.updatedAt),
+    policyState: item.hasOverride ? "使用自定义设置" : "使用默认设置",
   });
 }
 
 const ERROR_GUIDANCE = Object.freeze({
   invalid_policy: Object.freeze({
-    title: "策略字段未通过校验",
-    message: "后端拒绝了当前站点策略；页面不会回显整份表单或原始 details。",
-    nextStep: "请按字段帮助与安全定位修正后重试。",
+    title: "设置有误",
+    message: "服务未接受本次站点设置。",
+    nextStep: "请检查标出的项目后再保存。",
   }),
   invalid_policy_draft: Object.freeze({
-    title: "表单字段无效",
-    message: "当前草稿没有发送到后端。",
-    nextStep: "请修正标记字段；危险输入不会进入 Store、Storage 或错误历史。",
+    title: "请修正设置",
+    message: "更改尚未发送。",
+    nextStep: "请修正标出的项目后再保存。",
   }),
   unsupported_policy_site: Object.freeze({
-    title: "来源不支持 POLICY 编辑",
-    message: "当前后端没有把该来源列入 POLICY 受控枚举。",
-    nextStep: "请手动刷新；不要通过地址栏构造未知来源。",
+    title: "该站点不支持自定义设置",
+    message: "当前版本不支持修改该站点。",
+    nextStep: "请刷新页面；如果仍然出现，请更新服务和界面版本。",
   }),
   site_policy_not_found: Object.freeze({
-    title: "站点覆盖已经不存在",
-    message: "该覆盖可能已在其他客户端删除。",
-    nextStep: "请刷新服务器权威配置后重新编辑。",
+    title: "已使用默认设置",
+    message: "该站点没有单独保存的设置。",
+    nextStep: "请刷新站点设置。",
   }),
   policy_request_too_large: Object.freeze({
-    title: "策略请求过大",
-    message: "请求超过 POLICY 专用大小上限。",
-    nextStep: "请减少节点标签或额外参数的数量/长度。",
+    title: "提交内容太大",
+    message: "服务拒绝了异常大的设置请求。",
+    nextStep: "请刷新页面后重试。",
   }),
   policy_store_error: Object.freeze({
-    title: "策略存储不可用",
-    message: "后端未确认 SQLite 原子事务完成。",
-    nextStep: "当前页面不会乐观标记成功；请检查磁盘与权限后手动刷新。",
+    title: "暂时无法保存设置",
+    message: "服务未确认本次修改已保存。",
+    nextStep: "修改已保留，请稍后重试。",
   }),
   invalid_content_length: Object.freeze({
-    title: "请求大小信息无效",
-    message: "后端拒绝了异常的 Content-Length。",
-    nextStep: "请刷新页面并重新编辑。",
+    title: "请求格式不正确",
+    message: "服务未接受请求大小信息。",
+    nextStep: "请刷新页面后重试。",
   }),
   network_error: Object.freeze({
-    title: "后端连接中断",
-    message: "POLICY 无法连接到 ImageWeave 后端。",
-    nextStep: "连接恢复后使用“手动刷新”，无需重载整个桌面。",
+    title: "无法连接服务",
+    message: "站点设置无法连接到 ImageWeave 服务。",
+    nextStep: "请确认服务正在运行，然后重试。",
   }),
   invalid_response: Object.freeze({
-    title: "策略响应未通过校验",
-    message: "页面拒绝采用包含未知、危险或不完整字段的响应。",
-    nextStep: "请刷新；若持续发生，请检查后端与桌面 WebUI 版本。",
+    title: "设置数据无效",
+    message: "页面未采用格式无效的服务数据。",
+    nextStep: "请刷新页面；如果仍然出现，请更新服务和界面版本。",
   }),
 });
 
 const SAFE_DETAIL_FIELDS = new Set([...CONFIG_KEYS, "policy"]);
 const SAFE_DETAIL_REASONS = /^[a-z0-9_.:-]{1,64}$/i;
+const SAFE_DETAIL_REASON_TEXT = Object.freeze({
+  missing_field: "缺少必填内容",
+  extra_forbidden: "包含不支持的项目",
+  int_type: "需要填写整数",
+  int_parsing: "需要填写整数",
+  float_type: "需要填写数字",
+  float_parsing: "需要填写数字",
+  greater_than_equal: "小于允许范围",
+  less_than_equal: "超过允许范围",
+  literal_error: "不是可选内容",
+  invalid_policy: "内容不正确",
+  invalid_enum: "不是可选内容",
+  not_number: "需要填写数字",
+  not_integer: "需要填写整数",
+  empty_number: "不能留空",
+  out_of_range: "超出允许范围",
+  unknown_field: "包含不支持的项目",
+  dangerous_key: "包含不安全的内容",
+  invalid_value: "内容不正确",
+});
+
+function safePolicyReasonText(reason) {
+  return SAFE_DETAIL_REASON_TEXT[reason] || "内容不正确";
+}
 
 export function safePolicyErrorDetail(error) {
   if (error instanceof PolicyValidationError) {
-    const index = error.index === null ? "" : `第 ${error.index + 1} 行，`;
-    return `${FIELD_LABELS[error.field] || "策略字段"}：${index}原因 ${error.reason}`;
+    return `${FIELD_LABELS[error.field] || "站点设置"}：${safePolicyReasonText(error.reason)}`;
   }
   const rawDetails = Array.isArray(error?.details)
     ? error.details[0]
@@ -882,16 +635,11 @@ export function safePolicyErrorDetail(error) {
   const reason = typeof rawDetails.reason === "string" && SAFE_DETAIL_REASONS.test(rawDetails.reason)
     ? rawDetails.reason
     : "";
-  const index = Number.isInteger(rawDetails.index) && rawDetails.index >= 0 &&
-    rawDetails.index < POLICY_LIMITS.extraArgCount
-    ? rawDetails.index
-    : null;
-  if (!field && !reason && index === null) return "";
+  if (!field && !reason) return "";
   const parts = [];
-  if (field) parts.push(FIELD_LABELS[field] || "策略字段");
-  if (index !== null) parts.push(`第 ${index + 1} 行`);
-  if (reason) parts.push(`原因 ${reason}`);
-  return parts.join(" · ");
+  if (field) parts.push(FIELD_LABELS[field] || "站点设置");
+  if (reason) parts.push(safePolicyReasonText(reason));
+  return parts.join("：");
 }
 
 export function policyErrorGuidance(error) {
@@ -902,15 +650,15 @@ export function policyErrorGuidance(error) {
   let guidance = ERROR_GUIDANCE[code];
   if (!guidance && (status === 401 || status === 403)) {
     guidance = {
-      title: "POLICY API 拒绝访问",
-      message: "后端拒绝了当前同源策略请求。",
-      nextStep: "请确认通过 /ui/ 访问并检查后端访问策略。",
+      title: "访问被拒绝",
+      message: "本次站点设置请求未通过。",
+      nextStep: "请从 ImageWeave 的 /ui/ 页面重新打开。",
     };
   } else if (!guidance && status === 409) {
     guidance = {
-      title: "服务器策略状态冲突",
-      message: "后端没有接受当前写入。",
-      nextStep: "请刷新服务器权威配置后重新编辑；页面不会自动覆盖。",
+      title: "设置已更新",
+      message: "服务未接受本次修改。",
+      nextStep: "请刷新最新设置，核对后重新保存。",
     };
   } else if (!guidance && status === 413) {
     guidance = ERROR_GUIDANCE.policy_request_too_large;
@@ -918,15 +666,15 @@ export function policyErrorGuidance(error) {
     guidance = ERROR_GUIDANCE.invalid_policy;
   } else if (!guidance && status >= 500) {
     guidance = {
-      title: "策略后端暂时不可用",
-      message: "后端未完成本次 POLICY 操作。",
-      nextStep: "保留当前页面并稍后手动刷新；DIAG.EXE 尚未迁移，当前请检查后端日志。",
+      title: "服务暂时不可用",
+      message: "本次站点设置没有完成。",
+      nextStep: "修改已保留，请稍后重试。",
     };
   } else if (!guidance) {
     guidance = {
-      title: "策略操作未完成",
-      message: "本次 POLICY 操作没有完成。",
-      nextStep: "请手动刷新后重试；页面不会渲染原始错误 details。",
+      title: "操作失败",
+      message: "本次站点设置没有完成。",
+      nextStep: "请稍后重试。",
     };
   }
   return Object.freeze({

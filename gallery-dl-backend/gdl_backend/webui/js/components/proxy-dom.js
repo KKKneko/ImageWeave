@@ -2,8 +2,8 @@ import { createElement } from "../core/dom.js";
 import { createStatusBadge } from "./status.js";
 
 const SOURCE_LABELS = Object.freeze({
-  config: "config 基线",
-  runtime: "runtime 托管覆盖",
+  config: "配置文件默认值",
+  runtime: "界面自定义配置",
   none: "未配置",
 });
 
@@ -103,7 +103,7 @@ function createSourceForm({ kind, label, help, inputTag = "input", inputAttribut
 export function buildProxyDom(context) {
   const { root, app } = context;
   const headingId = "proxy-heading";
-  const headerBadge = createStatusBadge("disabled", "运行状态待加载");
+  const headerBadge = createStatusBadge("disabled", "正在加载");
   const operationLive = createElement("p", {
     className: "proxy-operation-live",
     text: "等待操作。",
@@ -116,11 +116,11 @@ export function buildProxyDom(context) {
   const waitingHost = createElement("div", { className: "proxy-waiting-host" });
 
   const runtimeButtons = {
-    start: operationButton("start", "启动", "正在启动…"),
-    stop: operationButton("stop", "停止", "正在停止…", "proxy-button proxy-button--dangerous"),
-    reload: operationButton("reload", "应用并重载", "正在应用…", "proxy-button proxy-button--primary"),
-    probe: operationButton("probe", "全池探活", "正在探活…"),
-    refresh: operationButton("refresh", "刷新状态与代理源", "正在刷新…"),
+    start: operationButton("start", "启动代理池", "正在启动…"),
+    stop: operationButton("stop", "停止代理池", "正在停止…", "proxy-button proxy-button--dangerous"),
+    reload: operationButton("reload", "应用并重新加载", "正在应用…", "proxy-button proxy-button--primary"),
+    probe: operationButton("probe", "检测全部节点", "正在检测…"),
+    refresh: operationButton("refresh", "刷新", "正在刷新…"),
   };
   const controlReasons = createElement("ul", {
     className: "proxy-control-reasons",
@@ -153,7 +153,7 @@ export function buildProxyDom(context) {
       attributes: { "aria-labelledby": "proxy-node-heading" },
     }, [
       createElement("div", { className: "proxy-subheading" }, [
-        createElement("h3", { text: "脱敏节点", attributes: { id: "proxy-node-heading" } }),
+        createElement("h3", { text: "代理节点", attributes: { id: "proxy-node-heading" } }),
         nodeCount,
       ]),
       nodeHost,
@@ -167,7 +167,7 @@ export function buildProxyDom(context) {
   const subscriptionAdd = createSourceForm({
     kind: "subscription-add",
     label: "添加完整订阅地址",
-    help: "只在本次提交中使用；保存后界面仅显示脱敏主机和地址。",
+    help: "保存后仅显示隐藏敏感信息的订阅地址。",
     inputAttributes: {
       type: "url",
       inputmode: "url",
@@ -180,8 +180,8 @@ export function buildProxyDom(context) {
   const nodeFileHost = createElement("div", { className: "proxy-node-file" });
   const nodeFileSet = createSourceForm({
     kind: "node-file-set",
-    label: "许可目录内的节点文件路径",
-    help: "路径必须位于后端 allowed_node_roots 内；提交后只显示安全相对路径或文件名。",
+    label: "允许目录中的节点文件",
+    help: "文件必须位于服务配置的允许目录中；保存后仅显示相对路径或文件名。",
     inputAttributes: {
       type: "text",
       placeholder: "../subscriptions/provider.yaml",
@@ -194,8 +194,8 @@ export function buildProxyDom(context) {
   const inlineHost = createElement("div", { className: "proxy-source-list" });
   const inlineAdd = createSourceForm({
     kind: "inline-add",
-    label: "批量添加完整节点（每行一个）",
-    help: "空行会被过滤；提交后不会再次显示节点原文。",
+    label: "批量添加手动节点（每行一个）",
+    help: "空行会被忽略；保存后不会再次显示完整节点信息。",
     inputTag: "textarea",
     inputAttributes: {
       rows: "6",
@@ -207,13 +207,13 @@ export function buildProxyDom(context) {
 
   const resetButton = sourceActionButton(
     "override-reset",
-    "恢复 config 默认",
+    "恢复配置文件默认值",
     "正在恢复…",
     { dangerous: true },
   );
   const resetHelp = createElement("p", {
     className: "proxy-field-help",
-    text: "删除托管运行时覆盖，恢复后端启动时读取的 config 基线；不会自动重载运行池。",
+    text: "删除界面保存的节点来源并恢复配置文件默认值；运行中的代理池不会自动更新。",
     attributes: { id: "proxy-reset-help" },
   });
   resetButton.setAttribute("aria-describedby", "proxy-reset-help");
@@ -223,7 +223,7 @@ export function buildProxyDom(context) {
     attributes: { "aria-labelledby": "proxy-sources-heading" },
   }, [
     createElement("div", { className: "proxy-panel-heading" }, [
-      createElement("h2", { text: "托管代理源", attributes: { id: "proxy-sources-heading" } }),
+      createElement("h2", { text: "节点来源", attributes: { id: "proxy-sources-heading" } }),
       resetButton,
     ]),
     sourceOverview,
@@ -233,7 +233,7 @@ export function buildProxyDom(context) {
       attributes: { "aria-labelledby": "proxy-subscriptions-heading" },
     }, [
       createElement("div", { className: "proxy-subheading" }, [
-        createElement("h3", { text: "订阅 URL", attributes: { id: "proxy-subscriptions-heading" } }),
+        createElement("h3", { text: "订阅地址", attributes: { id: "proxy-subscriptions-heading" } }),
         subscriptionCount,
       ]),
       subscriptionHost,
@@ -252,7 +252,7 @@ export function buildProxyDom(context) {
       attributes: { "aria-labelledby": "proxy-inline-heading" },
     }, [
       createElement("div", { className: "proxy-subheading" }, [
-        createElement("h3", { text: "内联节点", attributes: { id: "proxy-inline-heading" } }),
+        createElement("h3", { text: "手动节点", attributes: { id: "proxy-inline-heading" } }),
         inlineCount,
       ]),
       inlineHost,
@@ -270,7 +270,7 @@ export function buildProxyDom(context) {
       headerBadge,
       createElement("p", {
         className: "app-summary",
-        text: "控制后端托管代理池并维护脱敏代理源。保存源配置与应用重载严格分离。",
+        text: "查看代理池状态并管理节点来源。保存后需手动应用，运行中的代理池不会立即改变。",
       }),
     ]),
     waitingHost,

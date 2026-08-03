@@ -3,7 +3,6 @@ import { setElementInert } from "../core/dom.js";
 import {
   createPolicyRequestGate,
   getPolicySiteDefinition,
-  policyConfigsEqual,
   PolicyValidationError,
 } from "../core/policy-model.js";
 import { actionCreators } from "../core/store.js";
@@ -20,12 +19,12 @@ function policyViewUrl(path) {
 }
 
 function policySitePath(siteId) {
-  if (!getPolicySiteDefinition(siteId)) throw new TypeError("POLICY 来源无效");
+  if (!getPolicySiteDefinition(siteId)) throw new TypeError("站点无效");
   return `${POLICY_ENDPOINTS.policies}/${encodeURIComponent(siteId)}`;
 }
 
 function createPolicyController(context) {
-  const { root, api, store, dialogs, actions } = context;
+  const { root, api, store, dialogs } = context;
   const view = createPolicyView(context);
   const requestGate = createPolicyRequestGate();
   let active = false;
@@ -53,7 +52,7 @@ function createPolicyController(context) {
       try {
         await configRead.promise;
       } catch {
-        // 被替换的读取由原调用方处理。
+        // 被新读取替换的请求由原调用方收尾。
       }
       if (!active || destroyed) return false;
     }
@@ -67,7 +66,6 @@ function createPolicyController(context) {
         if (!active || destroyed || controller.signal.aborted ||
             !requestGate.isReadCurrent(ticket)) return false;
         store.dispatch(actionCreators.policyConfigReceived(payload));
-        view.setConflict(false);
         return true;
       })
       .catch((error) => {
@@ -93,24 +91,19 @@ function createPolicyController(context) {
     abortRead();
   };
 
-  const runOperation = async ({ kind, request, successMessage, writes = true }) => {
+  const runOperation = async ({ kind, request, successMessage }) => {
     if (!active || destroyed || busy) return false;
     const operation = ++operationSequence;
-    const baselinePolicy = writes ? view.getCurrentItem()?.policy || null : null;
-    if (writes) invalidateReadsForWrite();
-    else abortRead();
+    invalidateReadsForWrite();
     view.clearError();
-    view.setConflict(false);
     setBusy(kind);
     view.setOperationMessage(
-      kind === "refresh"
-        ? "正在读取后端 POLICY 安全投影…"
-        : "正在写入单个站点策略，请勿重复提交…",
+      kind === "save" ? "正在保存站点设置……" : "正在恢复默认设置……",
     );
     const controller = new AbortController();
     activeOperationController = controller;
     try {
-      if (request) await request(controller.signal);
+      await request(controller.signal);
       if (!active || destroyed || controller.signal.aborted) return false;
       const loaded = await readConfig(null, { replace: true, report: false });
       if (!loaded || !active || destroyed || controller.signal.aborted) return false;
@@ -119,28 +112,17 @@ function createPolicyController(context) {
       return true;
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted || !active) return false;
-      // 写失败后仍读取权威状态，但把草稿恢复到 DOM；草稿绝不进入 Store。
-      const preservedDraft = writes && view.isDirty() ? view.readDraft() : null;
-      let authoritativeChanged = false;
-      if (writes) {
-        try {
-          const loaded = await readConfig(null, { replace: true, report: false });
-          if (!active || destroyed || controller.signal.aborted) return false;
-          if (loaded) {
-            const currentPolicy = view.getCurrentItem()?.policy || null;
-            authoritativeChanged = Boolean(
-              baselinePolicy && currentPolicy && !policyConfigsEqual(baselinePolicy, currentPolicy),
-            );
-            if (preservedDraft) view.restoreDraft(preservedDraft);
-          }
-        } catch (readError) {
-          if (isAbortError(readError) || controller.signal.aborted || !active) return false;
-          // 原写错误更能解释当前操作；读取错误不覆盖它，也不输出原始细节。
-        }
+      const preservedDraft = view.isDirty() ? view.readDraft() : null;
+      try {
+        const loaded = await readConfig(null, { replace: true, report: false });
+        if (!active || destroyed || controller.signal.aborted) return false;
+        if (loaded && preservedDraft) view.restoreDraft(preservedDraft);
+      } catch (readError) {
+        if (isAbortError(readError) || controller.signal.aborted || !active) return false;
+        // 保留原操作错误和当前表单，不展示第二个原始错误。
       }
       view.showError(error);
-      if (authoritativeChanged) view.setConflict(true);
-      view.setOperationMessage("操作未完成；当前草稿仍留在本页，可修正或手动刷新。");
+      view.setOperationMessage("操作失败，修改已保留。请检查后重试。");
       return false;
     } finally {
       if (activeOperationController === controller) activeOperationController = null;
@@ -157,17 +139,21 @@ function createPolicyController(context) {
   };
 
   const confirmDiscard = async (purpose) => {
+    if (busy) {
+      view.setOperationMessage("请等待当前操作完成后再离开。");
+      return false;
+    }
     if (!view.isDirty()) return true;
     const confirmed = await confirm({
-      title: "放弃 POLICY 未保存更改？",
-      message: `当前来源草稿尚未保存。${purpose}会立即清除这些局部值。`,
-      confirmLabel: "放弃草稿并继续",
+      title: "放弃未保存的更改？",
+      message: `当前站点有未保存的更改，${purpose}后将丢失。`,
+      confirmLabel: "放弃更改并继续",
       dangerous: true,
-      confirmationText: "草稿没有写入中央 Store、Storage 或后端；放弃后无法从页面恢复。",
+      confirmationText: "已保存的设置和运行中的任务不受影响。",
     });
     if (!confirmed) {
       view.restoreSourceSelection();
-      view.setOperationMessage("已取消；未保存草稿继续保留在当前页面。");
+      view.setOperationMessage("已取消，未保存的更改继续保留。");
     }
     return confirmed;
   };
@@ -175,18 +161,12 @@ function createPolicyController(context) {
   const save = async () => {
     const validation = view.validateDraft({ announce: true });
     if (!validation.valid || !validation.payload) {
-      view.showError(new PolicyValidationError(
-        validation.field,
-        validation.reason,
-        { index: validation.index },
-      ));
-      view.setOperationMessage("没有发送未通过本地安全预检的策略草稿。");
+      view.showError(new PolicyValidationError(validation.field, validation.reason));
+      view.setOperationMessage("请修正标记项后再保存。");
       return;
     }
     const siteId = view.getSelectedSite();
-    let payload = validation.payload;
-    let capturedPayload = payload;
-    payload = null;
+    let capturedPayload = validation.payload;
     try {
       await runOperation({
         kind: "save",
@@ -195,49 +175,38 @@ function createPolicyController(context) {
           capturedPayload = null;
           return api.put(policyViewUrl(policySitePath(siteId)), body, { signal });
         },
-        successMessage: "✓ 站点覆盖已由后端确认保存；只影响之后的新搜索、规划与任务快照。",
+        successMessage: "设置已保存，将用于新建任务。",
       });
     } finally {
-      payload = null;
       capturedPayload = null;
     }
   };
 
   const reset = async () => {
     const item = view.getCurrentItem();
-    if (!item?.hasOverride) return;
+    const hasLocalChanges = view.isDirty();
+    if (!item || (!item.hasOverride && !hasLocalChanges)) return;
     if (!await confirm({
-      title: `恢复 ${item.label} 启动默认？`,
-      message: "这会删除该站点的完整 SQLite 覆盖，并重新继承进程启动时的默认策略快照。",
-      confirmLabel: "删除覆盖并恢复",
+      title: `恢复 ${item.label} 的默认设置？`,
+      message: item.hasOverride
+        ? "将删除该站点的自定义设置并恢复默认值。"
+        : "将清除本页未保存的更改。",
+      confirmLabel: "恢复默认设置",
       dangerous: true,
-      confirmationText: "不会热重载 config，不会修改已创建或运行中的任务，也不会触发代理/授权/抓取操作。",
+      confirmationText: "已创建和运行中的任务不受影响。",
     })) return;
+    if (!item.hasOverride) {
+      view.reloadDraft();
+      view.clearError();
+      view.setOperationMessage("已清除本页更改，继续使用默认设置。");
+      view.focusAfterOperation("reset");
+      return;
+    }
     await runOperation({
       kind: "reset",
       request: (signal) => api.delete(policyViewUrl(policySitePath(item.site)), { signal }),
-      successMessage: "✓ 站点覆盖已删除并恢复启动默认；后端权威配置已重新读取。",
+      successMessage: "该站点已恢复默认设置。",
     });
-  };
-
-  const refresh = async () => {
-    if (!await confirmDiscard("手动刷新")) return;
-    await runOperation({
-      kind: "refresh",
-      writes: false,
-      request: null,
-      successMessage: "✓ 五个来源的后端权威策略已刷新。",
-    });
-  };
-
-  const discard = async () => {
-    if (!view.isDirty()) return;
-    if (!await confirmDiscard("放弃更改")) return;
-    view.discardDraft();
-    view.clearError();
-    view.setConflict(false);
-    view.setOperationMessage("✓ 未保存草稿已清除，表单恢复为最后读取的服务器配置。");
-    view.focusAfterOperation("discard");
   };
 
   const switchSite = async (siteId) => {
@@ -245,17 +214,10 @@ function createPolicyController(context) {
       view.restoreSourceSelection();
       return;
     }
-    if (!await confirmDiscard("切换来源")) return;
+    if (!await confirmDiscard("切换站点")) return;
     view.selectSite(siteId);
     view.clearError();
-    view.setOperationMessage("已切换来源；表单来自中央 Store 中最后一次安全服务器投影。");
-  };
-
-  const navigateToVault = async () => {
-    const item = view.getCurrentItem();
-    if (!item || item.authorization === "anonymous") return;
-    if (!await confirmDiscard("打开 VAULT.CPL")) return;
-    actions.navigateToApp("vault");
+    view.setOperationMessage("已切换站点；保存后仅影响新建任务。");
   };
 
   const onClick = async (event) => {
@@ -264,7 +226,6 @@ function createPolicyController(context) {
     if (sourceOption) {
       const radio = sourceOption.querySelector("[data-policy-site]");
       if (!(radio instanceof HTMLInputElement) || radio.disabled) return;
-      // Radio 自身的鼠标/键盘激活交给原生 change；卡片空白与文字点击才走手动切换。
       if (event.target === radio) return;
       event.preventDefault();
       await switchSite(radio.value);
@@ -272,16 +233,11 @@ function createPolicyController(context) {
     }
     const button = event.target.closest("[data-policy-action]");
     if (!(button instanceof HTMLButtonElement) || button.disabled) return;
-    const action = button.dataset.policyAction;
-    if (action === "discard") await discard();
-    else if (action === "reset") await reset();
-    else if (action === "refresh") await refresh();
-    else if (action === "vault") await navigateToVault();
+    if (button.dataset.policyAction === "reset") await reset();
   };
 
   const onChange = async (event) => {
     if (event.target instanceof HTMLInputElement && event.target.matches("[data-policy-site]")) {
-      // 键盘方向键可能只触发 change；恢复 DOM 选择后走统一确认流程。
       const siteId = event.target.value;
       view.restoreSourceSelection();
       await switchSite(siteId);
@@ -305,7 +261,7 @@ function createPolicyController(context) {
   };
 
   const onBeforeUnload = (event) => {
-    if (!active || !view.isDirty()) return;
+    if (!active || (!view.isDirty() && !busy)) return;
     event.preventDefault();
     event.returnValue = "";
   };
@@ -317,6 +273,12 @@ function createPolicyController(context) {
   globalThis.addEventListener?.("beforeunload", onBeforeUnload);
 
   return Object.freeze({
+    beforeLeave() {
+      return confirmDiscard("切换应用");
+    },
+    beforeWindowHide(visibility) {
+      return confirmDiscard(visibility === "closed" ? "关闭窗口" : "最小化窗口");
+    },
     activate() {
       if (destroyed || active) return;
       active = true;
@@ -326,13 +288,10 @@ function createPolicyController(context) {
       root.dataset.lifecycle = "active";
       view.clearDraft();
       view.clearError();
-      view.setConflict(false);
-      view.setOperationMessage("正在加载后端 POLICY 安全投影…");
+      view.setOperationMessage("正在加载站点设置……");
       void readConfig(null, { replace: true, report: true })
         .then((loaded) => {
-          if (loaded && active) {
-            view.setOperationMessage("✓ 站点策略已加载；配置不轮询，可保存后刷新或手动刷新。");
-          }
+          if (loaded && active) view.setOperationMessage("站点设置已加载。");
         })
         .catch(() => {});
     },
@@ -384,6 +343,12 @@ export default Object.freeze({
   },
   activate() {
     controller?.activate();
+  },
+  beforeLeave() {
+    return controller?.beforeLeave() ?? true;
+  },
+  beforeWindowHide(_context, visibility) {
+    return controller?.beforeWindowHide(visibility) ?? true;
   },
   deactivate() {
     controller?.deactivate();

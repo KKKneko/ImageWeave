@@ -184,7 +184,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gallery.calls[0]["site"], "exhentai")
         self.assertEqual(gallery.calls[0]["eh_download"].image_mode, "original")
         self.assertEqual(gallery.calls[0]["eh_download"].gp_policy, "stop")
-        self.assertEqual(gallery.calls[0]["stall_timeout"], 180.0)
+        self.assertEqual(gallery.calls[0]["stall_timeout"], 300.0)
 
     async def test_artifact_scan_ignores_partial_and_activity_files(self):
         output = self.root / "artifacts"

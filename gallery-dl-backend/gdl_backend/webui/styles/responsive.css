@@ -73,7 +73,8 @@
     width: auto;
     height: 138px;
     padding: 0;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
   }
 
   .desktop-icon {

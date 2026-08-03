@@ -20,12 +20,10 @@ function createApplicationLink(app, location) {
   link.append(
     createIcon(app.icon, { size: isDesktop ? 30 : 22, strokeWidth: 1.6 }),
     createElement("span", { className: "application-label", text: app.label }),
-    createStatusBadge(
-      app.availability === "ready" ? "ready" : "disabled",
-      app.availability === "ready" ? "可用" : "占位",
-      { compact: true },
-    ),
   );
+  if (app.availability !== "ready") {
+    link.append(createStatusBadge("disabled", "开发中", { compact: true }));
+  }
   return link;
 }
 
@@ -59,7 +57,15 @@ function validateServices({ api, store, polling, storage, dialogs }) {
 
 export function initializeDesktop(root = document, services = {}) {
   validateServices(services);
-  const { api, store, polling, storage, dialogs } = services;
+  const {
+    api,
+    store,
+    polling,
+    storage,
+    dialogs,
+    motion = null,
+    personalization = null,
+  } = services;
   const desktop = requireElement("[data-desktop]", root);
   const desktopIcons = requireElement("[data-desktop-icons]", desktop);
   const startMenu = requireElement("[data-start-menu]", desktop);
@@ -107,6 +113,8 @@ export function initializeDesktop(root = document, services = {}) {
       pollingScope: `app:${app.id}`,
       storage,
       dialogs,
+      motion,
+      personalization,
       navigate: actions.navigateToApp,
     });
     try {
@@ -166,7 +174,7 @@ export function initializeDesktop(root = document, services = {}) {
         }
         if (transition !== routeTransitionVersion) return;
         if (!allowed) {
-          announcer.textContent = `未能安全离开${previous.label}；请先处理未保存内容。`;
+          announcer.textContent = `无法离开${previous.label}；请先处理未保存内容。`;
           router.navigate(previous.id);
           return;
         }
@@ -202,6 +210,11 @@ export function initializeDesktop(root = document, services = {}) {
     },
     onCloseFocus(app) {
       focusDesktopApplication(app);
+    },
+    onBeforeHide(app, visibility) {
+      if (typeof app?.beforeWindowHide !== "function") return true;
+      const mounted = ensureMounted(app);
+      return app.beforeWindowHide(mounted.context, visibility);
     },
   });
 

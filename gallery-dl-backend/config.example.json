@@ -82,14 +82,6 @@
     "max_concurrency": 20,
     "retry_limit": 2,
     "backoff_base_seconds": 2,
-    "proxy_mode": "prefer",
-    "probe_url": null,
-    "probe_before_use": false,
-    "node_tags": [],
-    "http_timeout": 30,
-    "gallery_retries": 2,
-    "task_timeout_seconds": 0,
-    "download_stall_timeout_seconds": 180,
-    "extra_args": []
+    "proxy_mode": "prefer"
   }
 }

@@ -95,6 +95,20 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(decision.error_class, "cloudflare_challenge")
         self.assertTrue(decision.retryable)
 
+    def test_tls_eof_variants_are_retryable_proxy_failures(self):
+        variants = (
+            "HttpError: SSLError: TLS connection terminated",
+            "requests.exceptions.SSLEOFError: connection closed",
+            "SSLError: UNEXPECTED_EOF_WHILE_READING (_ssl.c:1082)",
+            "EOF occurred in violation of protocol (_ssl.c:1082)",
+        )
+        for message in variants:
+            with self.subTest(message=message):
+                decision = classify_result(1, message)
+                self.assertEqual(decision.error_class, "proxy_failure")
+                self.assertTrue(decision.retryable)
+                self.assertTrue(decision.proxy_fault)
+
     def test_plain_extraction_error_stays_non_retryable(self):
         decision = classify_result(
             4, "gallery_dl.exception.ExtractionError: unable to parse gallery page"

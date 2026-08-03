@@ -78,9 +78,9 @@ export class UnknownActionError extends Error {
 
 function initialSummary() {
   return {
-    api: { status: "disabled", label: "API 待检测" },
-    proxy: { status: "disabled", label: "代理待检测" },
-    dedup: { status: "disabled", label: "去重待检测" },
+    api: { status: "disabled", label: "服务检查中" },
+    proxy: { status: "disabled", label: "代理检查中" },
+    dedup: { status: "disabled", label: "去重检查中" },
   };
 }
 
@@ -448,7 +448,7 @@ export function rootReducer(state, action) {
       return changed ? { ...state, crawl: { ...state.crawl, sources } } : state;
     }
     case ACTION_TYPES.CRAWL_WEAK_VISIBILITY_CHANGED: {
-      const visible = requireBoolean(action.payload?.visible, "弱证据显示状态");
+      const visible = requireBoolean(action.payload?.visible, "待核实结果显示状态");
       let crawl = { ...state.crawl, showWeakEvidence: visible };
       if (!visible) {
         const weakKeys = crawl.sources.flatMap((source) =>

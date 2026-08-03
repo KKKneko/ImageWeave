@@ -24,8 +24,19 @@ ImageWeave 是一套面向插画与图库采集的本地工作台。它把跨站
 | `PROXY.CPL` 代理配置 | 管理代理池运行状态、节点探活、订阅 URL、节点文件与内联节点；保存配置后由用户显式重载。 |
 | `VAULT.CPL` 凭证管理 | 查看五站授权状态，托管 X、Pixiv、EH 浏览器授权，清理导出材料/Profile，并配置授权专用代理。 |
 | `REVIEW.EXE` 去重审核 | 启动 L0–L2 分析，分页比较候选，保存保留决定并应用文件整理结果。 |
-| `POLICY.CPL` 站点策略 | 设置单站并发、重试、退避、代理模式、探活、超时、节点标签和受控 gallery-dl 参数。 |
+| `POLICY.CPL` 各站运行设置 | 每站只设置并发任务、重试次数、重试间隔和代理方案；其他运行参数由后端固定。 |
 | `DIAG.EXE` 系统诊断 | 只读展示健康、就绪、配置能力与调度摘要；离线时保留最后一份安全快照。 |
+| `DESKTOP.CPL` 桌面个性化 | 自定义强调色与窗口底色，并管理静态纯色/本地图片壁纸、图片可读性、功能性动效和有限窗口透明度；不调用业务 API。 |
+
+`DESKTOP.CPL` 的界面主题默认采用墨灰纸白：强调色 `#46515D`、窗口底色 `#F4F1EA`。两项只接受
+严格六位 HEX 并规范为大写；任意颜色组合（包括相同颜色）都可即时预览和应用，界面只同步显示
+实际对比度。窗口底色会自动派生浅色或深色 `color-scheme`，系统 forced-colors 始终优先。主题与
+其他个性化设置共同预览，只有点击“应用”才保存完整偏好。
+
+`DESKTOP.CPL` 另内置石墨、岩灰、深海、深林、灰梅和暖纸六种静态纯色。本地 JPG、PNG 或 WebP
+只在本机解码并重编码为静态 WebP（不支持时安全回退为静态 PNG），Blob 仅保存到 IndexedDB，
+不会上传后端。界面提供“开启/关闭”动效二态（系统 reduced-motion 始终优先）、图片填充/位置/遮罩、
+模糊可读性控制，以及 100%、96%、92% 三档窗口不透明度。
 
 `GALLERY.EXE`、`SCHEDULE.EXE` 和 `EXPORT.EXE` 当前是明确的占位入口，不会发送业务请求。
 
@@ -291,7 +302,7 @@ PyTorch 实际设备及模型缓存。某个可选组件显示 `disabled` 不代
 | `proxy` | 抓取代理池、订阅、节点文件、探活和 Mihomo 传输核心。 |
 | `scheduler` | 全局任务并发、轮询、退出等待和单任务日志上限。 |
 | `dedup` | 去重开关、CPU/CUDA 设备、模型路径和资源参数。 |
-| `default_site_policy` | 新站点策略的启动默认值；运行时可在 `POLICY.CPL` 中按站点覆盖。 |
+| `default_site_policy` | 四项统一默认：并发任务、重试次数、重试间隔和代理方案；其他键不会改变运行参数。 |
 
 ### 输出目录
 
@@ -397,11 +408,12 @@ CUDA 部署只需将 `device` 改为 `"cuda"`，但必须先用对应脚本安�
 
 1. 启动服务并打开 `/ui/`；
 2. 在 `DIAG.EXE` 检查后端、代理和去重组件；
-3. 在 `PROXY.CPL` 配置并探活抓取代理池；
-4. 在 `VAULT.CPL` 完成需要登录的站点授权；
-5. 在 `CRAWL.EXE` 搜索、筛选、排序并创建批次；
-6. 在 `TASKMGR.EXE` 查看进度、取消或恢复失败任务；
-7. 批次终态后，在 `REVIEW.EXE` 启动去重、审核并应用结果。
+3. （可选）在 `DESKTOP.CPL` 设置严格六位 HEX 的强调色与窗口底色，并调整静态桌面背景、可读性、动效和窗口透明度；任意颜色组合均可直接预览和应用；
+4. 在 `PROXY.CPL` 配置并探活抓取代理池；
+5. 在 `VAULT.CPL` 完成需要登录的站点授权；
+6. 在 `CRAWL.EXE` 搜索、筛选、排序并创建批次；
+7. 在 `TASKMGR.EXE` 查看进度、取消或恢复失败任务；
+8. 批次终态后，在 `REVIEW.EXE` 启动去重、审核并应用结果。
 
 ## 独立使用去重 CLI
 
@@ -492,6 +504,8 @@ curl http://127.0.0.1:8787/readyz
 - [后端、API 与工作流](./gallery-dl-backend/README.md)
 - [架构与状态机](./gallery-dl-backend/docs/ARCHITECTURE.md)
 - [WebUI 重写与迁移记录](./gallery-dl-backend/docs/WEBUI_REWRITE.md)
+- [WebUI 桌面个性化实现与验收](./docs/webui-desktop-personalization.md)
+- [WebUI 界面主题设计与聚焦验收](./docs/webui-interface-theme-personalization.md)
 - [Mihomo 安装说明](./gallery-dl-backend/docs/MIHOMO.md)
 - [Linux 部署路线与修复记录](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)
 - [第三方组件与许可证](./gallery-dl-backend/THIRD_PARTY_NOTICES.md)

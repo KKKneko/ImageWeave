@@ -86,7 +86,7 @@ function createCrawlController(context) {
       payload = buildSearchPayload(view.readSearchDraft());
     } catch (error) {
       showError({ code: "invalid_search", status: 422, message: error.message });
-      view.setOperationMessage("没有发送未通过本地校验的搜索请求。");
+      view.setOperationMessage("请修正标记项后再搜索。");
       return false;
     }
     const operation = ++operationSequence;
@@ -98,7 +98,7 @@ function createCrawlController(context) {
     view.hideSuggestions();
     view.clearError();
     setBusy("search");
-    view.setOperationMessage("正在查询真实来源并归并候选；离开应用会取消本次请求…");
+    view.setOperationMessage("正在搜索多个站点，离开页面将取消本次搜索……");
     let captured = payload;
     payload = null;
     try {
@@ -112,13 +112,13 @@ function createCrawlController(context) {
       store.dispatch(actionCreators.crawlSearchReceived(response));
       view.clearError();
       view.setOperationMessage(
-        `✓ 搜索完成：${projection.snapshot.addressCount} 个候选，${projection.snapshot.weakEvidenceCount} 个弱证据。`,
+        `搜索完成：${projection.snapshot.addressCount} 个候选，${projection.snapshot.weakEvidenceCount} 个待核实结果。`,
       );
       return true;
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted) return false;
       if (active && requestLifecycle === lifecycle) showError(error);
-      view.setOperationMessage("搜索未完成；上一次安全结果仍保留，可修正前置条件后重试。");
+      view.setOperationMessage("搜索失败，上次结果已保留。请检查授权或代理后重试。");
       return false;
     } finally {
       captured = null;
@@ -138,7 +138,7 @@ function createCrawlController(context) {
       });
     } catch (error) {
       showError({ code: "invalid_crawl", status: 422, message: error.message });
-      view.setOperationMessage("没有发送未通过本地校验的批次请求。");
+      view.setOperationMessage("请修正标记项后再创建批次。");
       return false;
     }
     const operation = ++operationSequence;
@@ -147,7 +147,7 @@ function createCrawlController(context) {
     operationController = controller;
     view.clearError();
     setBusy("crawl");
-    view.setOperationMessage("正在创建顺序批次；重复点击已禁用并附带新的幂等键…");
+    view.setOperationMessage("正在创建批次，请勿重复提交……");
     let captured = payload;
     payload = null;
     try {
@@ -163,13 +163,13 @@ function createCrawlController(context) {
       const batchId = typeof batch?.id === "string" ? batch.id : "";
       actions.setActiveBatchId(batchId);
       store.dispatch(actionCreators.batchSnapshotReceived(batch, { items: [] }));
-      view.setOperationMessage("✓ 批次已由后端确认创建，正在打开 TASKMGR.EXE。 ");
+      view.setOperationMessage("批次已创建，正在打开批次管理。");
       actions.navigateToApp("tasks");
       return true;
     } catch (error) {
       if (isAbortError(error) || controller.signal.aborted) return false;
       if (active && requestLifecycle === lifecycle) showError(error);
-      view.setOperationMessage("批次未创建；选择与顺序仍保留，可修正后重试。");
+      view.setOperationMessage("批次创建失败，当前选择和顺序已保留。请修正后重试。");
       return false;
     } finally {
       captured = null;
@@ -319,8 +319,8 @@ function createCrawlController(context) {
       root.dataset.lifecycle = "active";
       view.renderPreconditions();
       view.setOperationMessage(store.getState().crawl.sources.length
-        ? "上一次安全搜索结果仍在内存中；查询与输出目录未写入 Storage。"
-        : "输入关键词并选择来源；所有请求只通过同源 context.api。 ");
+        ? "上次搜索结果已保留，可继续选择来源或重新搜索。"
+        : "输入关键词并选择搜索来源。" );
     },
     deactivate() {
       if (destroyed) return;

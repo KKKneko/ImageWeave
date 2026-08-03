@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from types import MappingProxyType
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
@@ -12,11 +13,29 @@ from .proxy_source_store import (
     MAX_PROXY_SOURCE_PATH_LENGTH,
     MAX_SUBSCRIPTION_URL_LENGTH,
 )
+from .site_policy import (
+    EDITABLE_SITE_POLICY_FIELDS,
+    EditableSitePolicy,
+    ProxyMode,
+)
 
 
-ProxyMode = Literal["direct", "prefer", "required"]
 EHImageMode = Literal["original", "resample"]
 EHGPPolicy = Literal["stop", "resized"]
+
+FIXED_SITE_POLICY_FIELDS = MappingProxyType(
+    {
+        "probe_url": None,
+        "probe_before_use": True,
+        "node_tags": (),
+        "http_timeout": 60.0,
+        "gallery_retries": 2,
+        "task_timeout_seconds": 7200.0,
+        "download_stall_timeout_seconds": 300.0,
+        "eh_download": None,
+        "extra_args": (),
+    }
+)
 
 
 class EHDownloadOptions(BaseModel):
@@ -26,20 +45,16 @@ class EHDownloadOptions(BaseModel):
     gp_policy: EHGPPolicy = "stop"
 
 
-class SitePolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class SitePolicy(EditableSitePolicy):
+    """后端运行时完整策略；高级字段不属于站点设置写接口。"""
 
-    max_concurrency: int = Field(default=20, ge=1, le=128)
-    retry_limit: int = Field(default=2, ge=0, le=20)
-    backoff_base_seconds: float = Field(default=2.0, ge=0.0, le=3600.0)
-    proxy_mode: ProxyMode = "prefer"
     probe_url: str | None = None
-    probe_before_use: bool = False
+    probe_before_use: bool = True
     node_tags: list[str] = Field(default_factory=list, max_length=32)
-    http_timeout: float = Field(default=30.0, ge=1.0, le=3600.0)
+    http_timeout: float = Field(default=60.0, ge=1.0, le=3600.0)
     gallery_retries: int = Field(default=2, ge=0, le=50)
-    task_timeout_seconds: float = Field(default=0.0, ge=0.0, le=604800.0)
-    download_stall_timeout_seconds: float = Field(default=180.0, ge=0.0, le=604800.0)
+    task_timeout_seconds: float = Field(default=7200.0, ge=0.0, le=604800.0)
+    download_stall_timeout_seconds: float = Field(default=300.0, ge=0.0, le=604800.0)
     eh_download: EHDownloadOptions | None = None
     extra_args: list[str] = Field(default_factory=list, max_length=128)
 
@@ -69,6 +84,32 @@ class SitePolicy(BaseModel):
     @classmethod
     def stringify_args(cls, values: list[str]) -> list[str]:
         return [str(value) for value in values]
+
+
+def build_runtime_site_policy(
+    value: EditableSitePolicy | dict[str, Any],
+) -> SitePolicy:
+    """把四字段设置与不可配置的稳妥参数合成为新任务运行时快照。"""
+
+    if isinstance(value, EditableSitePolicy):
+        editable_input = {
+            field: getattr(value, field)
+            for field in EDITABLE_SITE_POLICY_FIELDS
+        }
+    else:
+        # 运行时再做一次正向投影，确保旁路留下的旧高级键也绝不生效。
+        editable_input = {
+            field: value[field]
+            for field in EDITABLE_SITE_POLICY_FIELDS
+            if field in value
+        }
+    editable = EditableSitePolicy.model_validate(editable_input).model_dump()
+    return SitePolicy.model_validate(
+        {
+            **FIXED_SITE_POLICY_FIELDS,
+            **editable,
+        }
+    )
 
 
 class TaskPolicy(SitePolicy):

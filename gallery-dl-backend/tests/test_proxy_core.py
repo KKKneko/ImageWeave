@@ -42,6 +42,16 @@ proxies:
 """
 
 
+def _mark_all_records_healthy(adapter: ProxyPoolAdapter) -> dict[str, object]:
+    for record in adapter._records:
+        record.healthy = True
+    return {
+        "total": len(adapter._records),
+        "healthy": len(adapter._records),
+        "results": [],
+    }
+
+
 class ProxyCoreTests(unittest.TestCase):
     def test_core_binary_search_names_are_platform_specific(self):
         self.assertEqual(_core_binary_names("posix"), ("proxy-core", "mihomo", "verge-mihomo"))
@@ -163,7 +173,7 @@ class ProxyCoreTests(unittest.TestCase):
             settings.proxy.enabled = True
             settings.proxy.inline_nodes = ["http://127.0.0.1:39999"]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 1, "healthy": 1, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             adapter.stop()
             self.assertIsNone(adapter.acquire("task-stopped"))
@@ -177,7 +187,7 @@ class ProxyCoreTests(unittest.TestCase):
             node_file.write_text(CLASH_TUNNEL_FIXTURE, encoding="utf-8")
             settings.proxy.node_file = node_file
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 3, "healthy": 3, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             fake_endpoints = [
                 CoreEndpoint(
                     id=f"node-{index}",
@@ -250,7 +260,7 @@ class ProxyCoreTests(unittest.TestCase):
             node_file.write_text(CLASH_TUNNEL_FIXTURE, encoding="utf-8")
             settings.proxy.node_file = node_file
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 3, "healthy": 3, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             fake_endpoints = [
                 CoreEndpoint(
                     id=f"node-{index}",

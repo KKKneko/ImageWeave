@@ -77,14 +77,14 @@ export function createProxyView(context) {
     elements.waitingHost.replaceChildren(
       createStatusBadge(
         waiting ? "warning" : sources ? "ready" : "disabled",
-        waiting ? "已保存，等待重载" : sources ? "配置与活动 revision 已同步" : "等待代理源快照",
+        waiting ? "有配置待应用" : sources ? "配置已生效" : "正在加载节点来源",
       ),
       createElement("p", {
         text: waiting
-          ? "△ 源配置已经保存，但运行池仍保持旧 revision；只有点击“应用并重载”才会切换。"
+          ? "节点来源已保存；点击“应用并重新加载”后生效。"
           : sources
-            ? "保存代理源不会自动启动、停止、探活或重载代理池。"
-            : "正在读取 configured / active revision。",
+            ? "保存节点来源不会自动启停或检测代理池。"
+            : "正在读取已保存和当前运行的配置版本。",
       }),
     );
     elements.waitingHost.dataset.waiting = String(waiting);
@@ -97,10 +97,10 @@ export function createProxyView(context) {
     const activeRevision = sources?.active_revision ?? status?.active_revision ?? null;
     const revisions = formatRevisionPair(configured, activeRevision);
     elements.revisionHost.replaceChildren(
-      createElement("h3", { text: "配置 revision" }),
+      createElement("h3", { text: "配置版本" }),
       definitionList([
-        ["configured", revisions.configured],
-        ["active", revisions.active],
+        ["已保存", revisions.configured],
+        ["当前运行", revisions.active],
         ["关系", revisions.relation],
       ]),
     );
@@ -119,7 +119,7 @@ export function createProxyView(context) {
     elements.controlReasons.replaceChildren(
       ...(reasons.length
         ? reasons.map((reason) => createElement("li", { text: reason }))
-        : [createElement("li", { text: "运行控制可用；停止始终使用非强制模式。" })]),
+        : [createElement("li", { text: "停止操作不会中断正在使用代理的任务。" })]),
     );
     renderBusyAttributes();
   };
@@ -137,7 +137,7 @@ export function createProxyView(context) {
     const displayed = status.nodes.slice(0, PROXY_NODE_RENDER_LIMIT);
     const reported = Math.max(status.total, status.node_rows_received);
     elements.nodeCount.textContent = reported > displayed.length
-      ? `显示 ${displayed.length} / 后端报告 ${reported}`
+      ? `显示 ${displayed.length} / 服务报告 ${reported}`
       : `共 ${reported} 个节点`;
     if (!displayed.length) {
       elements.nodeHost.replaceChildren(createEmptyState({
@@ -145,8 +145,8 @@ export function createProxyView(context) {
         label: status.running ? "空代理池" : "代理池未启动",
         title: status.running ? "当前运行池没有节点" : "启动后显示节点状态",
         message: status.reload_required
-          ? "代理源已变更，请在无活动租约时点击“应用并重载”。"
-          : "请检查是否已配置代理源，再使用启动或手动刷新。",
+          ? "节点来源已变更，请在没有任务使用代理时点击“应用并重新加载”。"
+          : "请检查是否已配置节点来源，再启动代理池或刷新。",
       }));
       return;
     }
@@ -173,10 +173,10 @@ export function createProxyView(context) {
         ]),
         tags,
         definitionList([
-          ["租约", model.lease],
+          ["占用状态", model.lease],
           ["最近延迟", model.latency],
-          ["累计探测/使用", model.attempts],
-          ["冷却", model.cooldown],
+          ["累计成功/失败", model.attempts],
+          ["等待重试", model.cooldown],
           ["最近错误", model.lastError],
         ], "proxy-node-details"),
       ]);
@@ -186,7 +186,7 @@ export function createProxyView(context) {
     if (reported > displayed.length || status.nodes_truncated) {
       fragment.append(createElement("p", {
         className: "proxy-render-limit",
-        text: `为保证页面流畅，最多渲染前 ${PROXY_NODE_RENDER_LIMIT} 个脱敏节点；请使用聚合计数判断完整池状态。`,
+        text: `为保证页面流畅，最多显示前 ${PROXY_NODE_RENDER_LIMIT} 个代理节点；完整数量以上方统计为准。`,
       }));
     }
     elements.nodeHost.replaceChildren(fragment);
@@ -197,7 +197,7 @@ export function createProxyView(context) {
     updateStatusBadge(elements.headerBadge, presentation.status, presentation.label);
     if (!status) {
       elements.metricsHost.replaceChildren(
-        metric("节点", "—"), metric("健康", "—"), metric("可重试", "—"), metric("租约", "—"),
+        metric("节点", "—"), metric("健康", "—"), metric("可重试", "—"), metric("正在使用", "—"),
       );
       elements.runtimeMetaHost.replaceChildren(createEmptyState({
         label: "等待状态",
@@ -216,15 +216,15 @@ export function createProxyView(context) {
       metric("节点总数", status.total),
       metric("健康", status.healthy, status.running ? "当前运行池" : "池未运行"),
       metric("可重试", status.retry_eligible),
-      metric("活动租约", status.leases, status.leases ? "重载与停止已锁定" : "可安全变更运行池"),
+      metric("正在使用", status.leases, status.leases ? "暂时不能停止或重新加载" : "可以更改运行配置"),
     );
     elements.runtimeMetaHost.replaceChildren(
-      createElement("h3", { text: "后端托管" }),
+      createElement("h3", { text: "运行设置" }),
       definitionList([
         ["启用", status.enabled ? "是" : "否"],
         ["运行", status.running ? "运行中" : "已停止"],
         ["engine", status.engine],
-        ["托管方式", status.managed_by_backend ? "由后端托管" : "未知托管方式"],
+        ["管理方式", status.managed_by_backend ? "由服务管理" : "未知"],
         ["自动启动", status.auto_start ? "已启用" : "未启用"],
         ["最近错误", status.last_error || "无"],
       ]),
@@ -243,7 +243,7 @@ export function createProxyView(context) {
       definitionList([
         ["启用", core.enabled ? "是" : "否"],
         ["运行", core.running ? "是" : "否"],
-        ["listener 数", String(core.listeners)],
+        ["监听端口数", String(core.listeners)],
         ["最近错误", core.last_error || "无"],
       ]),
     );
@@ -269,8 +269,8 @@ export function createProxyView(context) {
     if (!sources || !items.length) {
       elements.subscriptionHost.replaceChildren(createEmptyState({
         label: sources ? "无订阅" : "等待代理源",
-        title: sources ? "尚未配置订阅 URL" : "订阅列表待加载",
-        message: "添加时请输入完整地址；保存后不会再次回显秘密路径或查询参数。",
+        title: sources ? "尚未配置订阅地址" : "订阅列表正在加载",
+        message: "添加时请输入完整地址；保存后仅显示隐藏敏感信息的地址。",
       }));
       return;
     }
@@ -279,7 +279,7 @@ export function createProxyView(context) {
       const model = formatSubscriptionSource(subscription);
       const replacement = createReplaceForm("subscription-replace", subscription.id, index, {
         label: "请输入完整新订阅地址",
-        help: "旧地址不会回填；取消、失败或离开页面都会清空此输入。",
+        help: "出于安全考虑，原地址不会重新显示。取消、失败或离开页面都会清空输入。",
         inputAttributes: {
           type: "url",
           inputmode: "url",
@@ -297,7 +297,7 @@ export function createProxyView(context) {
           ]),
           createStatusBadge(subscription.source === "runtime" ? "running" : "ready", sourceLabel(model.source)),
         ]),
-        createElement("p", { className: "proxy-redaction-note", text: `✓ ${model.redaction}` }),
+        createElement("p", { className: "proxy-redaction-note", text: model.redaction }),
         replacementActions("subscription"),
         replacement.form,
       ]));
@@ -311,7 +311,7 @@ export function createProxyView(context) {
       elements.nodeFileHost.replaceChildren(createEmptyState({
         label: sources ? "未配置文件" : "等待代理源",
         title: sources ? "没有节点文件" : "节点文件状态待加载",
-        message: "仅可设置后端许可目录中的普通文件。",
+        message: "仅可设置服务允许目录中的普通文件。",
       }));
       return;
     }
@@ -319,7 +319,7 @@ export function createProxyView(context) {
       createElement("div", { className: "proxy-card-heading" }, [
         createElement("div", {}, [
           createElement("h4", { text: nodeFile.display_path || "路径已隐藏" }),
-          createElement("p", { text: "仅展示后端脱敏路径" }),
+          createElement("p", { text: "仅显示隐藏敏感信息后的路径" }),
         ]),
         createStatusBadge(nodeFile.source === "runtime" ? "running" : "ready", sourceLabel(nodeFile.source)),
       ]),
@@ -334,9 +334,9 @@ export function createProxyView(context) {
     elements.inlineCount.textContent = sources ? `${sources.counts.inline_nodes} 项` : "待加载";
     if (!sources || !items.length) {
       elements.inlineHost.replaceChildren(createEmptyState({
-        label: sources ? "无内联节点" : "等待代理源",
-        title: sources ? "尚未配置内联节点" : "内联节点列表待加载",
-        message: "可一次粘贴多行；保存后只显示协议、主机和脱敏 endpoint。",
+        label: sources ? "无手动节点" : "正在加载节点来源",
+        title: sources ? "尚未配置手动节点" : "手动节点列表正在加载",
+        message: "可一次粘贴多行；保存后仅显示协议、主机和隐藏敏感信息后的地址。",
       }));
       return;
     }
@@ -345,7 +345,7 @@ export function createProxyView(context) {
       const model = formatInlineNodeSource(node);
       const replacement = createReplaceForm("inline-replace", node.id, index, {
         label: "请输入完整新节点",
-        help: "旧节点不会回填；提交后不会再次显示原文。",
+        help: "出于安全考虑，原节点不会重新显示。",
         inputTag: "textarea",
         inputAttributes: { rows: "3", placeholder: "粘贴一个完整新节点" },
       });
@@ -402,25 +402,25 @@ export function createProxyView(context) {
   const renderSources = (sources) => {
     if (!sources) {
       elements.sourceOverview.replaceChildren(createEmptyState({
-        label: "等待代理源",
-        title: "托管源快照待加载",
-        message: "激活页面时只加载一次，修改或运行操作后会显式刷新。",
+        label: "正在加载节点来源",
+        title: "节点来源正在加载",
+        message: "页面打开后会自动加载，修改或运行操作后也会刷新。",
       }));
       elements.sourceGuard.replaceChildren();
     } else {
       elements.sourceOverview.replaceChildren(
         createStatusBadge(
           sources.reload_required ? "warning" : "ready",
-          sources.reload_required ? "已保存，等待重载" : "源快照已同步",
+          sources.reload_required ? "有配置待应用" : "配置已生效",
         ),
         definitionList([
-          ["有效来源", sourceLabel(sources.source)],
-          ["runtime 覆盖", sources.has_runtime_override ? "存在" : "不存在"],
-          ["覆盖有效", sources.runtime_override_valid ? "是" : "否"],
+          ["当前来源", sourceLabel(sources.source)],
+          ["界面自定义设置", sources.has_runtime_override ? "存在" : "不存在"],
+          ["设置有效", sources.runtime_override_valid ? "是" : "否"],
           ["订阅", String(sources.counts.subscriptions)],
           ["节点文件", String(sources.counts.node_file)],
-          ["内联节点", String(sources.counts.inline_nodes)],
-          ["源总计", String(sources.counts.total)],
+          ["手动节点", String(sources.counts.inline_nodes)],
+          ["来源总计", String(sources.counts.total)],
         ], "proxy-source-summary"),
       );
       elements.sourceGuard.replaceChildren(
@@ -430,9 +430,9 @@ export function createProxyView(context) {
               className: "proxy-corrupt-warning",
               attributes: { role: "alert" },
             }, [
-              createStatusBadge("error", "runtime 覆盖损坏"),
+              createStatusBadge("error", "自定义配置已损坏"),
               createElement("p", {
-                text: "普通增删改已锁定。当前安全回退 config 基线，仅允许“恢复 config 默认”删除损坏覆盖。",
+                text: "当前正在使用配置文件默认值。请恢复默认设置后再编辑。",
               }),
             ])]),
       );

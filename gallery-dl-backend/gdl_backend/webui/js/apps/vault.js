@@ -153,7 +153,7 @@ function createVaultController(context) {
         ) return false;
         applySiteStatus(payload, { syncPolling: false });
         if (!activeSession && active && !destroyed) {
-          view.setOperationMessage("授权流程已结束；请查看目标文字状态，页面不会把流程结束等同于登录成功。");
+          view.setOperationMessage("授权窗口已关闭，请刷新并确认登录状态。");
           await readStatus(controller.signal, { replace: false, report: false });
         } else {
           syncAuthorizationPolling();
@@ -214,8 +214,8 @@ function createVaultController(context) {
     setBusy(kind);
     view.setOperationMessage(
       kind === "refresh"
-        ? "正在读取后端安全授权投影…"
-        : "正在执行凭证操作，请勿重复提交…",
+        ? "正在刷新授权状态……"
+        : "正在执行授权操作，请勿重复提交……",
     );
     const controller = new AbortController();
     activeOperationController = controller;
@@ -236,7 +236,7 @@ function createVaultController(context) {
         // 保留原操作错误，失败刷新不能覆盖受控指引。
       }
       view.showError(error);
-      view.setOperationMessage("操作未完成；其他目标的最后安全状态仍然保留。可手动刷新恢复。");
+      view.setOperationMessage("操作失败，其他站点的上次状态已保留。请刷新后重试。");
       return false;
     } finally {
       view.clearSensitiveInputs();
@@ -263,7 +263,7 @@ function createVaultController(context) {
           capturedPayload = null;
           return api.put(vaultViewUrl(VAULT_ENDPOINTS.proxy), body, { signal });
         },
-        successMessage: "✓ 后端已保存授权线路设置；这不代表任何站点登录成功。",
+        successMessage: "登录代理设置已保存。",
       });
     } catch (error) {
       if (active && !busy) {
@@ -273,7 +273,7 @@ function createVaultController(context) {
           requestId: "",
           details: null,
         });
-        view.setOperationMessage("没有发送格式无效的授权代理请求。");
+        view.setOperationMessage("登录代理地址格式无效，请修正后重试。");
       }
       return false;
     } finally {
@@ -293,7 +293,7 @@ function createVaultController(context) {
     view.clearSensitiveInputs();
     if (active && !destroyed) syncAuthorizationPolling();
     if (choice !== "confirm") {
-      view.setOperationMessage("已取消操作；敏感输入已清空。后端状态未改变。");
+      view.setOperationMessage("已取消操作，敏感输入已清空，授权状态未改变。");
       return false;
     }
     return active && !destroyed;
@@ -309,7 +309,7 @@ function createVaultController(context) {
       kind: `authorize:${siteId}`,
       request: (signal) => api.post(vaultViewUrl(path), undefined, { signal }),
       processPayload: true,
-      successMessage: `▶ ${definition.label} 授权流程已启动；请在共享浏览器中完成操作。尚未声明登录成功。`,
+      successMessage: `${definition.label} 授权已开始，请在打开的浏览器中完成登录。`,
     });
   };
 
@@ -319,10 +319,10 @@ function createVaultController(context) {
     if (!definition || !reference || reference.site !== siteId) return;
     if (!await confirm({
       title: `关闭 ${definition.label} 授权标签页？`,
-      message: "这会取消本次共享浏览器授权流程，不会删除此前已经导出的站点材料。",
+      message: "这会取消本次浏览器授权，不会删除此前已保存的站点凭证。",
       confirmLabel: "关闭授权标签页",
       dangerous: true,
-      confirmationText: "关闭后可重新开始；页面不会自动取消抓取任务。",
+      confirmationText: "关闭后可重新开始，正在运行的采集任务不会自动取消。",
     })) return;
     const path = reference.kind === "oauth"
       ? VAULT_ENDPOINTS.pixivOAuthSession
@@ -331,7 +331,7 @@ function createVaultController(context) {
       kind: `cancel:${siteId}`,
       request: (signal) => api.delete(vaultViewUrl(path), { signal }),
       processPayload: true,
-      successMessage: `✓ ${definition.label} 本次授权标签页已关闭；既有导出材料保持原样。`,
+      successMessage: `${definition.label} 授权标签页已关闭，已保存凭证保持不变。`,
     });
   };
 
@@ -339,47 +339,47 @@ function createVaultController(context) {
     const definition = getVaultSiteDefinition(siteId);
     if (!definition || definition.method === "anonymous") return;
     if (!await confirm({
-      title: `删除 ${definition.label} 导出凭证？`,
-      message: "这会删除后端托管的单站 Cookie 或 Token；共享浏览器 Profile 将继续保留。",
-      confirmLabel: "删除导出凭证",
+      title: `删除 ${definition.label} 站点凭证？`,
+      message: "这会删除服务保存的单站 Cookie 或 Token；授权浏览器数据将继续保留。",
+      confirmLabel: "删除站点凭证",
       dangerous: true,
-      confirmationText: "后端没有承诺自动处理运行中任务；页面不会强制取消任务或乐观标记成功。",
+      confirmationText: "运行中的任务不会自动取消；确认删除后才会更新状态。",
     })) return;
     await runOperation({
       kind: `clear:${siteId}`,
       request: (signal) => api.delete(vaultViewUrl(siteAuthPath(siteId)), { signal }),
       processPayload: true,
-      successMessage: `✓ ${definition.label} 导出材料已由后端确认删除；共享 Profile 未删除。`,
+      successMessage: `${definition.label} 站点凭证已删除，授权浏览器数据保持不变。`,
     });
   };
 
   const clearProfile = async () => {
     if (!await confirm({
-      title: "清空共享授权 Profile？",
-      message: "这会关闭活动授权并删除 X、Pixiv、EH 共用的项目 Chrome Profile。",
-      confirmLabel: "清空共享 Profile",
+      title: "清除授权浏览器数据？",
+      message: "这会关闭活动授权，并删除 X、Pixiv 和 EH 共用的授权浏览器登录数据。",
+      confirmLabel: "清除授权浏览器数据",
       dangerous: true,
-      confirmationText: "单站已导出的 Cookie/Token 不会随 Profile 删除；运行中任务不会被页面强制中断。",
+      confirmationText: "各站点已保存的 Cookie 或 Token 不会被删除，运行中的任务不会被强制中断。",
     })) return;
     await runOperation({
       kind: "profile-clear",
       request: (signal) => api.delete(vaultViewUrl(VAULT_ENDPOINTS.browserProfile), { signal }),
-      successMessage: "✓ 后端已确认共享 Profile 清空；单站导出材料保持原样。",
+      successMessage: "授权浏览器数据已清除，各站点已保存凭证保持不变。",
     });
   };
 
   const resetProxy = async () => {
     if (!await confirm({
-      title: "恢复 config 授权代理默认值？",
-      message: "这会删除 VAULT 保存的运行时授权代理覆盖，包括显式直连覆盖。",
-      confirmLabel: "恢复 config 默认",
+      title: "恢复登录代理默认设置？",
+      message: "这会删除授权管理中保存的登录代理设置，并恢复配置文件默认值。",
+      confirmLabel: "恢复默认设置",
       dangerous: true,
-      confirmationText: "只影响后续共享浏览器授权线路，不修改 PROXY.CPL 抓取代理池。",
+      confirmationText: "仅影响后续浏览器授权，不会修改代理管理中的采集代理池。",
     })) return;
     await runOperation({
       kind: "proxy-reset",
       request: (signal) => api.delete(vaultViewUrl(VAULT_ENDPOINTS.proxy), { signal }),
-      successMessage: "✓ 授权代理已恢复 config 默认；后端安全状态已刷新。",
+      successMessage: "登录代理已恢复默认设置，授权状态已刷新。",
     });
   };
 
@@ -392,7 +392,7 @@ function createVaultController(context) {
       await runOperation({
         kind: "refresh",
         writes: false,
-        successMessage: "✓ 授权目标、共享 Profile 与授权代理安全状态已刷新。",
+        successMessage: "站点授权、授权浏览器数据和登录代理状态已刷新。",
       });
       return;
     }
@@ -433,11 +433,11 @@ function createVaultController(context) {
     const isDirect = view.elements.proxyInput.value.trim() === "";
     const currentProxy = store.getState().auth.authorizationProxy;
     if (isDirect && currentProxy?.configured && !await confirm({
-      title: "将授权线路改为直连？",
-      message: "空值会保存为运行时直连覆盖，而不是恢复 config 默认。",
+      title: "将登录代理改为直连？",
+      message: "留空保存表示始终直连，而不是恢复配置文件默认值。",
       confirmLabel: "保存为直连",
       dangerous: true,
-      confirmationText: "现有代理凭据不会回填；只影响下一次授权浏览器与 Pixiv Token 交换。",
+      confirmationText: "只影响下一次授权浏览器和 Pixiv Token 交换。",
     })) return;
     await runProxySecretOperation();
   };
@@ -459,10 +459,10 @@ function createVaultController(context) {
       setElementInert(root, false);
       root.dataset.lifecycle = "active";
       view.clearSensitiveInputs();
-      view.setOperationMessage("正在加载后端 VAULT 安全投影…");
+      view.setOperationMessage("正在加载授权状态……");
       void readStatus(null, { replace: true, report: true })
         .then((loaded) => {
-          if (loaded && active) view.setOperationMessage("✓ 安全授权状态已加载。可随时手动刷新。");
+          if (loaded && active) view.setOperationMessage("授权状态已加载，可随时刷新。");
         })
         .catch(() => {});
     },

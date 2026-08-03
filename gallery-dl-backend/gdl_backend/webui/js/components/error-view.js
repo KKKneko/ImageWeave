@@ -2,9 +2,9 @@ import { createElement } from "../core/dom.js";
 import { createStatusBadge } from "./status.js";
 
 const SAFE_GENERIC_MESSAGES = Object.freeze({
-  network_error: "无法连接到 ImageWeave 后端。",
-  invalid_response: "后端响应格式无效，界面没有采用该响应。",
-  http_error: "后端返回了错误状态。",
+  network_error: "无法连接到 ImageWeave 服务。",
+  invalid_response: "服务响应格式无效，页面未采用该响应。",
+  http_error: "服务返回了错误状态。",
   request_failed: "请求未能完成。",
 });
 
@@ -28,7 +28,7 @@ function safeRequestId(value) {
 
 export function toSafeErrorViewModel(error, {
   fallbackMessage = "请求未能完成。",
-  nextStep = "请稍后重试，或打开 DIAG.EXE 检查系统状态。",
+  nextStep = "请稍后重试，或打开系统诊断检查运行状态。",
 } = {}) {
   const code = typeof error?.code === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(error.code)
     ? error.code
@@ -46,7 +46,7 @@ export function toSafeErrorViewModel(error, {
 export function createErrorView(error, {
   nextStep,
   statusLabel = "操作失败",
-  actionLabel = "打开 DIAG.EXE",
+  actionLabel = "打开系统诊断",
   onAction = null,
 } = {}) {
   const model = toSafeErrorViewModel(error, { nextStep });

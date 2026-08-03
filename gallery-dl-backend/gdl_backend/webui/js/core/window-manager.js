@@ -14,9 +14,13 @@ export function createWindowManager({
   actions,
   onVisibilityChange,
   onCloseFocus,
+  onBeforeHide,
 }) {
   const mobileViewport = window.matchMedia("(max-width: 767px)");
   let currentView = selectors.windowView(store.getState());
+  let hideRequestSequence = 0;
+  let hidePending = false;
+  let destroyed = false;
 
   const isForcedMobileMaximized = (view) =>
     Boolean(view?.appId === "review" && mobileViewport.matches);
@@ -91,10 +95,48 @@ export function createWindowManager({
     fireImmediately: true,
   });
 
+  const requestHide = (visibility, commit) => {
+    if (destroyed || hidePending || currentView.visibility !== "open") return;
+    const app = getApplicationById(currentView.appId);
+    let decision = true;
+    try {
+      decision = typeof onBeforeHide === "function"
+        ? onBeforeHide(app, visibility)
+        : true;
+    } catch {
+      decision = false;
+    }
+
+    if (typeof decision?.then !== "function") {
+      if (decision === true && !destroyed) commit(app);
+      return;
+    }
+
+    hidePending = true;
+    const request = ++hideRequestSequence;
+    const appId = currentView.appId;
+    void Promise.resolve(decision)
+      .then((allowed) => {
+        if (
+          allowed !== true
+          || destroyed
+          || request !== hideRequestSequence
+          || currentView.visibility !== "open"
+          || currentView.appId !== appId
+        ) return;
+        commit(app);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (request === hideRequestSequence) hidePending = false;
+      });
+  };
+
   const minimize = () => {
-    if (currentView.visibility !== "open") return;
-    actions.minimizeWindow();
-    taskButton.focus();
+    requestHide("minimized", () => {
+      actions.minimizeWindow();
+      taskButton.focus();
+    });
   };
 
   const restore = () => {
@@ -109,9 +151,10 @@ export function createWindowManager({
 
   const close = () => {
     if (currentView.visibility === "closed") return;
-    const app = getApplicationById(currentView.appId);
-    actions.closeWindow();
-    if (app && typeof onCloseFocus === "function") onCloseFocus(app);
+    requestHide("closed", (app) => {
+      actions.closeWindow();
+      if (app && typeof onCloseFocus === "function") onCloseFocus(app);
+    });
   };
 
   const toggleMaximized = () => {
@@ -140,6 +183,9 @@ export function createWindowManager({
       });
     },
     destroy() {
+      destroyed = true;
+      hideRequestSequence += 1;
+      hidePending = false;
       unsubscribe();
       minimizeButton.removeEventListener("click", minimize);
       maximizeButton.removeEventListener("click", toggleMaximized);

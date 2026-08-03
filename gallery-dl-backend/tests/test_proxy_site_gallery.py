@@ -23,6 +23,16 @@ from gdl_backend.site import SiteResolver
 from tests.helpers import WORKSPACE, make_settings
 
 
+def _mark_all_records_healthy(adapter: ProxyPoolAdapter) -> dict[str, object]:
+    for record in adapter._records:
+        record.healthy = True
+    return {
+        "total": len(adapter._records),
+        "healthy": len(adapter._records),
+        "results": [],
+    }
+
+
 class SiteAndGalleryTests(unittest.TestCase):
     def test_site_resolver_uses_gallery_extractor(self):
         resolver = SiteResolver(WORKSPACE / "gallery-dl-codeberg")
@@ -535,7 +545,7 @@ proxies:
                 "http://127.0.0.1:18081#HK",
             ]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 2, "healthy": 2, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             started = adapter.start(force_refresh=True)
             self.assertEqual(started["start"]["engine"], "native")
             lease = adapter.acquire("task-jp", node_tags=["jp"])
@@ -555,7 +565,7 @@ proxies:
                 "http://127.0.0.1:18081#SECOND",
             ]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 2, "healthy": 2, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             try:
                 allowed_id = adapter._records[1].id
@@ -573,7 +583,7 @@ proxies:
             settings.proxy.enabled = True
             settings.proxy.inline_nodes = ["http://127.0.0.1:18080#AUSTRALIA"]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 1, "healthy": 1, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             try:
                 self.assertIsNone(adapter.acquire("task-us", node_tags=["us"]))
@@ -601,7 +611,7 @@ proxies:
             settings.proxy.enabled = True
             settings.proxy.inline_nodes = ["http://user:pass@127.0.0.1:18082#AUTH"]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 1, "healthy": 1, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             lease = adapter.acquire("task-auth")
             self.assertIsNotNone(lease)
@@ -616,7 +626,7 @@ proxies:
             settings.proxy.enabled = True
             settings.proxy.inline_nodes = ["http://127.0.0.1:18083#SLOW"]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 1, "healthy": 1, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             entered = threading.Event()
             release_probe = threading.Event()
@@ -682,27 +692,96 @@ proxies:
                         )
                     self.assertEqual(result["healthy"], expected)
 
-    def test_health_and_retry_eligibility_are_independent(self):
+    def test_unhealthy_node_is_not_leased_after_cooldown_expires(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(Path(tmp))
             settings.proxy.enabled = True
             settings.proxy.fail_cooldown_seconds = 0
             settings.proxy.inline_nodes = ["http://127.0.0.1:18080#PROBE"]
             adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
-            adapter.probe = lambda **_: {"total": 1, "healthy": 0, "results": []}
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
             adapter.start(force_refresh=True)
             try:
+                lease = adapter.acquire("task-failing")
+                self.assertIsNotNone(lease)
+                adapter.release("task-failing", proxy_fault=True, reason="fixture failure")
+
                 node = adapter.status()["nodes"][0]
                 self.assertFalse(node["healthy"])
-                self.assertTrue(node["retry_eligible"])
-                self.assertEqual(adapter.status()["retry_eligible"], 1)
+                self.assertFalse(node["retry_eligible"])
+                self.assertEqual(adapter.status()["retry_eligible"], 0)
+                self.assertIsNone(adapter.acquire("task-after-cooldown"))
+            finally:
+                adapter.stop(force=True)
 
-                lease = adapter.acquire("task-after-cooldown")
-                self.assertIsNotNone(lease)
-                adapter.release("task-after-cooldown", proxy_fault=False)
-                released = adapter.status()["nodes"][0]
-                self.assertFalse(released["healthy"])
-                self.assertTrue(released["retry_eligible"])
+    def test_explicit_pre_probe_recovers_unhealthy_node_before_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            settings.proxy.fail_cooldown_seconds = 0
+            settings.proxy.inline_nodes = ["http://127.0.0.1:18080#PROBE"]
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
+            adapter.start(force_refresh=True)
+            try:
+                first = adapter.acquire("task-failing")
+                self.assertIsNotNone(first)
+                adapter.release("task-failing", proxy_fault=True, reason="fixture failure")
+                self.assertFalse(adapter._records[0].healthy)
+
+                probes = []
+
+                def successful_probe(node_id, endpoint, target_url, *, update_pool=True):
+                    probes.append((node_id, endpoint, target_url, update_pool))
+                    return {"healthy": True}
+
+                adapter._probe_endpoint = successful_probe
+                recovered = adapter.acquire(
+                    "task-pre-probed",
+                    probe_before_use=True,
+                    probe_url="https://example.com/health",
+                )
+                self.assertIsNotNone(recovered)
+                self.assertEqual(recovered.node_id, first.node_id)
+                self.assertEqual(len(probes), 1)
+                self.assertFalse(probes[0][3])
+                self.assertTrue(adapter._records[0].healthy)
+                adapter.release("task-pre-probed", proxy_fault=False)
+                self.assertTrue(adapter.status()["nodes"][0]["retry_eligible"])
+            finally:
+                adapter.stop(force=True)
+
+    def test_background_probe_restores_unhealthy_node_for_normal_lease(self):
+        class Response:
+            status_code = 204
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.proxy.enabled = True
+            settings.proxy.fail_cooldown_seconds = 0
+            settings.proxy.inline_nodes = ["http://127.0.0.1:18080#PROBE"]
+            adapter = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+            adapter.probe = lambda **_: _mark_all_records_healthy(adapter)
+            adapter.start(force_refresh=True)
+            try:
+                first = adapter.acquire("task-failing")
+                self.assertIsNotNone(first)
+                adapter.release("task-failing", proxy_fault=True, reason="fixture failure")
+                self.assertIsNone(adapter.acquire("task-before-background-probe"))
+
+                del adapter.probe
+                with patch("gdl_backend.proxy.requests.get", return_value=Response()):
+                    probed = adapter.probe(node_id=first.node_id)
+                self.assertEqual(probed["healthy"], 1)
+                self.assertTrue(adapter.status()["nodes"][0]["retry_eligible"])
+
+                recovered = adapter.acquire("task-after-background-probe")
+                self.assertIsNotNone(recovered)
+                self.assertEqual(recovered.node_id, first.node_id)
+                adapter.release("task-after-background-probe", proxy_fault=False)
             finally:
                 adapter.stop(force=True)
 

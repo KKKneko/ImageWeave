@@ -1,16 +1,17 @@
 # ImageWeave WebUI 桌面化重写开发方案
 
-状态：**方案已确认，待实施**
+状态：**已实现；桌面个性化增补已验收**
 
-最后更新：2026-08-02
+最后更新：2026-08-03
 
-本文是 ImageWeave WebUI 重写的实施基线。后续开发、评审与验收均以本文为准；如需改变应用边界、部署方式或代理源持久化语义，应先更新本文再改代码。
+本文最初是 ImageWeave WebUI 重写的实施基线，现保留决策与迁移历史，并同步记录正式 `/ui/` 的
+当前边界。后续如需改变应用边界、部署方式、桌面个性化或代理源持久化语义，应先更新本文再改代码。
 
 ---
 
 ## 1. 背景
 
-当前 WebUI 位于：
+重写前的 WebUI 位于：
 
 ```text
 gallery-dl-backend/gdl_backend/webui/
@@ -19,11 +20,12 @@ gallery-dl-backend/gdl_backend/webui/
 └── styles.css
 ```
 
-它由 FastAPI 同源挂载在 `/ui/`，已经覆盖聚合搜索、站点授权、代理池控制、顺序批次、任务监控、去重分析和人工审核，但所有功能集中在一个长页面与单个 JavaScript 文件中。
+当时由 FastAPI 同源挂载在 `/ui/`，并已覆盖聚合搜索、站点授权、代理池控制、顺序批次、任务监控、
+去重分析和人工审核，但所有功能集中在一个长页面与单个 JavaScript 文件中。
 
 仓库根目录的 `blog/` 是本次视觉重写的本地参考代码。需要复用的是其复古桌面视觉语言：
 
-- 像素抖动云背景；
+- 像素抖动云背景（仅是重写初期的历史视觉参考）；
 - 桌面快捷方式；
 - 仿系统内容窗口；
 - START 开始菜单；
@@ -31,6 +33,8 @@ gallery-dl-backend/gdl_backend/webui/
 - 严格双色、2px 实线边框和无模糊硬阴影。
 
 `blog/` 只作为参考，不参与 ImageWeave 构建、打包或运行，并由根 `.gitignore` 整目录忽略。
+云背景方案已经退出正式实现：当前 `/ui/` 使用静态纯色或本地重编码图片壁纸，不加载云背景资源，
+也没有背景 WebGL、Canvas 或持续 `requestAnimationFrame()`。
 
 ---
 
@@ -107,7 +111,7 @@ WebUI 不直接读写完整 `config.json`。API 修改保存到应用管理的�
 - 保持现有抓取、授权、代理、批次和审核功能等价；
 - 将业务逻辑拆分为可维护的 ES Module；
 - 为代理源提供安全、持久、脱敏的 CRUD API；
-- 提供站点策略与诊断应用；
+- 提供站点策略、系统诊断与完全本地的桌面个性化应用；
 - 为尚未开发的功能保留明确的桌面应用占位；
 - 保持 `/ui/` 同源部署和本地回环安全边界；
 - 保持桌面端、平板和手机端可操作。
@@ -135,8 +139,9 @@ WebUI 不直接读写完整 `config.json`。API 修改保存到应用管理的�
 | `proxy` | 代理配置 | `C:\IMAGEWEAVE\PROXY.CPL` | `#/proxy` | 可用 | 普通 |
 | `vault` | 凭证管理 | `C:\IMAGEWEAVE\VAULT.CPL` | `#/vault` | 可用 | 普通 |
 | `review` | 去重审核 | `C:\IMAGEWEAVE\REVIEW.EXE` | `#/review` | 可用 | **最大化** |
-| `policy` | 站点策略 | `C:\IMAGEWEAVE\POLICY.CPL` | `#/policy` | 可用 | 普通 |
+| `policy` | 各站运行设置 | `C:\IMAGEWEAVE\POLICY.CPL` | `#/policy` | 可用 | 普通 |
 | `diagnostics` | 系统诊断 | `C:\IMAGEWEAVE\DIAG.EXE` | `#/diagnostics` | 可用 | 普通 |
+| `personalization` | 桌面个性化 | `C:\IMAGEWEAVE\DESKTOP.CPL` | `#/personalization` | 可用 | 普通 |
 | `gallery` | 图片库 | `C:\IMAGEWEAVE\GALLERY.EXE` | `#/gallery` | 占位 | 普通 |
 | `schedule` | 定时任务 | `C:\IMAGEWEAVE\SCHEDULE.EXE` | `#/schedule` | 占位 | 普通 |
 | `export` | 数据集导出 | `C:\IMAGEWEAVE\EXPORT.EXE` | `#/export` | 占位 | 普通 |
@@ -264,9 +269,12 @@ WebUI 不直接读写完整 `config.json`。API 修改保存到应用管理的�
 - 保留服务端分页，禁止一次加载全部审核图片；
 - 图片使用懒加载，切页前自动保存脏决策或阻止切换。
 
-### 4.7 `POLICY.CPL`：站点策略
+### 4.7 `POLICY.CPL`：各站运行设置
 
-使用现有接口：
+> **现行产品决定（取代阶段 4B 的旧高级编辑器）：** 本节早期版本曾允许探活地址、节点标签、
+> 多层超时、gallery-dl 重试和附加参数。该结构已经被四字段极简方案完全取代，不再是当前契约。
+
+继续使用既有路由：
 
 ```text
 GET    /api/v1/sites/policies
@@ -275,26 +283,25 @@ PUT    /api/v1/sites/policies/{site}
 DELETE /api/v1/sites/policies/{site}
 ```
 
-支持编辑：
+每站只允许编辑：
 
-- 最大并发；
-- 重试次数与退避；
-- 默认代理模式；
-- HTTPS 探活地址；
-- 使用前探活；
-- 节点标签；
-- HTTP、任务和无进展超时；
-- gallery-dl 重试；
-- 已受后端白名单保护的额外参数。
+- `max_concurrency`：并发任务；
+- `retry_limit`：重试次数；
+- `backoff_base_seconds`：重试间隔；
+- `proxy_mode`：代理方案，可选不使用代理、优先代理或只使用代理。
 
-必须明确标识“继承默认值”和“站点覆盖值”，删除覆盖前需要确认。
+PUT 必须提交完整四字段对象。后端请求模型、数据库写入层和前端模型都拒绝未知字段；旧高级字段
+不能通过默认响应、`?view=policy`、`default_site_policy` 或升级前数据库覆盖改变新任务。
+运行时完整 `SitePolicy` 由四字段与后端固定值合成；CRAWL 的单次 EH 选项、受控附加参数和显式
+连接方式仍保持原优先级。
 
-阶段 4B 使用同一路由的 `?view=policy` 最小响应 profile，默认 `legacy` 响应保持兼容。投影只枚举
-Danbooru、X、Pixiv、EH 与 Pawchive，未知站点覆盖只返回计数；绝对路径、URL 凭据/query/fragment、
-疑似秘密赋值及不安全旧值不进入响应。POLICY 不管理来源启用/排序，也不迁移 EH 标签
-include/exclude；这些仍属于阶段 5 `CRAWL.EXE`。未保存草稿不进入 Store/Storage，配置无轮询；
-PUT/DELETE 尝试无论成功或失败都重新 GET 权威值；失败时只恢复 DOM 草稿，若基线已变化则进入
-冲突态。后端没有 ETag/revision，前端世代门只处理本页竞态。
+界面主体只显示网站选择、四个字段、“保存该网站设置”和“恢复统一默认”。不显示授权、探活、
+节点、内部状态说明或手动刷新。未保存内容不进入 Store/Storage；切站、切应用、最小化、关闭与
+浏览器离开均保留确认和 ARIA 生命周期。保存只影响之后新建的搜索、规划和任务，既有任务继续使用
+已持久化快照。
+
+数据库 schema v8 首次升级会在同一事务中清空全部旧 `site_policies` 行并写入迁移版本；之后新建
+的四字段覆盖在重启后保留。删除某站覆盖后，该站重新使用统一默认。
 
 ### 4.8 `DIAG.EXE`：系统诊断
 
@@ -317,7 +324,25 @@ GET /api/v1/scheduler/status
 
 诊断应用只读，不提供直接编辑完整配置文件的能力。
 
-### 4.9 占位应用
+### 4.9 `DESKTOP.CPL`：桌面个性化
+
+职责：
+
+- 自定义“强调色 + 窗口底色”两个界面主题字段；只接受严格六位 HEX，任意颜色组合均可预览和应用，界面同步显示实际对比度，并自动派生浅/深 `color-scheme`；
+- 在六种内置静态纯色间预览与应用；
+- 在本机校验、解码并重编码 JPG、PNG 或 WebP 静态壁纸；
+- 调整填充、九宫格位置、深浅遮罩、0–10px 模糊与 92%–100% 窗口不透明度；
+- 在“开启动效 / 关闭动效”二态间切换，并服从系统 `prefers-reduced-motion`；
+- 将规范化完整偏好写入既有 LocalStorage key，将重编码 Blob 单独写入 IndexedDB。
+
+该应用不发起网络请求、调用业务 API、增加后端端点或上传内容。主题只写入完整偏好中的
+`themeAccent/themeSurface` 两个规范化严格六位 HEX，不建立新 storage key，不保存 CSS 声明、选择器、
+`var()` 或其他 CSS 文本；`File`、文件名、路径、Base64/Data URL 和 Blob URL 也不进入 Store 或
+LocalStorage。存储缺失、损坏或配额失败时回退安全纯色且不阻断桌面启动。完整设计与验收记录见
+[`../../docs/webui-desktop-personalization.md`](../../docs/webui-desktop-personalization.md) 与
+[`../../docs/webui-interface-theme-personalization.md`](../../docs/webui-interface-theme-personalization.md)。
+
+### 4.10 占位应用
 
 `GALLERY.EXE`、`SCHEDULE.EXE` 和 `EXPORT.EXE` 首期只打开统一占位窗口：
 
@@ -333,9 +358,10 @@ GET /api/v1/scheduler/status
 
 ### 5.1 设计令牌
 
-保留参考桌面的核心规则：
+重写初期从参考桌面继承了以下视觉草案；该片段只保留历史设计语境，**不是当前正式实现**：
 
 ```css
+/* 历史参考，已被 ImageWeave 语义 Token 与 G1–G3 主题决策取代 */
 :root {
   --hue: 345;
   --accent: oklch(0.55 0.12 var(--hue));
@@ -346,9 +372,30 @@ GET /api/v1/scheduler/status
 }
 ```
 
-最终变量命名统一使用 ImageWeave 语义，不继续使用博客中的 `--blue` 命名。
+正式版本统一使用 ImageWeave 语义命名，并由两个可验证的基础颜色 Token 驱动双色界面：
 
-主题首期只保证一个固定默认色相。未来可以增加普通主题设置，但不得重新引入桌宠主题逻辑。
+```css
+:root {
+  --imageweave-accent: #46515D;
+  --imageweave-surface: #F4F1EA;
+  --imageweave-taskbar-height: 40px;
+  --imageweave-border-width: 2px;
+  --imageweave-hard-shadow: 5px 5px 0 var(--imageweave-accent);
+}
+
+:root[data-theme-tone="light"] { color-scheme: light; }
+:root[data-theme-tone="dark"]  { color-scheme: dark; }
+```
+
+`#46515D / #F4F1EA` 是新安装、迁移缺省和恢复默认使用的墨灰纸白组合，不再以固定紫白作为正式
+主题。`DESKTOP.CPL` 可修改的颜色仍仅限强调色与窗口底色：输入必须是严格 `#RRGGBB`，规范化为
+大写，任意对比度（包括同色）都可立即预览、应用和持久化，live status 只同步显示实际对比度。
+窗口底色只负责派生固定 `light/dark` tone；forced-colors 使用 `CanvasText/Canvas`，不会把系统色写回偏好。
+
+运行时只向根节点的两个固定 Token 名写入严格投影后的 HEX，并设置固定
+`data-theme-tone="light|dark"`；不接受动态 Token 名、任意 CSS、dataset 颜色值或
+`prefers-color-scheme` 自动换色。完整安全模型与 G3 验收见
+[`../../docs/webui-interface-theme-personalization.md`](../../docs/webui-interface-theme-personalization.md)。
 
 ### 5.2 状态语法
 
@@ -373,7 +420,7 @@ GET /api/v1/scheduler/status
 
 桌面包含：
 
-1. WebGL 抖动云背景与静态 PNG 回退；
+1. 默认 `graphite` 的静态壁纸层，可切换六种纯色或本地重编码静态图片，并提供独立遮罩层；
 2. 桌面应用图标；
 3. 一个前台内容窗口；
 4. START 开始菜单；
@@ -409,13 +456,13 @@ GET /api/v1/scheduler/status
 - 任务栏尊重安全区；
 - 内容窗口内部独立滚动，页面本身不产生双滚动条。
 
-### 5.6 云背景性能
+### 5.6 静态壁纸约束
 
-- WebGL 初始化失败时立即使用静态回退图；
-- 页面隐藏时停止 `requestAnimationFrame`；
-- 减少动态偏好下只渲染静态帧；
-- WebGL context lost 后不循环重试；
-- 云背景永远不拦截鼠标或触摸事件。
+- 默认使用 `graphite`（`#20242A`）纯色；
+- 壁纸层及其图片层、遮罩层永远不拦截鼠标或触摸事件；
+- 壁纸层对辅助技术隐藏，且不得进入键盘焦点顺序；
+- 桌面背景不得使用 Canvas、WebGL 或持续 `requestAnimationFrame()`；
+- 壁纸层不承载业务数据，不改变桌面壳层的现有交互。
 
 ---
 
@@ -426,8 +473,6 @@ GET /api/v1/scheduler/status
 ```text
 gallery-dl-backend/gdl_backend/webui/
 ├── index.html
-├── assets/
-│   └── dithered-cloud-fallback.png
 ├── styles/
 │   ├── tokens.css
 │   ├── base.css
@@ -442,7 +487,8 @@ gallery-dl-backend/gdl_backend/webui/
 │       ├── vault.css
 │       ├── review.css
 │       ├── policy.css
-│       └── diagnostics.css
+│       ├── diagnostics.css
+│       └── personalization.css
 └── js/
     ├── main.js
     ├── core/
@@ -454,12 +500,17 @@ gallery-dl-backend/gdl_backend/webui/
     │   ├── window-manager.js
     │   ├── polling.js
     │   ├── storage.js
+    │   ├── motion.js
+    │   ├── personalization-model.js
+    │   ├── personalization.js
+    │   ├── wallpaper-image-import.js
+    │   ├── wallpaper-storage.js
     │   └── dom.js
     ├── components/
-    │   ├── cloud-background.js
     │   ├── icons.js
     │   ├── status.js
     │   ├── dialog.js
+    │   ├── personalization-view.js
     │   └── empty-state.js
     └── apps/
         ├── crawl.js
@@ -469,6 +520,7 @@ gallery-dl-backend/gdl_backend/webui/
         ├── review.js
         ├── policy.js
         ├── diagnostics.js
+        ├── personalization.js
         └── placeholder.js
 ```
 
@@ -514,6 +566,7 @@ gallery-dl-backend/gdl_backend/webui/
 #/review
 #/policy
 #/diagnostics
+#/personalization
 #/gallery
 #/schedule
 #/export
@@ -604,10 +657,10 @@ gallery-dl-backend/gdl_backend/webui/
 
 允许保存：
 
-- 当前应用 ID；
-- 当前批次 ID；
+- 当前应用 ID 与当前批次 ID（`sessionStorage`）；
 - 窗口最大化状态；
-- 非敏感 UI 偏好。
+- 严格白名单、规范化且不含图片/CSS 文本的 UI/桌面个性化完整偏好（`LocalStorage`）；主题只含 `themeAccent/themeSurface` 两个严格六位 HEX；
+- 仅在 IndexedDB 中保存本机重编码后的静态壁纸 Blob。
 
 禁止保存：
 
@@ -616,7 +669,13 @@ gallery-dl-backend/gdl_backend/webui/
 - 代理用户名或密码；
 - Cookie、Token 或 OAuth 回调；
 - 浏览器 Profile 路径；
-- 未脱敏 API 原始响应。
+- 未脱敏 API 原始响应；
+- 原始 `File`、本地文件名或路径、Base64/Data URL、Blob URL；
+- CSS 声明、选择器、颜色函数、`var()`、动态 Token 名或其他主题文本。
+
+桌面个性化 Blob 不进入中央 Store 或 LocalStorage，也不上传后端；临时 Object URL 只在内存中存在，
+替换、取消或卸载时撤销。界面主题不建立专用 key，只随既有 `imageweave.ui:ui-preferences` 的完整
+偏好对象保存两个规范化 HEX 字段。
 
 ---
 
@@ -632,7 +691,7 @@ gallery-dl-backend/gdl_backend/webui/
 | 顺序批次 | `/api/v1/crawls...` | `CRAWL.EXE`、`TASKMGR.EXE` |
 | 去重审核 | `/api/v1/crawls/{id}/review...` | `REVIEW.EXE` |
 | 任务详情 | `/api/v1/tasks...` | `TASKMGR.EXE` |
-| 站点策略 | `/api/v1/sites/policies...` | `POLICY.CPL` |
+| 各站运行设置 | `/api/v1/sites/policies...` | `POLICY.CPL` |
 | 调度摘要 | `/api/v1/scheduler/status` | `DIAG.EXE` |
 
 现有 API 的业务语义保持不变。前端拆分不是后端状态机重写。
@@ -976,7 +1035,7 @@ proxy_sources_store_error
 
 - [x] 建立新目录结构与 ES Module 入口；
 - [x] 移植并重命名设计令牌；
-- [x] 移植 WebGL 云背景与静态回退；
+- [x] 建立默认 `graphite` 静态壁纸层并移除 WebGL 云背景与静态回退；
 - [x] 完成应用注册表、Hash 路由、窗口管理、开始菜单、任务栏和时钟；
 - [x] 创建全部真实应用与占位应用空壳；
 - [x] 确认不存在桌宠脚本、素材、Storage 或开场隐藏逻辑；
@@ -1009,8 +1068,9 @@ proxy_sources_store_error
 - [x] 验证共享浏览器授权轮询不会因应用切换重复启动；
 - [x] 验证任何 UI 状态与日志不含凭证。
 
-阶段 4A 已完成 VAULT 模块、后端安全投影、秘密生命周期和共享授权轮询验收。阶段 4B 已完成
-POLICY 的五来源安全投影、站点策略编辑、SQLite 覆盖/reset、草稿生命周期与无轮询验收。
+阶段 4A 已完成 VAULT 模块、后端安全投影、秘密生命周期和共享授权轮询验收。阶段 4B 最初完成的
+POLICY 高级编辑器现仅作为历史实现记录；其字段集合、状态说明和手动刷新交互均已被 4.7 节现行
+四字段极简决定取代。当前版本保留五站读取、单站保存/恢复、草稿生命周期与无轮询边界。
 DIAG.EXE 现已使用 diagnostics 最小投影接入健康、就绪、配置能力和调度摘要；配置阶段的 Store、
 DOM、Storage、URL、日志与浏览器错误路径已完成集中脱敏复核。来源勾选/排序、每请求路由及 EH
 标签 include/exclude 按本方案归阶段 5 的 CRAWL.EXE，并已完成迁移。
@@ -1048,11 +1108,18 @@ DOM、Storage、URL、日志与浏览器错误路径已完成集中脱敏复核�
 `/ui-next/` 挂载已移除，旧单页 `index.html`、`app.js` 与 `styles.css` 已删除且不保留兼容副本。
 阶段 0 的旧界面截图由维护者明确放弃，不作为发布阻塞项；功能与请求基线仍保留为历史文档。
 
-切换前的可执行验收已完成：前端模型套件 48 项与后端 276 项通过；根去重共 32 项，其中 31 项通过、
-真实私有样本 1 项按设计跳过；`doctor.sh` 为 ready；1440px/320px 浏览器烟雾覆盖七个主应用、三个占位入口、
-搜索建批、活动批次轮询/取消、审核脏页保存/应用与 DIAG 离线旧快照。正式切换后的静态契约继续验证
-`/ui/` 包含全部 59 个模块化资源，`/ui-next/` 与旧平面 `app.js/styles.css` 均返回 404；wheel 仅打包
-正式 WebUI 资源。
+切换前的历史验收（尚未加入 `DESKTOP.CPL`）已完成：前端模型套件 48 项与后端 276 项通过；根去重共
+32 项，其中 31 项通过、真实私有样本 1 项按设计跳过；`doctor.sh` 为 ready；1440px/320px 浏览器
+烟雾覆盖当时七个业务主应用、三个占位入口、搜索建批、活动批次轮询/取消、审核脏页保存/应用与
+DIAG 离线旧快照。正式切换后的静态契约继续验证 `/ui/` 当时包含的 59 个模块化资源，`/ui-next/`
+与旧平面 `app.js/styles.css` 均返回 404；wheel 仅打包正式 WebUI 资源。
+
+后续桌面个性化增补将当前可用主应用数更新为八个：新增 `DESKTOP.CPL`，以静态壁纸替代云背景，
+并在其后的 G1–G3 决策中安全开放“强调色 + 窗口底色”两个固定主题 Token。A–F 桌面增补与 G1–G3
+主题增补的聚焦自动化、真实浏览器场景和验收记录分别维护在
+[`../../docs/webui-desktop-personalization.md`](../../docs/webui-desktop-personalization.md) 与
+[`../../docs/webui-interface-theme-personalization.md`](../../docs/webui-interface-theme-personalization.md)，
+不改写上述正式切换时点的历史测试数字。
 
 ---
 
@@ -1128,6 +1195,11 @@ DOM、Storage、URL、日志与浏览器错误路径已完成集中脱敏复核�
 13. `prefers-reduced-motion` 下无持续背景动画；
 14. 网络请求中不存在 `/neuro-pet/`。
 
+桌面与主题个性化增补不扩展本节的历史 E2E 矩阵；其聚焦自动化与真实浏览器重点场景见
+[`../../docs/webui-desktop-personalization.md`](../../docs/webui-desktop-personalization.md#13-实现结果与验证记录)
+和
+[`../../docs/webui-interface-theme-personalization.md`](../../docs/webui-interface-theme-personalization.md#12-验收清单)。
+
 ### 11.4 回归命令
 
 至少执行：
@@ -1146,17 +1218,18 @@ DOM、Storage、URL、日志与浏览器错误路径已完成集中脱敏复核�
 
 ### 12.1 功能
 
-- [x] 七个首期应用均可从桌面和开始菜单进入；
+- [x] 八个可用主应用均可从桌面和开始菜单进入；
+- [x] `DESKTOP.CPL` 只处理本地个性化，不发送业务 API 请求；界面主题只开放两个固定 Token，严格六位 HEX 的任意颜色组合均可应用；
 - [x] 三个占位应用明确标记且不伪造功能；
 - [x] 旧 WebUI 的搜索、授权、爬取、批次、代理和审核能力无回归；
-- [x] 站点策略和系统诊断具备独立应用；
+- [x] 各站运行设置和系统诊断具备独立应用；
 - [x] 代理 URL、节点文件和内联节点可通过 API 管理；
 - [x] 代理源修改持久化且必须显式重载才切换运行池；
 - [x] 有活动租约时不会被配置保存强制中断。
 
 ### 12.2 视觉与交互
 
-- [x] 桌面、云背景、窗口、开始菜单和任务栏形成统一复古视觉；
+- [x] 静态个性化壁纸、可验证的双颜色主题 Token、窗口、开始菜单和任务栏形成统一复古视觉；
 - [x] 所有状态具有文字、图标和非颜色视觉差异；
 - [x] `REVIEW.EXE` 默认最大化；
 - [x] 桌面、平板和手机可操作；
@@ -1183,6 +1256,7 @@ rg -n "neuro-pet|NeuroPet|PETS\.CPL|__neuroIntroPlay" \
 ### 12.4 安全与部署
 
 - [x] API 响应、DOM、Storage 和界面日志不包含代理或授权秘密；
+- [x] 桌面个性化完整偏好只写既有 LocalStorage 白名单，主题仅存两个严格 HEX 且不保存 CSS 文本；重编码 Blob 只写 IndexedDB，主题与图片均不上传；
 - [x] 代理源覆盖文件使用私有权限与原子写入；
 - [x] FastAPI 仍只需托管静态文件；
 - [x] 正式安装与运行不依赖 Node.js；
@@ -1191,7 +1265,7 @@ rg -n "neuro-pet|NeuroPet|PETS\.CPL|__neuroIntroPlay" \
 
 ---
 
-## 13. 预计改动文件
+## 13. 历史预计改动文件
 
 后端：
 
@@ -1209,7 +1283,6 @@ gallery-dl-backend/tests/test_proxy_sources.py         # 新增或扩展
 
 ```text
 gallery-dl-backend/gdl_backend/webui/index.html
-gallery-dl-backend/gdl_backend/webui/assets/
 gallery-dl-backend/gdl_backend/webui/styles/
 gallery-dl-backend/gdl_backend/webui/js/
 ```

@@ -17,11 +17,11 @@ const SITE_IDS = new Set(["danbooru", "twitter", "pixiv", "exhentai", "pawchive"
 const STATUS_LABELS = Object.freeze({
   queued: "等待", pending: "待处理", planning: "规划中", starting: "启动中",
   running: "运行中", succeeded: "成功", failed: "失败", cancelling: "取消中",
-  cancelled: "已取消", completed_with_errors: "完成但有错误",
+  cancelled: "已取消", completed_with_errors: "部分失败",
 });
 const REVIEW_LABELS = Object.freeze({
-  not_started: "去重未开始", waiting_for_crawl: "等待手动启动", pending: "分析已排队",
-  analyzing: "去重分析中", auto_applying: "严格自动整理中", ready: "待审核",
+  not_started: "去重未开始", waiting_for_crawl: "待开始分析", pending: "分析已排队",
+  analyzing: "去重分析中", auto_applying: "自动去重中", ready: "待审核",
   applying: "正在应用", applied: "审核已应用", failed: "分析失败",
   apply_failed: "部分处理失败", disabled: "审核未启用",
 });
@@ -108,8 +108,8 @@ function sanitizeAddress(raw, fallbackOrder = 0) {
   return Object.freeze({
     id,
     order: boundedCount(raw.address_order, 100_000) || fallbackOrder,
-    label: safeText(raw.label, "未命名地址", 140),
-    addressType: safeText(raw.address_type, "图库地址", 60),
+    label: safeText(raw.label, "未命名来源", 140),
+    addressType: safeText(raw.address_type, "来源地址", 60),
     status,
     statusLabel: STATUS_LABELS[status] || status,
     statusKind: statusKind(status),
@@ -195,7 +195,7 @@ export function sanitizeBatchDetail(value) {
 
 export function sanitizeTaskPage(value, batchId) {
   if (!isRecord(value) || !Array.isArray(value.items) || !safeId(batchId)) {
-    throw new TypeError("批次任务页格式无效");
+    throw new TypeError("任务列表格式无效");
   }
   const tasks = [];
   for (const raw of value.items.slice(0, TASK_DISPLAY_LIMIT)) {
@@ -252,19 +252,19 @@ export function validateBatchState({ batch, tasks, recent }) {
   if (batch !== null && (!isRecord(batch) || !safeId(batch.id) ||
       Object.prototype.hasOwnProperty.call(batch, "output_dir") ||
       Object.prototype.hasOwnProperty.call(batch, "url"))) {
-    throw new TypeError("批次安全投影无效");
+    throw new TypeError("批次状态数据无效");
   }
-  if (!Array.isArray(tasks) || !Array.isArray(recent)) throw new TypeError("批次列表安全投影无效");
+  if (!Array.isArray(tasks) || !Array.isArray(recent)) throw new TypeError("批次列表数据无效");
   for (const task of tasks) {
     if (!isRecord(task) || !safeId(task.id) || Object.prototype.hasOwnProperty.call(task, "url") ||
         Object.prototype.hasOwnProperty.call(task, "output_dir") ||
         Object.prototype.hasOwnProperty.call(task, "cookies_file")) {
-      throw new TypeError("任务安全投影无效");
+      throw new TypeError("任务状态数据无效");
     }
   }
   for (const item of recent) {
     if (!isRecord(item) || !safeId(item.id) || Object.prototype.hasOwnProperty.call(item, "output_dir")) {
-      throw new TypeError("最近批次安全投影无效");
+      throw new TypeError("最近批次数据无效");
     }
   }
   return { batch, tasks, recent };
@@ -328,17 +328,17 @@ export function taskErrorGuidance(error) {
     missing,
     conflict,
     targetApp: auth ? "vault" : proxy ? "proxy" : "diagnostics",
-    title: missing ? "批次不存在" : conflict ? "批次状态已变化" : "批次操作未完成",
-    message: status === 0 ? "无法连接到 ImageWeave 后端。" : "后端没有接受本次批次操作。",
+    title: missing ? "批次不存在" : conflict ? "批次状态已变化" : "批次操作失败",
+    message: status === 0 ? "无法连接到 ImageWeave 服务。" : "服务未接受本次批次操作。",
     nextStep: missing
-      ? "选择另一个最近批次；陈旧 session 批次 ID 会被清除。"
+      ? "请选择其他最近批次。"
       : conflict
-        ? "页面将重新读取权威状态；请根据最新状态选择可用操作。"
+        ? "页面将重新读取最新状态；请根据可用操作继续。"
         : auth
-          ? "打开 VAULT.CPL 修复授权后，再使用批次级恢复操作。"
+          ? "打开授权管理修复授权后，再重试未完成项。"
           : proxy
-            ? "打开 PROXY.CPL 检查代理池后，再使用批次级恢复操作。"
-            : "保留当前批次，手动刷新或打开 DIAG.EXE 检查连接。",
+            ? "打开代理管理检查代理池后，再重试未完成项。"
+            : "保留当前批次，刷新或打开系统诊断检查连接。",
   });
 }
 

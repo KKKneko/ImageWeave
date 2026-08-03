@@ -117,10 +117,10 @@ Danbooru artist tag 还会查询 `artists.json` 与 `artist_urls.json`，把人�
 才激活同一来源的下一个地址；来源内地址结束后，再激活下一个来源。因此来源顺序和
 地址顺序由 SQLite 持久化，不依赖内存列表或协程完成先后。
 
-每次地址从 `pending` 进入 `planning` 后，管理器先从地址 URL 提取 HTTPS 站点根地址
-（站点策略显式配置 `probe_url` 时优先使用），对全池执行一次探活。通过节点集合与探活
-摘要按地址持久化；该地址的发现、索引规划及全部图片任务只能从此集合取得租约。服务重启
-继续执行已建立任务时从 SQLite 恢复集合，切换到下一个地址时重新探活。
+每次地址从 `pending` 进入 `planning` 后，管理器从地址 URL 提取 HTTPS 站点根地址，对全池执行
+一次探活。站点级 `probe_url` 已固定为 `null`，不再接受 POLICY/config 覆盖。通过节点集合与探活
+摘要按地址持久化；该地址的发现、索引规划及全部图片任务只能从此集合取得租约。服务重启继续执行
+已建立任务时从 SQLite 恢复集合，切换到下一个地址时重新探活。
 
 单地址统一执行图片级规划：
 
@@ -180,7 +180,7 @@ worker 直接保留原脚本 `auto_groups` 中的组类型、winner 和原因。
 - `leases`：正在使用的节点；
 - `task_logs`：脱敏 stdout/stderr/backend 日志；
 - `task_events`：状态变化事件；
-- `site_policies`：每站策略。
+- `site_policies`：每站四字段覆盖（并发、重试、首次等待、连接方式）；schema v8 首次升级清空旧行。
 - `crawl_batches`：顺序批次、并发上限和聚合计数；
 - `crawl_addresses`：来源顺序、地址顺序、规划状态及来源级凭据；
 - `crawl_address_tasks`：地址与图片任务的稳定序号映射。
@@ -198,9 +198,9 @@ worker 直接保留原脚本 `auto_groups` 中的组类型、winner 和原因。
 1. 新地址规划前对对应图站执行全池 HTTPS 探活并持久化通过节点；
 2. `NativeProxyPool.acquire()` 将候选限制到该地址的通过集合；
 3. 原子排除已租用、冷却及任务已尝试节点；
-4. 应用站点 `node_tags`；
+4. 站点标签约束固定为空，不从 POLICY/config 过滤节点；
 5. 使用内部轮询游标分配节点，并记录成功、失败和冷却状态；
-6. 可选执行任务取用前的二次站点 HTTPS 探活；
+6. 任务取用节点前固定执行二次 HTTPS 探活；
 7. 任务全程固定同一代理；
 8. 仅明确的代理故障处罚节点。
 

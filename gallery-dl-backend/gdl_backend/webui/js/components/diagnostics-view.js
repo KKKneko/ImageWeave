@@ -33,17 +33,17 @@ function definitionList(items) {
 function buildDom(context) {
   const { root, app } = context;
   const headingId = "diagnostics-heading";
-  const headerBadge = createStatusBadge("disabled", "诊断待加载");
-  const refreshButton = button("refresh", "立即刷新", { primary: true });
-  const copyButton = button("copy", "复制脱敏摘要");
+  const headerBadge = createStatusBadge("disabled", "正在加载诊断");
+  const refreshButton = button("refresh", "刷新", { primary: true });
+  const copyButton = button("copy", "复制诊断摘要");
   const swagger = createElement("a", {
     className: "diagnostics-button",
-    text: "打开 Swagger",
+    text: "打开 API 文档",
     attributes: { href: "/docs", target: "_blank", rel: "noreferrer noopener" },
   });
   const operationLive = createElement("p", {
     className: "diagnostics-operation-live",
-    text: "正在等待首次只读检查。",
+    text: "正在等待首次检查。",
     attributes: { "aria-live": "polite" },
     dataset: { diagnosticsLive: "" },
   });
@@ -55,18 +55,18 @@ function buildDom(context) {
   const content = createElement("div", { attributes: { hidden: "" }, dataset: { diagnosticsContent: "" } }, [
     metrics,
     createElement("section", { className: "diagnostics-panel", attributes: { "aria-labelledby": "diagnostics-security-title" } }, [
-      createElement("h2", { text: "安全与部署边界", attributes: { id: "diagnostics-security-title" } }),
+      createElement("h2", { text: "安全配置", attributes: { id: "diagnostics-security-title" } }),
       configHost,
     ]),
     createElement("section", { className: "diagnostics-panel", attributes: { "aria-labelledby": "diagnostics-scheduler-title" } }, [
-      createElement("h2", { text: "调度摘要", attributes: { id: "diagnostics-scheduler-title" } }),
+      createElement("h2", { text: "任务调度", attributes: { id: "diagnostics-scheduler-title" } }),
       schedulerHost,
     ]),
     createElement("section", { className: "diagnostics-panel", attributes: { "aria-labelledby": "diagnostics-components-title" } }, [
       createElement("div", { className: "diagnostics-panel-heading" }, [
         createElement("div", {}, [
-          createElement("h2", { text: "就绪组件", attributes: { id: "diagnostics-components-title" } }),
-          createElement("p", { text: "只显示受控状态、计数和安全下一步，不显示日志、路径、完整配置或原始异常。" }),
+          createElement("h2", { text: "组件状态", attributes: { id: "diagnostics-components-title" } }),
+          createElement("p", { text: "已隐藏日志、路径、完整配置和原始错误信息。" }),
         ]),
       ]),
       componentHost,
@@ -83,7 +83,7 @@ function buildDom(context) {
       headerBadge,
       createElement("p", {
         className: "app-summary",
-        text: "DIAG.EXE 只读聚合健康、就绪、最小配置能力与调度摘要；所有写操作留在专属应用。",
+        text: "查看服务、代理、任务调度和去重环境的运行状态。此页面不会修改系统配置。",
       }),
       createElement("div", { className: "diagnostics-actions" }, [refreshButton, copyButton, swagger]),
     ]),
@@ -118,36 +118,36 @@ export function createDiagnosticsView(context) {
   const render = (snapshot) => {
     elements.content.hidden = !snapshot;
     elements.emptyHost.replaceChildren(...(!snapshot ? [createEmptyState({
-      label: "诊断待加载", title: "尚无安全诊断快照", message: "应用激活后会启动唯一低频只读轮询。",
+      label: "正在加载诊断", title: "尚无诊断结果", message: "页面打开后会自动刷新诊断信息。",
     })] : []));
     elements.copyButton.disabled = Boolean(busy || !snapshot);
     if (!snapshot) {
-      updateStatusBadge(elements.headerBadge, "disabled", "诊断待加载");
+      updateStatusBadge(elements.headerBadge, "disabled", "正在加载诊断");
       return;
     }
-    if (snapshot.offline) updateStatusBadge(elements.headerBadge, "error", "后端离线 · 显示旧快照");
-    else if (snapshot.stale) updateStatusBadge(elements.headerBadge, "warning", "部分状态陈旧");
+    if (snapshot.offline) updateStatusBadge(elements.headerBadge, "error", "服务离线 · 显示上次结果");
+    else if (snapshot.stale) updateStatusBadge(elements.headerBadge, "warning", "部分状态未更新");
     else if (snapshot.readiness?.ready) updateStatusBadge(elements.headerBadge, "ready", "系统已就绪");
     else updateStatusBadge(elements.headerBadge, "warning", "系统未完全就绪");
 
     const warnings = [];
     if (snapshot.offline) {
       warnings.push(createElement("section", { className: "diagnostics-warning" }, [
-        createStatusBadge("error", "后端当前离线"),
-        createElement("p", { text: "已停止采用新响应；可确认本地服务运行后手动刷新。" }),
+        createStatusBadge("error", "服务离线"),
+        createElement("p", { text: "请确认本地服务正在运行，然后刷新。" }),
       ]));
     } else if (snapshot.stale) {
       warnings.push(createElement("section", { className: "diagnostics-warning" }, [
-        createStatusBadge("warning", "快照不完整"),
-        createElement("p", { text: "部分端点失败，未用空值覆盖上一次安全组件状态。" }),
+        createStatusBadge("warning", "部分状态未更新"),
+        createElement("p", { text: "部分检查失败，当前显示上次成功读取的状态。" }),
       ]));
     }
     const failedEndpoints = Object.entries(snapshot.errors).filter(([, error]) => error);
     if (failedEndpoints.length) {
       warnings.push(createElement("section", { className: "diagnostics-warning" }, [
-        createStatusBadge("warning", `${failedEndpoints.length} 个只读请求异常`),
+        createStatusBadge("warning", `${failedEndpoints.length} 项检查异常`),
         createElement("p", {
-          text: `错误码：${failedEndpoints.map(([name, error]) => `${name}:${error.code}`).join(" · ")}。原始 details 未进入 Store 或 DOM。`,
+          text: `错误码：${failedEndpoints.map(([name, error]) => `${name}:${error.code}`).join(" · ")}。详细错误信息已隐藏。`,
         }),
       ]));
     }
@@ -155,8 +155,8 @@ export function createDiagnosticsView(context) {
 
     elements.metrics.replaceChildren(
       metric("连接", snapshot.offline ? "离线" : "在线"),
-      metric("健康", snapshot.health?.ok ? "通过" : "异常/未知"),
-      metric("就绪", snapshot.readiness?.ready ? "通过" : "未完全就绪"),
+      metric("服务状态", snapshot.health?.ok ? "正常" : "异常/未知"),
+      metric("功能状态", snapshot.readiness?.ready ? "已就绪" : "未完全就绪"),
       metric("检查时间", checkedTime(snapshot.lastCheckedAt)),
     );
 
@@ -165,14 +165,14 @@ export function createDiagnosticsView(context) {
       ["回环监听", config.loopbackOnly ? "是" : "否（异常）"],
       ["CORS", config.corsEnabled ? "已配置" : "未启用"],
       ["私网目标", config.privateTargetsEnabled ? "允许（需留意）" : "禁止"],
-      ["托管授权缓存", config.managedAuthCache ? "启用" : "未知"],
-      ["项目代理池", config.proxyEnabled ? `启用${config.proxyAutoStart ? " / 自动启动" : ""}` : "禁用"],
+      ["授权缓存", config.managedAuthCache ? "启用" : "未知"],
+      ["代理池", config.proxyEnabled ? `启用${config.proxyAutoStart ? " / 自动启动" : ""}` : "禁用"],
       ["Mihomo 传输核心", config.transportCoreEnabled ? "启用" : "禁用"],
       ["去重配置", config.dedupEnabled
         ? `${config.configuredDevice} · SSCD ${config.sscdEnabled ? "开" : "关"} · DINO ${config.dinoEnabled ? "开" : "关"}`
         : "禁用"],
     ]) : createEmptyState({
-      label: "配置投影不可用", title: "未读取到最小配置能力", message: "不会回退显示 legacy 完整配置。",
+      label: "无法读取安全配置", title: "安全配置不可用", message: "请刷新后重试。",
     }));
 
     const scheduler = snapshot.scheduler;
@@ -180,11 +180,11 @@ export function createDiagnosticsView(context) {
       ["任务调度器", scheduler.tasksRunning ? "运行中" : "未运行"],
       ["活动任务", `${scheduler.activeTasks} / ${scheduler.maxConcurrent}`],
       ["活动来源数", scheduler.activeSiteCount],
-      ["顺序批次管理器", scheduler.crawlsRunning ? "运行中" : "未运行"],
+      ["批次调度", scheduler.crawlsRunning ? "运行中" : "未运行"],
       ["活动批次", scheduler.activeBatches],
-      ["执行模型", `${scheduler.executionOrder} / ${scheduler.addressParallelism}`],
+      ["执行方式", `${scheduler.executionOrder} / ${scheduler.addressParallelism}`],
     ]) : createEmptyState({
-      label: "调度摘要不可用", title: "未读取到安全调度投影", message: "请手动刷新；不会展示任务载荷。",
+      label: "无法读取任务调度状态", title: "任务调度状态不可用", message: "请刷新后重试。",
     }));
 
     const cards = [];
@@ -192,13 +192,13 @@ export function createDiagnosticsView(context) {
       const children = [
         createElement("div", { className: "diagnostics-component-heading" }, [
           createElement("h3", { text: component.label }),
-          createStatusBadge(component.uiStatus, component.status, { compact: true }),
+          createStatusBadge(component.uiStatus, component.statusLabel, { compact: true }),
         ]),
         ...(component.detail ? [createElement("p", { text: component.detail })] : []),
         createElement("p", { className: "diagnostics-next-step", text: component.nextStep }),
       ];
       if (component.targetApp) {
-        children.push(button("navigate", `打开 ${component.targetApp === "proxy" ? "PROXY.CPL" : "TASKMGR.EXE"}`, { small: true }));
+        children.push(button("navigate", `打开 ${component.targetApp === "proxy" ? "代理管理" : "批次管理"}`, { small: true }));
       }
       cards.push(createElement("article", {
         className: "diagnostics-component",
@@ -206,7 +206,7 @@ export function createDiagnosticsView(context) {
       }, children));
     }
     elements.componentHost.replaceChildren(...(cards.length ? cards : [createEmptyState({
-      label: "组件状态不可用", title: "就绪组件尚未读取", message: "保留旧快照或手动刷新。",
+      label: "组件状态不可用", title: "尚未读取组件状态", message: "请刷新后重试。",
     })]));
   };
 
@@ -218,7 +218,7 @@ export function createDiagnosticsView(context) {
       busy = Boolean(value);
       root.toggleAttribute("aria-busy", busy);
       elements.refreshButton.disabled = busy;
-      elements.refreshButton.textContent = busy ? "正在刷新…" : "立即刷新";
+      elements.refreshButton.textContent = busy ? "正在刷新…" : "刷新";
       elements.copyButton.disabled = busy || !context.store.getState().diagnostics.snapshot;
     },
     setOperationMessage(message) {

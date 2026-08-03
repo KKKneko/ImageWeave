@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-motion="on" data-theme-tone="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light">
-  <meta name="description" content="ImageWeave 复古桌面 WebUI">
+  <meta name="description" content="ImageWeave 图片采集与管理界面">
   <link rel="icon" href="data:,">
-  <title>ImageWeave — 聚合爬图</title>
+  <title>ImageWeave — 图片采集</title>
   <link rel="stylesheet" href="./styles/tokens.css">
   <link rel="stylesheet" href="./styles/base.css">
   <link rel="stylesheet" href="./styles/desktop.css">
@@ -20,6 +20,7 @@
   <link rel="stylesheet" href="./styles/apps/review.css">
   <link rel="stylesheet" href="./styles/apps/policy.css">
   <link rel="stylesheet" href="./styles/apps/diagnostics.css">
+  <link rel="stylesheet" href="./styles/apps/personalization.css">
   <link rel="stylesheet" href="./styles/responsive.css">
   <script type="module" src="./js/main.js"></script>
 </head>
@@ -27,16 +28,24 @@
   <button type="button" class="skip-link" data-skip-link>跳到当前应用</button>
 
   <div class="desktop" data-desktop>
-    <div class="cloud-background" data-cloud-background data-cloud-state="loading" aria-hidden="true">
-      <img
-        data-cloud-fallback
-        src="./assets/dithered-cloud-fallback.png"
-        alt=""
-        width="1440"
-        height="900"
-        decoding="async"
+    <div
+      class="desktop-wallpaper desktop-wallpaper--graphite"
+      data-desktop-wallpaper
+      aria-hidden="true"
+      inert
+    >
+      <div
+        class="desktop-wallpaper__image-layer"
+        data-desktop-wallpaper-image
+        hidden
       >
-      <canvas data-cloud-canvas aria-hidden="true"></canvas>
+        <img
+          class="desktop-wallpaper__image"
+          alt=""
+          draggable="false"
+        >
+      </div>
+      <div class="desktop-wallpaper__mask" data-desktop-wallpaper-mask></div>
     </div>
 
     <nav class="desktop-icons" data-desktop-icons aria-label="ImageWeave 应用快捷方式"></nav>
@@ -98,35 +107,35 @@
           data-status="disabled"
           data-taskbar-summary="api"
         >
-          <span aria-hidden="true">—</span><span>API 待检测</span>
+          <span aria-hidden="true">—</span><span>服务检查中</span>
         </span>
         <span
           class="status-badge status-badge--compact"
           data-status="disabled"
           data-taskbar-summary="proxy"
         >
-          <span aria-hidden="true">—</span><span>代理待检测</span>
+          <span aria-hidden="true">—</span><span>代理检查中</span>
         </span>
         <span
           class="status-badge status-badge--compact"
           data-status="disabled"
           data-taskbar-summary="dedup"
         >
-          <span aria-hidden="true">—</span><span>去重待检测</span>
+          <span aria-hidden="true">—</span><span>去重检查中</span>
         </span>
         <button
           type="button"
           class="taskbar-summary-action"
           data-taskbar-refresh
-          aria-label="立即刷新系统摘要"
-          title="立即刷新系统摘要"
+          aria-label="刷新系统状态"
+          title="刷新系统状态"
         >↻</button>
         <button
           type="button"
           class="taskbar-summary-action taskbar-summary-action--diagnostics"
           data-taskbar-diagnostics
-          aria-label="打开 DIAG.EXE 查看脱敏诊断"
-          title="打开 DIAG.EXE"
+          aria-label="打开系统诊断"
+          title="打开系统诊断"
         >DIAG</button>
       </div>
 

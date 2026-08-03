@@ -12,7 +12,7 @@ const CATEGORY_LABELS = Object.freeze({
   artist: "画师", character: "角色", copyright: "作品", general: "标签", meta: "META",
 });
 const CONFIDENCE_LABELS = Object.freeze({
-  verified: "已验证", site_search: "站内候选", weak: "弱证据",
+  verified: "已核实", site_search: "站内结果", weak: "待核实",
 });
 const TAG_MODE_LABELS = Object.freeze({ include: "包含", exclude: "排除", none: "未筛选" });
 
@@ -30,6 +30,17 @@ function button(action, label, { primary = false, dangerous = false, small = fal
   });
 }
 
+export function createSourceErrorWarning(source) {
+  if (!source?.errorCode) return null;
+  const text = source.errorMessage
+    ? `来源搜索失败（${source.errorCode}）：${source.errorMessage}。请检查授权或代理后重试。`
+    : `来源搜索失败（${source.errorCode}）。请检查授权或代理后重试。`;
+  return createElement("p", {
+    className: "crawl-source-warning",
+    text,
+  });
+}
+
 function field(label, control, help = "") {
   return createElement("label", { className: "crawl-field" }, [
     createElement("span", { text: label }),
@@ -42,9 +53,9 @@ function selectProxyMode(name, value = "required", { inherit = false } = {}) {
   const select = createElement("select", {
     attributes: { name, "aria-label": name },
   });
-  if (inherit) select.append(createElement("option", { text: "继承全局", attributes: { value: "" } }));
+  if (inherit) select.append(createElement("option", { text: "使用全局设置", attributes: { value: "" } }));
   for (const [mode, label] of [
-    ["required", "必须使用代理池"], ["prefer", "优先代理池"], ["direct", "直连"],
+    ["required", "仅使用代理"], ["prefer", "优先使用代理，不可用时直连"], ["direct", "不使用代理"],
   ]) {
     const option = createElement("option", { text: label, attributes: { value: mode } });
     option.selected = mode === value;
@@ -68,7 +79,7 @@ function buildDom(context) {
     className: "crawl-suggestions",
     attributes: { id: "crawl-suggestions", role: "listbox", hidden: "" },
   });
-  const keywordField = field("关键词", keyword, "至少 2 个字符时查询 Danbooru 补全；输入不会写入 Storage。");
+  const keywordField = field("关键词", keyword, "输入至少 2 个字符可查看 Danbooru 搜索建议。");
   keywordField.classList.add("crawl-field--keyword");
   keywordField.append(suggestions);
 
@@ -97,20 +108,20 @@ function buildDom(context) {
 
   const searchButton = createElement("button", {
     className: "crawl-button crawl-button--primary",
-    text: "搜索候选图库",
+    text: "搜索来源",
     attributes: { type: "submit" },
     dataset: { operationKind: "search" },
   });
   const searchForm = createElement("form", { className: "crawl-search-form", dataset: { crawlForm: "search" } }, [
     createElement("div", { className: "crawl-search-grid" }, [
       keywordField,
-      field("证据上限", searchLimit),
-      field("搜索路由", searchProxy),
+      field("结果上限", searchLimit),
+      field("搜索连接方式", searchProxy),
     ]),
     sitePicker,
     createElement("details", { className: "crawl-advanced" }, [
-      createElement("summary", { text: "来源级路由覆盖" }),
-      createElement("p", { text: "只发送实际选择的覆盖；空值继承全局搜索或下载路由。" }),
+      createElement("summary", { text: "各来源连接方式（可选）" }),
+      createElement("p", { text: "未选择时使用上方的全局连接方式。" }),
       sourceOverrides,
     ]),
     createElement("div", { className: "crawl-form-actions" }, [searchButton]),
@@ -133,7 +144,7 @@ function buildDom(context) {
     createElement("div", { className: "crawl-panel-heading" }, [
       createElement("div", {}, [
         createElement("h3", { text: "EH 标签筛选", attributes: { id: "crawl-eh-title" } }),
-        createElement("p", { text: "同命名空间取任一，跨命名空间同时满足；排除条件优先。" }),
+        createElement("p", { text: "同一分类满足任意一个，不同分类需同时满足；排除标签优先。" }),
       ]),
       field("筛选标签列表", ehTagQuery),
     ]),
@@ -150,11 +161,11 @@ function buildDom(context) {
   }, [
     createElement("div", { className: "crawl-panel-heading" }, [
       createElement("div", {}, [
-        createElement("h2", { text: "选择来源与图库地址", attributes: { id: "crawl-results-title" } }),
+        createElement("h2", { text: "选择采集来源", attributes: { id: "crawl-results-title" } }),
         createElement("p", { dataset: { crawlResultSummary: "" } }),
       ]),
       createElement("div", { className: "crawl-toolbar" }, [
-        createElement("label", { className: "crawl-toggle" }, [weakToggle, createElement("span", { text: "显示弱证据" })]),
+        createElement("label", { className: "crawl-toggle" }, [weakToggle, createElement("span", { text: "显示待核实结果" })]),
         button("select-visible", "全选当前显示", { small: true }),
         button("clear-selection", "清空选择", { small: true }),
       ]),
@@ -174,7 +185,7 @@ function buildDom(context) {
   const outputDir = createElement("input", {
     attributes: {
       type: "text", maxlength: "2048", name: "output-dir", autocomplete: "off",
-      placeholder: "可选：相对默认下载目录或后端许可目录",
+      placeholder: "可选：默认下载目录下的相对路径或系统允许的目录",
     },
   });
   const imageOriginal = createElement("input", {
@@ -185,8 +196,8 @@ function buildDom(context) {
     attributes: { type: "radio", name: "eh-image-mode", value: "resample" },
   });
   const gpPolicy = createElement("select", { attributes: { name: "eh-gp-policy" } }, [
-    createElement("option", { text: "严格原图（失败即停止）", attributes: { value: "stop" } }),
-    createElement("option", { text: "允许降级到 1280", attributes: { value: "resized" } }),
+    createElement("option", { text: "停止该地址", attributes: { value: "stop" } }),
+    createElement("option", { text: "改用 1280px 版本", attributes: { value: "resized" } }),
   ]);
   const ehOptions = createElement("fieldset", {
     className: "crawl-eh-download",
@@ -198,11 +209,11 @@ function buildDom(context) {
       createElement("label", {}, [imageOriginal, createElement("span", { text: "原图" })]),
       createElement("label", {}, [imageResample, createElement("span", { text: "1280" })]),
     ]),
-    field("原图 GP 响应", gpPolicy),
+    field("原图不可用时", gpPolicy),
   ]);
   const startButton = createElement("button", {
     className: "crawl-button crawl-button--primary",
-    text: "按当前顺序创建批次",
+    text: "创建批次",
     attributes: { type: "submit", disabled: "" },
     dataset: { operationKind: "crawl" },
   });
@@ -213,17 +224,17 @@ function buildDom(context) {
   }, [
     createElement("div", { className: "crawl-panel-heading" }, [
       createElement("div", {}, [
-        createElement("h2", { text: "提交顺序批次" }),
-        createElement("p", { text: "来源与地址均按上方顺序执行；创建成功后自动打开 TASKMGR.EXE。" }),
+        createElement("h2", { text: "创建下载批次" }),
+        createElement("p", { text: "将按当前来源和地址顺序执行，创建后自动打开批次管理。" }),
       ]),
       createStatusBadge("disabled", "尚未选择地址"),
     ]),
     ehOptions,
     createElement("div", { className: "crawl-config-grid" }, [
-      field("单地址图片并发", concurrency),
-      field("任务保护上限", maxTasks),
-      field("下载路由", crawlProxy),
-      field("输出目录（可选）", outputDir, "不会保存到 Storage；后端仍执行许可目录校验。"),
+      field("每个地址并发数", concurrency),
+      field("最多任务数", maxTasks),
+      field("下载连接方式", crawlProxy),
+      field("输出目录（可选）", outputDir, "留空时使用默认下载目录；仅支持系统允许的目录。"),
     ]),
     createElement("div", { className: "crawl-form-actions" }, [startButton]),
   ]);
@@ -243,17 +254,17 @@ function buildDom(context) {
     createElement("header", { className: "app-header crawl-app-header" }, [
       createElement("p", { className: "app-executable", text: app.windowTitle }),
       createElement("h1", { text: app.label, attributes: { id: headingId } }),
-      createStatusBadge("ready", "真实搜索与顺序批次"),
+      createStatusBadge("ready", "多站搜索与批次创建"),
       createElement("p", {
         className: "app-summary",
-        text: "搜索、弱证据、EH 标签过滤与来源排序均在本应用完成；授权和代理控制通过专属应用修复。",
+        text: "跨站搜索并选择采集来源，再按指定顺序创建下载批次。授权或代理异常时，可前往对应设置页处理。",
       }),
     ]),
     preconditions,
     errorHost,
     operationLive,
     createElement("section", { className: "crawl-panel", attributes: { "aria-labelledby": "crawl-search-title" } }, [
-      createElement("h2", { text: "聚合关键词搜索", attributes: { id: "crawl-search-title" } }),
+      createElement("h2", { text: "多站搜索", attributes: { id: "crawl-search-title" } }),
       searchForm,
     ]),
     resultHost,
@@ -329,10 +340,10 @@ export function createCrawlView(context) {
       statusLabel: guidance.title,
       nextStep: guidance.nextStep,
       actionLabel: guidance.targetApp === "vault"
-        ? "打开 VAULT.CPL"
+        ? "打开授权管理"
         : guidance.targetApp === "proxy"
-          ? "打开 PROXY.CPL"
-          : "打开 DIAG.EXE",
+          ? "打开代理管理"
+          : "打开系统诊断",
       onAction: () => actions.navigateToApp(guidance.targetApp),
     });
     elements.errorHost.replaceChildren(renderedError.element);
@@ -354,7 +365,7 @@ export function createCrawlView(context) {
     if (requiredSites.length) {
       notices.push(createElement("section", { className: "crawl-precondition" }, [
         createStatusBadge("warning", `需要授权：${requiredSites.map((item) => item.label).join("、")}`),
-        button("open-vault", "打开 VAULT.CPL", { small: true }),
+        button("open-vault", "打开授权管理", { small: true }),
       ]));
     }
     const proxy = state.system.readiness?.proxy;
@@ -362,7 +373,7 @@ export function createCrawlView(context) {
     if (proxyNeeded && proxy && !proxy.running && proxy.status !== "disabled") {
       notices.push(createElement("section", { className: "crawl-precondition" }, [
         createStatusBadge("warning", "代理池尚未运行"),
-        button("open-proxy", "打开 PROXY.CPL", { small: true }),
+        button("open-proxy", "打开代理管理", { small: true }),
       ]));
     }
     elements.preconditions.replaceChildren(...notices);
@@ -467,23 +478,19 @@ export function createCrawlView(context) {
         ]),
         createElement("p", {
           className: "crawl-source-meta",
-          text: `站内证据 ${source.evidenceCount} · 当前可见 ${visible.length} · 已选 ${selected} · 尝试 ${source.attempts}${source.enrichmentIssueCount ? ` · 附加步骤异常 ${source.enrichmentIssueCount}` : ""}`,
+          text: `站内结果 ${source.evidenceCount} · 当前显示 ${visible.length} · 已选 ${selected} · 尝试 ${source.attempts}${source.enrichmentIssueCount ? ` · 补充信息异常 ${source.enrichmentIssueCount}` : ""}`,
         }),
       ]);
-      if (source.errorCode) {
-        card.append(createElement("p", {
-          className: "crawl-source-warning",
-          text: `来源返回受控错误码 ${source.errorCode}；可修复前置条件后重新搜索。`,
-        }));
-      }
+      const warning = createSourceErrorWarning(source);
+      if (warning) card.append(warning);
       const list = createElement("div", { className: "crawl-address-list" });
       if (!visible.length) {
         list.append(createEmptyState({
-          label: source.addresses.some((candidate) => candidate.weak) ? "仅有弱证据" : "无候选",
+          label: source.addresses.some((candidate) => candidate.weak) ? "仅有待核实结果" : "无候选",
           title: "此来源当前没有可选地址",
           message: source.addresses.some((candidate) => candidate.weak)
-            ? "开启“显示弱证据”后人工核对。"
-            : "调整关键词或前置条件后重新搜索。",
+            ? "开启“显示待核实结果”后人工确认。"
+            : "调整关键词或检查授权、代理后重新搜索。",
         }));
       }
       visible.forEach((candidate, visibleIndex) => {
@@ -544,7 +551,7 @@ export function createCrawlView(context) {
       0,
     );
     const selectedSources = snapshot.sources.filter((source) => source.addresses.some((candidate) => candidate.selected)).length;
-    elements.resultSummary.textContent = `${snapshot.addressCount} 个候选 · ${snapshot.weakEvidenceCount} 个弱证据 · 已选 ${selectedSources} 个来源 / ${selected} 个地址`;
+    elements.resultSummary.textContent = `${snapshot.addressCount} 个候选 · ${snapshot.weakEvidenceCount} 个待核实结果 · 已选 ${selectedSources} 个来源 / ${selected} 个地址`;
     elements.startButton.disabled = !selected || Boolean(busy);
     elements.submitBadge.dataset.status = selected ? "ready" : "disabled";
     elements.submitBadge.replaceChildren(
@@ -626,8 +633,8 @@ export function createCrawlView(context) {
       busy = kind;
       root.toggleAttribute("aria-busy", Boolean(kind));
       elements.searchButton.disabled = Boolean(kind);
-      elements.searchButton.textContent = kind === "search" ? "正在聚合搜索…" : "搜索候选图库";
-      elements.startButton.textContent = kind === "crawl" ? "正在创建批次…" : "按当前顺序创建批次";
+      elements.searchButton.textContent = kind === "search" ? "正在搜索…" : "搜索来源";
+      elements.startButton.textContent = kind === "crawl" ? "正在创建批次…" : "创建批次";
       elements.startButton.disabled = Boolean(kind) || !store.getState().crawl.sources.some((source) =>
         source.addresses.some((candidate) => candidate.selected));
     },

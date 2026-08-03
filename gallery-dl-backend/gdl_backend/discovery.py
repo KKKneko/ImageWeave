@@ -2362,9 +2362,18 @@ class DiscoveryService:
         protocol_args = ["--dump-json", range_option, f"1-{range_limit}", *values]
         mode: ProxyMode = proxy_mode or policy.proxy_mode
         attempts = max(1, policy.retry_limit + 1)
+        attempt_count = 0
         tried: set[str] = set()
         last_message = "搜索任务没有返回结果"
         last_auth_context = ""
+        last_decision = FailureDecision("backend_error", False, False, last_message)
+        last_proxy = {
+            "mode": mode,
+            "used": False,
+            "node_id": None,
+            "node_name": None,
+            "protocol": None,
+        }
 
         for attempt in range(1, attempts + 1):
             operation_id = f"discover-{uuid.uuid4().hex}"
@@ -2387,19 +2396,36 @@ class DiscoveryService:
                         raise DiscoveryError(
                             "proxy_unavailable",
                             f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                            details={"attempts": attempt_count, "proxy": last_proxy},
                         ) from exc
                     except Exception as exc:
                         if mode == "required":
+                            if attempt_count and last_decision.retryable:
+                                decision = last_decision
+                                break
                             raise DiscoveryError(
                                 "proxy_unavailable",
                                 redact_text(exc, limit=1000),
+                                details={"attempts": attempt_count, "proxy": last_proxy},
                             ) from exc
                     if lease is None and mode == "required":
+                        if attempt_count and last_decision.retryable:
+                            decision = last_decision
+                            break
                         raise DiscoveryError(
                             "proxy_unavailable",
                             "当前没有符合站点策略的健康代理节点",
+                            details={"attempts": attempt_count, "proxy": last_proxy},
                         )
 
+                last_proxy = {
+                    "mode": mode,
+                    "used": lease is not None,
+                    "node_id": redact_text(lease.node_id, limit=128) if lease else None,
+                    "node_name": redact_text(lease.name, limit=200) if lease else None,
+                    "protocol": redact_text(lease.protocol, limit=50) if lease else None,
+                }
+                attempt_count += 1
                 result = await self.gallery.capture(
                     operation_id,
                     url=url,
@@ -2429,18 +2455,27 @@ class DiscoveryService:
                             limit=limit,
                         )
                     except DiscoveryError as exc:
-                        decision = classify_result(1, f"{result.stderr}\n{exc.message}")
-                        last_message = exc.message
+                        safe_message = redact_text(exc.message, limit=1000)
+                        decision = classify_result(1, f"{result.stderr}\n{safe_message}")
+                        last_message = safe_message
                         if not decision.retryable:
-                            raise
+                            details = {
+                                "attempts": attempt_count,
+                                "message": safe_message,
+                                "proxy": last_proxy,
+                            }
+                            if isinstance(exc.details, dict):
+                                errors = exc.details.get("errors")
+                                if isinstance(errors, list):
+                                    details["errors"] = [
+                                        redact_text(item, limit=500) for item in errors[:5]
+                                    ]
+                            raise DiscoveryError(
+                                exc.code,
+                                safe_message,
+                                details=details,
+                            ) from exc
                     else:
-                        proxy_info = {
-                            "mode": mode,
-                            "used": lease is not None,
-                            "node_id": lease.node_id if lease else None,
-                            "node_name": lease.name if lease else None,
-                            "protocol": lease.protocol if lease else None,
-                        }
                         return {
                             "site": spec.site,
                             "keyword": keyword,
@@ -2449,8 +2484,8 @@ class DiscoveryService:
                             "author_count": len(authors),
                             "candidates": candidates,
                             "authors": authors,
-                            "proxy": proxy_info,
-                            "attempts": attempt,
+                            "proxy": last_proxy,
+                            "attempts": attempt_count,
                         }
                 else:
                     last_message = decision.message
@@ -2477,6 +2512,7 @@ class DiscoveryService:
                 if operation_dir.parent == self.runtime_dir and operation_dir.name.startswith("discover-"):
                     shutil.rmtree(operation_dir, ignore_errors=True)
 
+            last_decision = decision
             if not decision.retryable or attempt >= attempts:
                 break
             delay = policy.backoff_base_seconds * (2 ** max(0, attempt - 1))
@@ -2492,8 +2528,13 @@ class DiscoveryService:
                 )
             except Exception:
                 pass
+        safe_message = redact_text(last_message, limit=1000)
         raise DiscoveryError(
             "authentication" if decision.error_class == "authentication" else "discovery_failed",
-            redact_text(last_message, limit=1000),
-            details={"attempts": attempts},
+            safe_message,
+            details={
+                "attempts": attempt_count,
+                "message": safe_message,
+                "proxy": last_proxy,
+            },
         )

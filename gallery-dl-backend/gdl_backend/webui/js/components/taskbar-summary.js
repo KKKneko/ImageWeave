@@ -71,11 +71,11 @@ function safeError(error) {
 }
 
 function apiDescriptor(connected, health, readiness) {
-  if (!connected) return { status: "error", label: "API 离线" };
-  if (!health || health.ok === false) return { status: "error", label: "API 健康异常" };
-  if (readiness?.ready === true) return { status: "ready", label: "API 已就绪" };
-  if (readiness?.ready === false) return { status: "warning", label: "API 未完全就绪" };
-  return { status: "warning", label: "API 已连接" };
+  if (!connected) return { status: "error", label: "服务离线" };
+  if (!health || health.ok === false) return { status: "error", label: "服务异常" };
+  if (readiness?.ready === true) return { status: "ready", label: "服务正常" };
+  if (readiness?.ready === false) return { status: "warning", label: "服务未就绪" };
+  return { status: "warning", label: "服务已连接" };
 }
 
 function proxyDescriptor(connected, readiness) {
@@ -85,7 +85,7 @@ function proxyDescriptor(connected, readiness) {
   if (proxy.status === "disabled") return { status: "disabled", label: "代理已禁用" };
   if (proxy.status === "error") return { status: "error", label: "代理异常" };
   if (proxy.status === "ok" && proxy.running) {
-    return { status: "running", label: `代理运行中 · ${proxy.healthy}` };
+    return { status: "running", label: `可用代理 ${proxy.healthy}` };
   }
   if (proxy.status === "ok") return { status: "ready", label: "代理已配置" };
   return { status: "warning", label: "代理待检查" };
@@ -95,7 +95,7 @@ function dedupDescriptor(connected, readiness) {
   if (!connected) return { status: "error", label: "去重状态未知" };
   const status = readiness?.dedup?.status;
   if (status === "disabled") return { status: "disabled", label: "去重已禁用" };
-  if (status === "ok") return { status: "ready", label: "去重已就绪" };
+  if (status === "ok") return { status: "ready", label: "去重正常" };
   if (status === "error") return { status: "error", label: "去重异常" };
   return { status: "warning", label: "去重待检查" };
 }
@@ -146,7 +146,7 @@ export function initializeTaskbarSummary(root, { api, store, actions, polling, n
   const render = (summary) => {
     for (const [name, descriptor] of Object.entries(summary)) {
       updateStatusBadge(slots[name], descriptor.status, descriptor.label, {
-        title: `${descriptor.label}；可打开 DIAG.EXE 查看脱敏诊断`,
+        title: `${descriptor.label}；可打开系统诊断查看详细信息`,
       });
     }
   };
