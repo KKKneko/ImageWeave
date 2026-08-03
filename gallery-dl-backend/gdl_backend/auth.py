@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .config import AppSettings, normalize_authorization_proxy
+from .config import AUTH_PROXY_SCHEMES, AppSettings, normalize_authorization_proxy
 from .file_security import (
     ensure_private_directory,
+    reject_symlink_path,
     secure_private_path,
     secure_sqlite_files,
     write_private_text,
@@ -54,6 +55,192 @@ COOKIE_LABELS = {
 PIXIV_LOGIN_URL_RE = re.compile(r"https://app-api\.pixiv\.net/web/v1/login\?[^\s]+")
 # auth-metadata.json 以站点名为键；下划线前缀保证与 SUPPORTED_AUTH_SITES 永不冲突。
 AUTH_PROXY_METADATA_KEY = "_authorization_proxy"
+VAULT_RESPONSE_PROFILE = "vault"
+MAX_AUTH_PROXY_REQUEST_BYTES = 1_024
+_VAULT_SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_VAULT_SESSION_STATES = {
+    "starting",
+    "starting_browser",
+    "awaiting_login",
+    "awaiting_code",
+    "exchanging",
+    "authorized",
+    "cancelled",
+    "timed_out",
+    "failed",
+    "token_ready",
+}
+_VAULT_SITE_METHODS = {
+    "danbooru": ("Danbooru", "anonymous", ()),
+    "twitter": ("X / Twitter", "managed_browser", ("managed_browser_login", "clear")),
+    "pixiv": ("Pixiv", "oauth", ("oauth", "clear")),
+    "exhentai": ("EH", "managed_browser", ("managed_browser_login", "clear")),
+    "pawchive": ("Pawchive", "anonymous", ()),
+}
+
+
+def _vault_timestamp(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if numeric == numeric and 0 <= numeric <= 4_102_444_800 else None
+
+
+def vault_safe_session(value: Any, *, site: str | None = None) -> dict[str, Any] | None:
+    """投影桌面 WebUI 轮询所需的会话字段，排除 URL、错误原文与凭证材料。"""
+
+    if not isinstance(value, dict):
+        return None
+    session_id = str(value.get("session_id") or "")
+    state = str(value.get("state") or "")
+    if not _VAULT_SESSION_ID_RE.fullmatch(session_id) or state not in _VAULT_SESSION_STATES:
+        return None
+    result: dict[str, Any] = {
+        "session_id": session_id,
+        "state": state,
+        "created_at": _vault_timestamp(value.get("created_at")),
+        "expires_at": _vault_timestamp(value.get("expires_at")),
+    }
+    if site in _VAULT_SITE_METHODS:
+        result["site"] = site
+    if site in MANAGED_BROWSER_SITES:
+        count = value.get("cookie_count")
+        result["cookie_count"] = (
+            min(int(count), 100_000)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            else 0
+        )
+    return result
+
+
+def _vault_summary(site: str, state: str, authorized: bool, invalidated: bool) -> str:
+    if site in {"danbooru", "pawchive"}:
+        return "后端声明此目标使用公开访问，不需要登录材料。"
+    if state == "authorizing":
+        return "共享授权浏览器流程正在进行。"
+    if invalidated:
+        return "后端已在实际访问中判定现有授权材料失效。"
+    if authorized:
+        return "后端检测到托管授权材料；此状态不代表远端验证成功。"
+    return "后端当前没有可供任务使用的托管授权材料。"
+
+
+def vault_safe_status(value: Any) -> dict[str, Any]:
+    """严格白名单投影单站状态，保持默认旧响应不变。"""
+
+    if not isinstance(value, dict):
+        raise ValueError("授权状态不是对象")
+    site = str(value.get("site") or "")
+    definition = _VAULT_SITE_METHODS.get(site)
+    if definition is None:
+        raise ValueError("授权状态包含未知目标")
+    label, method, actions = definition
+    state = str(value.get("state") or "required")
+    if state not in {"ready", "authorized", "authorizing", "required"}:
+        state = "required"
+    authorized = value.get("authorized") is True
+    invalidated_at = _vault_timestamp(value.get("invalidated_at"))
+    result: dict[str, Any] = {
+        "site": site,
+        "label": label,
+        "method": method,
+        "state": state,
+        "authorized": authorized,
+        "summary": _vault_summary(site, state, authorized, invalidated_at is not None),
+        "updated_at": _vault_timestamp(value.get("updated_at")),
+        "invalidated_at": invalidated_at,
+        "actions": list(actions),
+    }
+    if method == "managed_browser":
+        cookie = value.get("cookies") if isinstance(value.get("cookies"), dict) else {}
+        count = cookie.get("cookie_count")
+        result.update({"browser": "project_chrome", "profile": "shared"})
+        result["cookies"] = {
+            "present": cookie.get("present") is True,
+            "valid": cookie.get("valid") is True,
+            "cookie_count": (
+                min(int(count), 100_000)
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                else 0
+            ),
+            "updated_at": _vault_timestamp(cookie.get("updated_at")),
+        }
+        result["login"] = vault_safe_session(value.get("login"), site=site)
+    elif method == "oauth":
+        result.update({"browser": "project_chrome", "profile": "shared"})
+        result["oauth"] = vault_safe_session(value.get("oauth"), site=site)
+    return result
+
+
+def _vault_masked_proxy(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 300:
+        return None
+    try:
+        parsed = urlsplit(value)
+        scheme = (parsed.scheme or "").lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        scheme not in AUTH_PROXY_SCHEMES
+        or not hostname
+        or port is None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+    ):
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    credentials = "***@" if parsed.username is not None or parsed.password is not None else ""
+    return f"{scheme}://{credentials}{host}:{port}"
+
+
+def vault_safe_proxy_status(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("授权代理状态不是对象")
+    source = value.get("source") if value.get("source") in {"runtime", "config", "none"} else "none"
+    return {
+        "proxy_url": _vault_masked_proxy(value.get("proxy_url")),
+        "source": source,
+        "credentials_redacted": value.get("credentials_redacted") is True,
+        "browser_running": value.get("browser_running") is True,
+        "restart_pending": value.get("restart_pending") is True,
+        "updated_at": _vault_timestamp(value.get("updated_at")),
+    }
+
+
+def vault_safe_browser_profile(value: Any) -> dict[str, Any]:
+    profile = value if isinstance(value, dict) else {}
+    return {
+        "shared": profile.get("shared") is True,
+        "present": profile.get("present") is True,
+        "running": profile.get("running") is True,
+        "resetting": profile.get("resetting") is True,
+        "sites": ["twitter", "pixiv", "exhentai"],
+    }
+
+
+def vault_safe_statuses(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("授权状态快照不是对象")
+    raw_items = value.get("items") if isinstance(value.get("items"), list) else []
+    by_site: dict[str, dict[str, Any]] = {}
+    for item in raw_items[: len(SUPPORTED_AUTH_SITES) * 2]:
+        try:
+            projected = vault_safe_status(item)
+        except ValueError:
+            continue
+        by_site.setdefault(projected["site"], projected)
+    return {
+        "items": [by_site[site] for site in SUPPORTED_AUTH_SITES if site in by_site],
+        "browser_profile": vault_safe_browser_profile(value.get("browser_profile")),
+        "authorization_proxy": vault_safe_proxy_status(value.get("authorization_proxy")),
+        "managed": value.get("managed") is True,
+        "secrets_exposed": False,
+        "response_profile": VAULT_RESPONSE_PROFILE,
+    }
 
 
 def chrome_proxy_server(proxy_url: str) -> str:
@@ -1329,11 +1516,19 @@ class AuthManager:
                 await self._dispose_pixiv_session(pixiv_session)
             async with self._authorization_lock:
                 await self._stop_browser_host()
-                profile_dir = self.browser_profile_dir.resolve()
-                expected = (self.browser_profiles_dir / "shared").resolve()
+                profile_dir = Path(os.path.abspath(os.fspath(self.browser_profile_dir)))
+                expected = Path(os.path.abspath(os.fspath(self.browser_profiles_dir / "shared")))
                 if profile_dir != expected or profile_dir.parent != self.browser_profiles_dir:
                     raise AuthError("invalid_browser_profile_path", "共享授权浏览器目录校验失败")
-                await asyncio.to_thread(shutil.rmtree, profile_dir, True)
+                try:
+                    reject_symlink_path(profile_dir)
+                    if profile_dir.exists():
+                        await asyncio.to_thread(shutil.rmtree, profile_dir)
+                except (OSError, PermissionError, ValueError) as exc:
+                    raise AuthError(
+                        "invalid_browser_profile_path",
+                        "共享授权浏览器目录安全校验失败",
+                    ) from exc
         finally:
             async with self._lock:
                 self._active_authorization_id = ""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from gdl_backend.app import ServiceContainer, _validate_network_target, create_app
+from gdl_backend.auth import AuthError, AuthManager
 from gdl_backend.crawl import CrawlUnit
 from gdl_backend.discovery import DiscoveryError
 
@@ -41,6 +43,44 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(self.client.get("/api/v1/tasks").status_code, 200)
 
+    def test_diagnostics_profiles_are_minimal_and_legacy_compatible(self):
+        legacy_config = self.client.get("/api/v1/config")
+        self.assertEqual(legacy_config.status_code, 200, legacy_config.text)
+        self.assertIn("runtime_dir", legacy_config.json())
+        self.assertIn(str(self.settings.runtime_dir), legacy_config.text)
+
+        safe_config = self.client.get("/api/v1/config?view=diagnostics")
+        self.assertEqual(safe_config.status_code, 200, safe_config.text)
+        self.assertEqual(safe_config.json()["response_profile"], "diagnostics")
+        self.assertFalse(safe_config.json()["secrets_exposed"])
+        self.assertTrue(safe_config.json()["server"]["loopback_only"])
+        for forbidden in (
+            str(self.settings.runtime_dir),
+            str(self.settings.database_path),
+            str(self.settings.gallery.repo_path),
+            "runtime_dir",
+            "database_path",
+            "python_executable",
+            "authorization_proxy",
+            "subscription_urls",
+        ):
+            self.assertNotIn(forbidden, safe_config.text)
+
+        legacy_scheduler = self.client.get("/api/v1/scheduler/status")
+        self.assertEqual(legacy_scheduler.status_code, 200, legacy_scheduler.text)
+        self.assertEqual(set(legacy_scheduler.json()), {"tasks", "ordered_crawls"})
+        safe_scheduler = self.client.get(
+            "/api/v1/scheduler/status?view=diagnostics"
+        )
+        self.assertEqual(safe_scheduler.status_code, 200, safe_scheduler.text)
+        self.assertEqual(safe_scheduler.json()["response_profile"], "diagnostics")
+        self.assertFalse(safe_scheduler.json()["secrets_exposed"])
+        self.assertEqual(
+            set(safe_scheduler.json()["tasks"]),
+            {"running", "active", "max_concurrent", "active_site_count"},
+        )
+        self.assertNotIn("sites", safe_scheduler.json()["tasks"])
+
     def test_ready_fails_when_enabled_dedup_python_is_missing(self):
         self.settings.dedup.enabled = True
         self.settings.dedup.python_executable = Path(self.temp.name) / "missing-python"
@@ -58,80 +98,306 @@ class ApiTests(unittest.TestCase):
 
         index = self.client.get("/ui/")
         self.assertEqual(index.status_code, 200)
-        self.assertIn("聚合爬取测试台", index.text)
-        self.assertIn('id="ehTagFilter"', index.text)
-        self.assertIn('id="ehTagGroups"', index.text)
-        self.assertIn('id="authCenter"', index.text)
-        self.assertIn('data-managed-browser-auth="twitter"', index.text)
-        self.assertIn('data-managed-browser-auth="exhentai"', index.text)
-        self.assertIn('id="startPixivOAuth"', index.text)
-        self.assertIn('id="cancelPixivOAuth"', index.text)
-        self.assertIn('id="clearAuthBrowserProfile"', index.text)
-        self.assertIn('id="authProxyInput"', index.text)
-        self.assertIn('id="saveAuthProxy"', index.text)
-        self.assertIn('id="resetAuthProxy"', index.text)
-        self.assertIn("授权专用代理", index.text)
-        self.assertIn('id="ehDownloadOptions"', index.text)
-        self.assertIn('name="ehImageMode"', index.text)
-        self.assertIn('id="ehGpPolicy"', index.text)
-        self.assertIn('id="reviewPanel"', index.text)
-        self.assertIn('id="reviewGroups"', index.text)
-        self.assertIn('id="reviewStart"', index.text)
-        self.assertIn('id="reviewApply"', index.text)
-        self.assertIn('id="rerunBatch"', index.text)
-        self.assertIn("删除导出凭证", index.text)
-        self.assertIn("X、Pixiv 与 EH 共用同一个项目授权 Chrome Profile", index.text)
-        self.assertNotIn('id="apiKey"', index.text)
-        self.assertNotIn('id="pixivOAuthCallback"', index.text)
-        self.assertNotIn('id="completePixivOAuth"', index.text)
-        self.assertNotIn('id="authBrowser"', index.text)
-        self.assertNotIn('data-browser-auth=', index.text)
-        self.assertNotIn("Cookie 文件</span><span>gallery-dl 配置", index.text)
+        self.assertIn("ImageWeave 应用快捷方式", index.text)
+        self.assertNotIn("聚合爬取测试台", index.text)
         self.assertIn("text/html", index.headers["content-type"])
 
-        script = self.client.get("/ui/app.js")
-        self.assertEqual(script.status_code, 200)
-        self.assertIn("/api/v1/search", script.text)
-        self.assertIn("/api/v1/crawls", script.text)
-        self.assertIn("rerunActiveBatch", script.text)
-        self.assertIn("/rerun", script.text)
-        self.assertNotIn("X-API-Key", script.text)
-        self.assertNotIn("gdl.apiKey", script.text)
-        self.assertIn("address-thumbnail", script.text)
-        self.assertIn("gallery-tags", script.text)
-        self.assertIn("ehEntryMatchesTagFilter", script.text)
-        self.assertIn("eh-tag-option", script.text)
-        self.assertIn("keyword_gallery_search", script.text)
-        self.assertIn("eh_download", script.text)
-        self.assertIn("ehDownloadOptions", script.text)
-        self.assertIn("/api/v1/auth", script.text)
-        self.assertIn("startManagedBrowserLogin", script.text)
-        self.assertIn("scheduleBrowserLoginPoll", script.text)
-        self.assertNotIn("importBrowserLogin", script.text)
-        self.assertIn("schedulePixivOAuthPoll", script.text)
-        self.assertIn("/api/v1/auth/browser-profile", script.text)
-        self.assertIn("/api/v1/auth/proxy", script.text)
-        self.assertIn("renderAuthProxy", script.text)
-        self.assertIn("/review/decisions", script.text)
-        self.assertIn("/review/start", script.text)
-        self.assertIn("automatic_rejected_image_count", script.text)
-        self.assertIn("setReviewGroupSelection", script.text)
-        self.assertNotIn("completePixivOAuth", script.text)
+        self.assertEqual(self.client.get("/ui-next/").status_code, 404)
+        self.assertEqual(self.client.get("/ui/app.js").status_code, 404)
+        self.assertEqual(self.client.get("/ui/styles.css").status_code, 404)
 
-        styles = self.client.get("/ui/styles.css")
-        self.assertEqual(styles.status_code, 200)
-        self.assertIn(".source-card", styles.text)
-        self.assertIn(".address-thumbnail", styles.text)
-        self.assertIn(".gallery-tag", styles.text)
-        self.assertIn(".eh-tag-filter", styles.text)
-        self.assertIn(".eh-tag-option.exclude", styles.text)
-        self.assertIn(".auth-center", styles.text)
-        self.assertIn(".auth-proxy-row", styles.text)
-        self.assertIn(".oauth-panel", styles.text)
-        self.assertIn(".segmented-control", styles.text)
-        self.assertIn(".eh-download-options", styles.text)
-        self.assertIn(".review-image-grid", styles.text)
-        self.assertIn(".review-group.duplicate", styles.text)
+    def test_webui_desktop_shell_static_contract(self):
+        index = self.client.get("/ui/")
+        self.assertEqual(index.status_code, 200)
+        self.assertIn("ImageWeave 应用快捷方式", index.text)
+        self.assertIn('data-cloud-background', index.text)
+        self.assertIn('data-application-window', index.text)
+        self.assertIn('data-start-menu', index.text)
+        self.assertIn('data-task-window', index.text)
+        for summary in ("api", "proxy", "dedup"):
+            self.assertEqual(
+                index.text.count(f'data-taskbar-summary="{summary}"'), 1
+            )
+        self.assertEqual(index.text.count("data-taskbar-refresh"), 1)
+        self.assertEqual(index.text.count("data-taskbar-diagnostics"), 1)
+        self.assertIn('type="module" src="./js/main.js"', index.text)
+        self.assertIn('href="./styles/tokens.css"', index.text)
+        self.assertIn('href="./styles/responsive.css"', index.text)
+        self.assertNotIn("聚合爬取测试台", index.text)
+        self.assertNotIn('id="searchForm"', index.text)
+        self.assertNotIn('href="#/', index.text)
+        self.assertIn("text/html", index.headers["content-type"])
+
+        static_assets = [
+            "/ui/styles/tokens.css",
+            "/ui/styles/desktop.css",
+            "/ui/styles/dialog.css",
+            "/ui/styles/apps/crawl.css",
+            "/ui/styles/apps/tasks.css",
+            "/ui/styles/apps/review.css",
+            "/ui/styles/apps/policy.css",
+            "/ui/styles/apps/diagnostics.css",
+            "/ui/js/main.js",
+            "/ui/js/core/api.js",
+            "/ui/js/core/actions.js",
+            "/ui/js/core/router.js",
+            "/ui/js/core/store.js",
+            "/ui/js/core/polling.js",
+            "/ui/js/core/proxy-model.js",
+            "/ui/js/core/vault-model.js",
+            "/ui/js/core/policy-model.js",
+            "/ui/js/core/crawl-model.js",
+            "/ui/js/core/tasks-model.js",
+            "/ui/js/core/review-model.js",
+            "/ui/js/core/diagnostics-model.js",
+            "/ui/js/core/storage.js",
+            "/ui/js/core/window-manager.js",
+            "/ui/js/components/cloud-background.js",
+            "/ui/js/components/dialog.js",
+            "/ui/js/components/error-view.js",
+            "/ui/js/components/proxy-dom.js",
+            "/ui/js/components/proxy-view.js",
+            "/ui/js/components/vault-dom.js",
+            "/ui/js/components/vault-view.js",
+            "/ui/js/components/policy-dom.js",
+            "/ui/js/components/policy-view.js",
+            "/ui/js/components/crawl-view.js",
+            "/ui/js/components/tasks-view.js",
+            "/ui/js/components/review-view.js",
+            "/ui/js/components/diagnostics-view.js",
+            "/ui/js/components/taskbar-summary.js",
+            "/ui/js/apps/proxy.js",
+            "/ui/js/apps/vault.js",
+            "/ui/js/apps/policy.js",
+            "/ui/js/apps/crawl.js",
+            "/ui/js/apps/tasks.js",
+            "/ui/js/apps/review.js",
+            "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/placeholder.js",
+        ]
+        for path in static_assets:
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+
+        fallback = self.client.get("/ui/assets/dithered-cloud-fallback.png")
+        self.assertEqual(fallback.status_code, 200)
+        self.assertEqual(fallback.content[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn("image/png", fallback.headers["content-type"])
+
+        registry = self.client.get("/ui/js/core/app-registry.js")
+        self.assertEqual(registry.status_code, 200)
+        app_contract = {
+            "crawl": "/crawl",
+            "tasks": "/tasks",
+            "proxy": "/proxy",
+            "vault": "/vault",
+            "review": "/review",
+            "policy": "/policy",
+            "diagnostics": "/diagnostics",
+            "gallery": "/gallery",
+            "schedule": "/schedule",
+            "export": "/export",
+        }
+        for app_id, route in app_contract.items():
+            self.assertEqual(registry.text.count(f'id: "{app_id}"'), 1)
+            self.assertEqual(registry.text.count(f'route: "{route}"'), 1)
+        self.assertEqual(registry.text.count('availability: "ready"'), 7)
+        self.assertEqual(registry.text.count('availability: "placeholder"'), 3)
+        self.assertIn('defaultWindowState: "maximized"', registry.text)
+
+        javascript_paths = [
+            "/ui/js/main.js",
+            "/ui/js/core/app-registry.js",
+            "/ui/js/core/router.js",
+            "/ui/js/core/desktop.js",
+            "/ui/js/core/window-manager.js",
+            "/ui/js/components/cloud-background.js",
+            "/ui/js/components/empty-state.js",
+            "/ui/js/apps/crawl.js",
+            "/ui/js/apps/tasks.js",
+            "/ui/js/apps/proxy.js",
+            "/ui/js/apps/vault.js",
+            "/ui/js/apps/review.js",
+            "/ui/js/apps/policy.js",
+            "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/placeholder.js",
+        ]
+        combined_javascript = "\n".join(
+            self.client.get(path).text for path in javascript_paths
+        )
+        for forbidden in (
+            "fetch(",
+            "XMLHttpRequest",
+            "localStorage",
+            "sessionStorage",
+        ):
+            self.assertNotIn(forbidden, combined_javascript)
+
+        core_paths = [
+            "/ui/js/core/api.js",
+            "/ui/js/core/actions.js",
+            "/ui/js/core/app-registry.js",
+            "/ui/js/core/desktop.js",
+            "/ui/js/core/dom.js",
+            "/ui/js/core/polling.js",
+            "/ui/js/core/proxy-model.js",
+            "/ui/js/core/vault-model.js",
+            "/ui/js/core/policy-model.js",
+            "/ui/js/core/crawl-model.js",
+            "/ui/js/core/tasks-model.js",
+            "/ui/js/core/review-model.js",
+            "/ui/js/core/diagnostics-model.js",
+            "/ui/js/core/router.js",
+            "/ui/js/core/storage.js",
+            "/ui/js/core/store.js",
+            "/ui/js/core/window-manager.js",
+        ]
+        component_paths = [
+            "/ui/js/components/cloud-background.js",
+            "/ui/js/components/dialog.js",
+            "/ui/js/components/empty-state.js",
+            "/ui/js/components/error-view.js",
+            "/ui/js/components/icons.js",
+            "/ui/js/components/proxy-dom.js",
+            "/ui/js/components/proxy-view.js",
+            "/ui/js/components/vault-dom.js",
+            "/ui/js/components/vault-view.js",
+            "/ui/js/components/policy-dom.js",
+            "/ui/js/components/policy-view.js",
+            "/ui/js/components/crawl-view.js",
+            "/ui/js/components/tasks-view.js",
+            "/ui/js/components/review-view.js",
+            "/ui/js/components/diagnostics-view.js",
+            "/ui/js/components/status.js",
+            "/ui/js/components/taskbar-summary.js",
+        ]
+        app_paths = [
+            "/ui/js/apps/crawl.js",
+            "/ui/js/apps/tasks.js",
+            "/ui/js/apps/proxy.js",
+            "/ui/js/apps/vault.js",
+            "/ui/js/apps/review.js",
+            "/ui/js/apps/policy.js",
+            "/ui/js/apps/diagnostics.js",
+            "/ui/js/apps/placeholder.js",
+        ]
+        module_sources = {
+            path: self.client.get(path).text
+            for path in ["/ui/js/main.js", *core_paths, *component_paths, *app_paths]
+        }
+        api_source = module_sources["/ui/js/core/api.js"]
+        self.assertIn("globalThis.fetch", api_source)
+        self.assertIn("fetchImpl(url, requestOptions)", api_source)
+        for path, source in module_sources.items():
+            if path != "/ui/js/core/api.js":
+                self.assertNotIn("globalThis.fetch", source, path)
+                self.assertNotIn("fetch(", source, path)
+            self.assertNotIn("XMLHttpRequest", source, path)
+            if path != "/ui/js/core/storage.js":
+                self.assertNotIn("localStorage", source, path)
+                self.assertNotIn("sessionStorage", source, path)
+
+        proxy_app_path = "/ui/js/apps/proxy.js"
+        vault_app_path = "/ui/js/apps/vault.js"
+        policy_app_path = "/ui/js/apps/policy.js"
+        crawl_app_path = "/ui/js/apps/crawl.js"
+        tasks_app_path = "/ui/js/apps/tasks.js"
+        review_app_path = "/ui/js/apps/review.js"
+        diagnostics_app_path = "/ui/js/apps/diagnostics.js"
+        proxy_endpoints = {
+            "/api/v1/proxy/status",
+            "/api/v1/proxy/start",
+            "/api/v1/proxy/reload",
+            "/api/v1/proxy/probe",
+            "/api/v1/proxy/stop",
+            "/api/v1/proxy/sources",
+            "/api/v1/proxy/sources/subscriptions",
+            "/api/v1/proxy/sources/node-file",
+            "/api/v1/proxy/sources/inline-nodes",
+            "/api/v1/proxy/sources/override",
+        }
+        vault_endpoints = {
+            "/api/v1/auth",
+            "/api/v1/auth/proxy",
+            "/api/v1/auth/browser-profile",
+            "/api/v1/auth/pixiv/oauth/start",
+            "/api/v1/auth/pixiv/oauth/session",
+        }
+        for path in app_paths:
+            source = module_sources[path]
+            for forbidden in (
+                "fetch(",
+                "response.json",
+                "response.ok",
+                "normalizeApiError",
+                "new ApiError",
+            ):
+                self.assertNotIn(forbidden, source, path)
+            if path == proxy_app_path:
+                for endpoint in proxy_endpoints:
+                    self.assertEqual(source.count(f'"{endpoint}"'), 1, endpoint)
+                self.assertEqual(source.count('"/api/v1/'), len(proxy_endpoints))
+                self.assertIn('STATUS_POLL_KEY = "proxy.status"', source)
+                self.assertIn("scope: context.pollingScope", source)
+            elif path == vault_app_path:
+                for endpoint in vault_endpoints:
+                    self.assertEqual(source.count(f'"{endpoint}"'), 1, endpoint)
+                self.assertEqual(source.count('"/api/v1/'), len(vault_endpoints))
+                self.assertIn('AUTHORIZATION_POLL_KEY = "vault.authorization"', source)
+                self.assertIn("scope: context.pollingScope", source)
+                self.assertIn("critical: false", source)
+            elif path == policy_app_path:
+                self.assertEqual(source.count('"/api/v1/sites/policies"'), 1)
+                self.assertEqual(source.count('"/api/v1/'), 1)
+                self.assertIn('POLICY_VIEW_QUERY = "view=policy"', source)
+                self.assertNotIn("polling.start", source)
+            elif path == crawl_app_path:
+                for endpoint in (
+                    "/api/v1/search",
+                    "/api/v1/search/autocomplete",
+                    "/api/v1/crawls",
+                ):
+                    self.assertEqual(source.count(f'"{endpoint}"'), 1, endpoint)
+                self.assertIn("idempotencyKey: true", source)
+            elif path == tasks_app_path:
+                self.assertEqual(source.count('"/api/v1/crawls"'), 1)
+                self.assertIn('BATCH_POLL_KEY = "batches.active"', source)
+            elif path == review_app_path:
+                self.assertEqual(source.count('"/api/v1/crawls"'), 1)
+                self.assertIn('REVIEW_POLL_KEY = "review.active"', source)
+                self.assertIn("beforeLeave()", source)
+            elif path == diagnostics_app_path:
+                self.assertEqual(source.count('"/healthz"'), 1)
+                self.assertEqual(source.count('"/readyz"'), 1)
+                self.assertEqual(source.count('"/api/v1/config?view=diagnostics"'), 1)
+                self.assertEqual(
+                    source.count('"/api/v1/scheduler/status?view=diagnostics"'), 1
+                )
+                self.assertIn('DIAGNOSTICS_POLL_KEY = "diagnostics.snapshot"', source)
+            else:
+                self.assertNotIn("/api/v1", source, path)
+
+        for path, source in module_sources.items():
+            if path != proxy_app_path:
+                self.assertNotIn("/api/v1/proxy", source, path)
+            if path != vault_app_path:
+                self.assertNotIn("/api/v1/auth", source, path)
+            if path != policy_app_path:
+                self.assertNotIn("/api/v1/sites", source, path)
+        self.assertIn(
+            "context.actions.navigateToApp",
+            module_sources["/ui/js/components/empty-state.js"],
+        )
+        taskbar_summary_source = module_sources[
+            "/ui/js/components/taskbar-summary.js"
+        ]
+        self.assertIn('SHELL_POLL_KEY = "shell.summary"', taskbar_summary_source)
+        self.assertIn("key: SHELL_POLL_KEY", taskbar_summary_source)
+        self.assertIn("critical: false", taskbar_summary_source)
+
+        self.assertEqual(self.client.get("/ui/styles.css").status_code, 404)
+        self.assertEqual(self.client.get("/ui/app.js").status_code, 404)
+        self.assertEqual(self.client.get("/ui/does-not-exist.js").status_code, 404)
 
     def test_authorization_proxy_api_roundtrip(self):
         # 路由顺序回归：/auth/proxy 不能被 /auth/{site} 当成站点名吃掉（那会 404）
@@ -172,6 +438,126 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(reset.status_code, 200, reset.text)
         self.assertIsNone(reset.json()["proxy_url"])
         self.assertEqual(reset.json()["source"], "none")
+
+    def test_vault_auth_projection_and_sensitive_write_errors_are_redacted(self):
+        secret = "VAULT_API_SECRET_7f3c1a"
+        raw = self.container.auth.statuses()
+        pixiv = next(item for item in raw["items"] if item["site"] == "pixiv")
+        pixiv.update(
+            {
+                "state": "authorizing",
+                "summary": f"token={secret} /home/private/{secret}",
+                "oauth": {
+                    "session_id": "a" * 32,
+                    "state": "awaiting_login",
+                    "created_at": 1,
+                    "expires_at": 601,
+                    "authorization_url": (
+                        "https://app-api.pixiv.net/web/v1/login"
+                        f"?state={secret}&code_challenge={secret}"
+                    ),
+                    "message": f"Cookie={secret}",
+                    "error": f"/home/private/{secret}",
+                },
+            }
+        )
+        twitter = next(item for item in raw["items"] if item["site"] == "twitter")
+        twitter["invalid_reason"] = f"Authorization: Bearer {secret}"
+        raw["browser_profile"]["path"] = f"/home/private/{secret}"
+        self.container.auth.statuses = Mock(return_value=raw)
+
+        legacy = self.client.get("/api/v1/auth")
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertIn(secret, legacy.text)
+
+        safe = self.client.get("/api/v1/auth?view=vault")
+        self.assertEqual(safe.status_code, 200, safe.text)
+        payload = safe.json()
+        self.assertEqual(payload["response_profile"], "vault")
+        self.assertFalse(payload["secrets_exposed"])
+        safe_pixiv = next(item for item in payload["items"] if item["site"] == "pixiv")
+        self.assertEqual(safe_pixiv["oauth"]["session_id"], "a" * 32)
+        for forbidden in (
+            secret,
+            "authorization_url",
+            "invalid_reason",
+            "/home/private",
+            "code_challenge",
+            "Bearer ",
+        ):
+            self.assertNotIn(forbidden, safe.text)
+
+        # 恢复真实方法，验证写接口失败不覆盖已保存代理且错误 envelope 不回显输入。
+        self.container.auth.statuses = AuthManager.statuses.__get__(
+            self.container.auth, AuthManager
+        )
+        original_start = self.container.auth.start_browser_login
+
+        async def fail_browser_start(site: str):
+            raise AuthError(
+                "controlled_raw_error",
+                f"Cookie: {secret} /home/private/auth.log",
+                {"raw_detail": f"token={secret}"},
+            )
+
+        self.container.auth.start_browser_login = fail_browser_start
+        try:
+            safe_error = self.client.post(
+                "/api/v1/auth/twitter/login/start?view=vault"
+            )
+            legacy_error = self.client.post("/api/v1/auth/twitter/login/start")
+        finally:
+            self.container.auth.start_browser_login = original_start
+        self.assertEqual(safe_error.status_code, 409)
+        self.assertEqual(
+            safe_error.json()["error"]["code"],
+            "authorization_operation_failed",
+        )
+        self.assertNotIn(secret, safe_error.text)
+        self.assertNotIn("/home/private", safe_error.text)
+        self.assertNotIn("raw_detail", safe_error.text)
+        self.assertEqual(legacy_error.status_code, 409)
+        self.assertIn(secret, legacy_error.text)
+        self.assertIn("/home/private", legacy_error.text)
+
+        configured = "http://vault-user:vault-pass@127.0.0.1:7890"
+        saved = self.client.put(
+            "/api/v1/auth/proxy?view=vault", json={"proxy_url": configured}
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["proxy_url"], "http://***@127.0.0.1:7890")
+        self.assertNotIn("vault-user", saved.text)
+        self.assertNotIn("vault-pass", saved.text)
+
+        overlong = f"http://user:{secret}{'x' * 400}@127.0.0.1:7890"
+        rejected = self.client.put(
+            "/api/v1/auth/proxy", json={"proxy_url": overlong}
+        )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(
+            rejected.json()["error"]["code"], "invalid_authorization_proxy"
+        )
+        self.assertNotIn(secret, rejected.text)
+        self.assertNotIn("input", rejected.text)
+        self.assertEqual(self.container.auth.authorization_proxy(), configured)
+
+        wrong_type = self.client.put(
+            "/api/v1/auth/proxy", json={"proxy_url": {"token": secret}}
+        )
+        self.assertEqual(wrong_type.status_code, 422, wrong_type.text)
+        self.assertNotIn(secret, wrong_type.text)
+        self.assertNotIn("input", wrong_type.text)
+        self.assertEqual(self.container.auth.authorization_proxy(), configured)
+
+        too_large = self.client.put(
+            "/api/v1/auth/proxy",
+            content=b'{"proxy_url":""}',
+            headers={"Content-Type": "application/json", "Content-Length": "2048"},
+        )
+        self.assertEqual(too_large.status_code, 413, too_large.text)
+        self.assertEqual(too_large.json()["error"]["code"], "auth_request_too_large")
+        self.assertTrue(too_large.json()["error"]["request_id"])
+        self.assertEqual(self.container.auth.authorization_proxy(), configured)
 
     def test_managed_auth_api_contract(self):
         listing = self.client.get("/api/v1/auth")
@@ -322,6 +708,25 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["cookies_file"], str(cookie_path))
 
+    def _policy_view_payload(self, **overrides):
+        payload = {
+            "max_concurrency": 20,
+            "retry_limit": 2,
+            "backoff_base_seconds": 2,
+            "proxy_mode": "prefer",
+            "probe_url": None,
+            "probe_before_use": False,
+            "node_tags": [],
+            "http_timeout": 30,
+            "gallery_retries": 2,
+            "task_timeout_seconds": 0,
+            "download_stall_timeout_seconds": 180,
+            "eh_download": None,
+            "extra_args": [],
+        }
+        payload.update(overrides)
+        return payload
+
     def test_site_policy_crud_and_proxy_status(self):
         policy = {
             "max_concurrency": 1,
@@ -346,6 +751,320 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(status.json()["auto_start"])
         self.assertEqual(status.json()["engine"], "native")
         self.assertFalse(status.json()["executable_required"])
+
+    def test_policy_view_contract_legacy_compatibility_and_real_roundtrip(self):
+        legacy = self.client.get("/api/v1/sites/policies")
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertEqual(set(legacy.json()), {"default", "items"})
+        self.assertNotIn("response_profile", legacy.json())
+
+        listing = self.client.get("/api/v1/sites/policies?view=policy")
+        self.assertEqual(listing.status_code, 200, listing.text)
+        snapshot = listing.json()
+        self.assertEqual(snapshot["response_profile"], "policy")
+        self.assertFalse(snapshot["secrets_exposed"])
+        self.assertEqual(snapshot["effect_scope"], "new_requests_and_tasks")
+        self.assertEqual(snapshot["concurrency_protection"], "none")
+        self.assertEqual(snapshot["default_source"], "startup_snapshot")
+        self.assertEqual(snapshot["persistence"], "sqlite_atomic")
+        self.assertNotIn("revision", snapshot)
+        self.assertEqual(
+            [item["site"] for item in snapshot["items"]],
+            ["danbooru", "twitter", "pixiv", "exhentai", "pawchive"],
+        )
+        by_site = {item["site"]: item for item in snapshot["items"]}
+        self.assertEqual(by_site["danbooru"]["authorization"], "anonymous")
+        self.assertEqual(by_site["twitter"]["authorization"], "managed_browser")
+        self.assertEqual(by_site["pixiv"]["authorization"], "oauth")
+        self.assertEqual(
+            by_site["exhentai"]["authorization"],
+            "managed_browser_for_private_content",
+        )
+        self.assertTrue(all(item["selection_mode"] == "per_request" for item in snapshot["items"]))
+        self.assertTrue(all(item["availability"] == "not_probed" for item in snapshot["items"]))
+
+        old_snapshot = self.container.policy_for("pixiv")
+        payload = self._policy_view_payload(
+            max_concurrency=7,
+            retry_limit=3,
+            backoff_base_seconds=0.5,
+            proxy_mode="required",
+            probe_url="https://example.com/health",
+            probe_before_use=True,
+            node_tags=["JP", "jp", "高速"],
+            http_timeout=12.5,
+            gallery_retries=4,
+            task_timeout_seconds=90,
+            download_stall_timeout_seconds=0,
+            eh_download={"image_mode": "original", "gp_policy": "stop"},
+            extra_args=["--no-mtime"],
+        )
+        saved = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            json=payload,
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        item = saved.json()
+        self.assertTrue(item["has_override"])
+        self.assertFalse(item["inherited"])
+        self.assertEqual(item["policy"]["node_tags"], ["jp", "高速"])
+        self.assertEqual(item["policy"]["eh_download"], payload["eh_download"])
+        self.assertEqual(self.container.db.get_site_policy("pixiv")["policy"], item["policy"])
+        current = self.container.policy_for("pixiv")
+        self.assertEqual(current.max_concurrency, 7)
+        self.assertEqual(old_snapshot.max_concurrency, 20)
+
+        authoritative = self.client.get("/api/v1/sites/policies?view=policy").json()
+        pixiv = next(entry for entry in authoritative["items"] if entry["site"] == "pixiv")
+        self.assertEqual(pixiv["policy"], item["policy"])
+        reset = self.client.delete("/api/v1/sites/policies/pixiv?view=policy")
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(
+            reset.json(),
+            {"response_profile": "policy", "deleted": True, "site": "pixiv"},
+        )
+        inherited = self.client.get("/api/v1/sites/policies/pixiv?view=policy")
+        self.assertEqual(inherited.status_code, 200, inherited.text)
+        self.assertTrue(inherited.json()["inherited"])
+        self.assertFalse(inherited.json()["has_override"])
+        self.assertEqual(
+            inherited.json()["policy"],
+            self._policy_view_payload(),
+        )
+
+    def test_policy_view_projects_loaded_config_default_without_hot_reload(self):
+        self.settings.default_site_policy.update(
+            {
+                "max_concurrency": 11,
+                "proxy_mode": "direct",
+                "node_tags": ["loaded-config"],
+            }
+        )
+        first = self.client.get("/api/v1/sites/policies?view=policy")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["default"]["policy"]["max_concurrency"], 11)
+        self.assertEqual(first.json()["default"]["policy"]["proxy_mode"], "direct")
+        self.assertEqual(first.json()["default"]["policy"]["node_tags"], ["loaded-config"])
+        self.assertTrue(all(item["inherited"] for item in first.json()["items"]))
+        self.assertTrue(
+            all(item["policy"] == first.json()["default"]["policy"] for item in first.json()["items"])
+        )
+
+        # 外部文件变化不会改变进程启动时已经加载到 settings 的默认策略。
+        (Path(self.temp.name) / "missing-config.json").write_text(
+            '{"default_site_policy":{"max_concurrency":99}}',
+            encoding="utf-8",
+        )
+        second = self.client.get("/api/v1/sites/policies?view=policy")
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["default"]["policy"]["max_concurrency"], 11)
+
+    def test_policy_storage_rejects_symlink_database_without_touching_target(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("当前平台不支持符号链接")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = make_settings(root)
+            target = root / "outside.sqlite3"
+            sentinel = b"POLICY-SYMLINK-SENTINEL"
+            target.write_bytes(sentinel)
+            try:
+                settings.database_path.symlink_to(target)
+            except OSError as exc:
+                self.skipTest(f"当前环境不能创建符号链接：{exc}")
+            with self.assertRaisesRegex(ValueError, "符号链接"):
+                ServiceContainer(settings)
+            self.assertEqual(target.read_bytes(), sentinel)
+
+    def test_policy_view_projection_hides_unknown_or_unsafe_legacy_overrides(self):
+        secret = "POLICY_API_SECRET_83b1"
+        unsafe = self._policy_view_payload(
+            probe_url=f"https://user:{secret}@private.invalid/path?token={secret}",
+            node_tags=[f"token={secret}"],
+            extra_args=[f"--filter=token={secret}", f"/home/private/{secret}"],
+        )
+        self.container.db.put_site_policy("twitter", unsafe)
+        self.container.db.put_site_policy(
+            "unknown-private-source",
+            {"path": f"/home/private/{secret}", "token": secret},
+        )
+
+        projected = self.client.get("/api/v1/sites/policies?view=policy")
+        self.assertEqual(projected.status_code, 200, projected.text)
+        self.assertNotIn(secret, projected.text)
+        self.assertNotIn("/home/private", projected.text)
+        self.assertNotIn("unknown-private-source", projected.text)
+        self.assertEqual(projected.json()["unknown_override_count"], 1)
+        twitter = next(
+            item for item in projected.json()["items"] if item["site"] == "twitter"
+        )
+        self.assertFalse(twitter["editable"])
+        self.assertEqual(twitter["reason"], "unsafe_stored_policy")
+        self.assertIsNone(twitter["policy"])
+        self.assertTrue(twitter["has_override"])
+
+        # 默认 legacy 响应继续保持原有形状与内容，安全最小化只对显式 profile 生效。
+        legacy = self.client.get("/api/v1/sites/policies")
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertIn(secret, legacy.text)
+        self.assertIn("unknown-private-source", legacy.text)
+
+    def test_policy_view_validation_size_and_supported_source_boundaries(self):
+        payload = self._policy_view_payload()
+        for method, path in (
+            ("get", "/api/v1/sites/policies/unknown?view=policy"),
+            ("put", "/api/v1/sites/policies/unknown?view=policy"),
+            ("delete", "/api/v1/sites/policies/unknown?view=policy"),
+        ):
+            response = getattr(self.client, method)(
+                path,
+                **({"json": payload} if method == "put" else {}),
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(response.json()["error"]["code"], "unsupported_policy_site")
+
+        secret = "POLICY_INVALID_SECRET_51ca"
+        invalid_payloads = [
+            self._policy_view_payload(proxy_mode="automatic"),
+            self._policy_view_payload(max_concurrency=129),
+            self._policy_view_payload(probe_url=f"https://user:{secret}@example.com/"),
+            self._policy_view_payload(probe_url="https://example.com/?health=1"),
+            self._policy_view_payload(probe_url="https://127.0.0.1/"),
+            self._policy_view_payload(node_tags=[f"ok\u0000{secret}"]),
+            self._policy_view_payload(extra_args=[f"/home/private/{secret}"]),
+            self._policy_view_payload(extra_args=[f"ftp://user:{secret}@example.com/file"]),
+            self._policy_view_payload(extra_args=[f"token={secret}"]),
+            self._policy_view_payload(extra_args=["--cookies", secret]),
+            {**self._policy_view_payload(), "unknown_secret": secret},
+        ]
+        for invalid in invalid_payloads:
+            response = self.client.put(
+                "/api/v1/sites/policies/pixiv?view=policy",
+                json=invalid,
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(response.json()["error"]["code"], "invalid_policy")
+            self.assertNotIn(secret, response.text)
+            self.assertNotIn("/home/private", response.text)
+            self.assertNotIn('"input"', response.text)
+            details = response.json()["error"]["details"]
+            self.assertTrue(isinstance(details, (dict, list)))
+            self.assertIsNone(self.container.db.get_site_policy("pixiv"))
+
+        missing_field = self._policy_view_payload()
+        missing_field.pop("http_timeout")
+        missing = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            json=missing_field,
+        )
+        self.assertEqual(missing.status_code, 422, missing.text)
+        self.assertEqual(
+            missing.json()["error"]["details"],
+            {"field": "http_timeout", "reason": "missing_field"},
+        )
+
+        too_large = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            content=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(32 * 1024),
+            },
+        )
+        self.assertEqual(too_large.status_code, 413, too_large.text)
+        self.assertEqual(too_large.json()["error"]["code"], "policy_request_too_large")
+        self.assertIsNone(self.container.db.get_site_policy("pixiv"))
+
+        understated_large = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            content=b'{"padding":"' + (b"x" * (17 * 1024)) + b'"}',
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "2",
+            },
+        )
+        self.assertEqual(understated_large.status_code, 413, understated_large.text)
+        self.assertEqual(
+            understated_large.json()["error"]["code"],
+            "policy_request_too_large",
+        )
+        self.assertIsNone(self.container.db.get_site_policy("pixiv"))
+
+        normalized_empty = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            json=self._policy_view_payload(
+                probe_url="   ",
+                node_tags=["  ", "JP", "jp"],
+                extra_args=[],
+            ),
+        )
+        self.assertEqual(normalized_empty.status_code, 200, normalized_empty.text)
+        self.assertIsNone(normalized_empty.json()["policy"]["probe_url"])
+        self.assertEqual(normalized_empty.json()["policy"]["node_tags"], ["jp"])
+        self.assertEqual(normalized_empty.json()["policy"]["extra_args"], [])
+
+    def test_policy_view_sqlite_failure_is_atomic_and_error_is_safe(self):
+        first = self._policy_view_payload(max_concurrency=3)
+        saved = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            json=first,
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        with self.container.db._lock:
+            self.container.db._conn.execute(
+                """
+                CREATE TRIGGER fail_policy_update BEFORE UPDATE ON site_policies
+                WHEN NEW.site='pixiv'
+                BEGIN SELECT RAISE(ABORT, '/home/private/POLICY_DB_SECRET'); END
+                """
+            )
+        failed = self.client.put(
+            "/api/v1/sites/policies/pixiv?view=policy",
+            json=self._policy_view_payload(max_concurrency=9),
+        )
+        self.assertEqual(failed.status_code, 503, failed.text)
+        self.assertEqual(failed.json()["error"]["code"], "policy_store_error")
+        self.assertNotIn("POLICY_DB_SECRET", failed.text)
+        self.assertNotIn("/home/private", failed.text)
+        self.assertEqual(
+            self.container.db.get_site_policy("pixiv")["policy"]["max_concurrency"],
+            3,
+        )
+        with self.container.db._lock:
+            self.container.db._conn.execute("DROP TRIGGER fail_policy_update")
+            self.container.db._conn.execute(
+                """
+                CREATE TRIGGER fail_policy_delete BEFORE DELETE ON site_policies
+                WHEN OLD.site='pixiv'
+                BEGIN SELECT RAISE(ABORT, '/home/private/POLICY_DELETE_SECRET'); END
+                """
+            )
+        failed_delete = self.client.delete(
+            "/api/v1/sites/policies/pixiv?view=policy",
+        )
+        self.assertEqual(failed_delete.status_code, 503, failed_delete.text)
+        self.assertEqual(failed_delete.json()["error"]["code"], "policy_store_error")
+        self.assertNotIn("POLICY_DELETE_SECRET", failed_delete.text)
+        self.assertNotIn("/home/private", failed_delete.text)
+        self.assertEqual(
+            self.container.db.get_site_policy("pixiv")["policy"]["max_concurrency"],
+            3,
+        )
+        with self.container.db._lock:
+            self.container.db._conn.execute("DROP TRIGGER fail_policy_delete")
+        if os.name != "nt":
+            self.assertEqual(self.container.db.path.stat().st_mode & 0o777, 0o600)
+
+        with self.container.db._transaction() as connection:
+            connection.execute(
+                "UPDATE site_policies SET policy_json=? WHERE site='pixiv'",
+                ("{broken-private-path:/home/private/POLICY_DB_SECRET",),
+            )
+        corrupt = self.client.get("/api/v1/sites/policies?view=policy")
+        self.assertEqual(corrupt.status_code, 503, corrupt.text)
+        self.assertEqual(corrupt.json()["error"]["code"], "policy_store_error")
+        self.assertNotIn("POLICY_DB_SECRET", corrupt.text)
+        self.assertNotIn("/home/private", corrupt.text)
 
     def test_private_target_guard(self):
         with self.assertRaises(ValueError):
@@ -737,6 +1456,32 @@ class ApiTests(unittest.TestCase):
             source["addresses"][0]["evidence_reasons"], ["keyword_gallery_search"]
         )
         self.container.discovery.search.assert_awaited_once()
+
+    def test_search_failure_log_does_not_persist_user_query(self):
+        private_query = "PRIVATE_USER_QUERY_8c4f2a"
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
+        self.container.discovery.search = AsyncMock(
+            side_effect=DiscoveryError("fixture_search_failed", "受控上游失败")
+        )
+        with self.assertLogs("gdl_backend.search", level="WARNING") as captured:
+            response = self.client.post(
+                "/api/v1/search",
+                json={
+                    "sites": ["pawchive"],
+                    "keyword": private_query,
+                    "limit": 5,
+                    "proxy_mode": "direct",
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sources"][0]["status"], "failed")
+        logs = "\n".join(captured.output)
+        self.assertNotIn(private_query, logs)
+        self.assertNotIn("受控上游失败", logs)
+        self.assertIn("site=pawchive", logs)
+        self.assertIn("error_code=fixture_search_failed", logs)
 
     def test_search_autocomplete_endpoint(self):
         self.container.discovery.danbooru_autocomplete = AsyncMock(

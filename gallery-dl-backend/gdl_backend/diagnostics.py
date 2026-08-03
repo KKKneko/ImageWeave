@@ -380,6 +380,81 @@ def mihomo_component(settings: AppSettings, *, include_version: bool = False) ->
     )
 
 
+def diagnostics_config_snapshot(settings: AppSettings) -> dict[str, Any]:
+    """返回 DIAG.EXE 可读取的最小配置能力投影，不公开任何主机路径或秘密。"""
+
+    return {
+        "response_profile": "diagnostics",
+        "secrets_exposed": False,
+        "server": {
+            "loopback_only": settings.server.host.strip().lower()
+            in {"127.0.0.1", "localhost", "::1"},
+            "cors_enabled": bool(settings.server.cors_origins),
+            "private_targets_enabled": bool(settings.server.allow_private_targets),
+        },
+        "gallery": {
+            "managed_auth_cache": True,
+        },
+        "proxy": {
+            "enabled": bool(settings.proxy.enabled),
+            "auto_start": bool(settings.proxy.auto_start),
+            "transport_core_enabled": bool(settings.proxy.transport_core_enabled),
+        },
+        "scheduler": {
+            "max_concurrent_tasks": max(
+                1, min(int(settings.scheduler.max_concurrent_tasks), 100_000)
+            ),
+        },
+        "dedup": {
+            "enabled": bool(settings.dedup.enabled),
+            "configured_device": (
+                settings.dedup.device
+                if settings.dedup.device in {"auto", "cpu", "cuda"}
+                else "unknown"
+            ),
+            "sscd_enabled": not settings.dedup.no_sscd,
+            "dino_enabled": not settings.dedup.no_dino,
+        },
+    }
+
+
+def diagnostics_scheduler_snapshot(
+    scheduler: dict[str, Any],
+    ordered_crawls: dict[str, Any],
+) -> dict[str, Any]:
+    """投影调度摘要；只保留计数和受控枚举，不返回任务或批次载荷。"""
+
+    def bounded_count(value: Any) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(number, 1_000_000_000))
+
+    execution_order = str(ordered_crawls.get("execution_order") or "unknown")
+    if execution_order not in {"source_then_address", "unknown"}:
+        execution_order = "unknown"
+    address_parallelism = str(ordered_crawls.get("address_parallelism") or "unknown")
+    if address_parallelism not in {"media_tasks", "unknown"}:
+        address_parallelism = "unknown"
+    return {
+        "response_profile": "diagnostics",
+        "secrets_exposed": False,
+        "tasks": {
+            "running": bool(scheduler.get("running")),
+            "active": bounded_count(scheduler.get("active")),
+            "max_concurrent": bounded_count(scheduler.get("max_concurrent")),
+            "active_site_count": len(scheduler.get("sites") or {}),
+        },
+        "ordered_crawls": {
+            "running": bool(ordered_crawls.get("running")),
+            "active_batches": bounded_count(ordered_crawls.get("active_batches")),
+            "execution_order": execution_order,
+            "address_parallelism": address_parallelism,
+        },
+    }
+
+
 def readiness_snapshot(
     settings: AppSettings,
     *,

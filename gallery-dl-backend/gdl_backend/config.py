@@ -101,12 +101,35 @@ def _executable_path(
 def _paths(values: list[str] | None, base: Path, defaults: list[Path]) -> list[Path]:
     if not values:
         return [p.resolve() for p in defaults]
-    # Drop empty/whitespace entries: _path("") resolves to `base`, which would silently
-    # widen an allow-list root to the whole config directory (e.g. exposing credentials/).
+    # 丢弃空项，避免 _path("") 意外把配置目录扩成许可根目录。
     cleaned = [value for value in values if str(value).strip()]
     if not cleaned:
         return [p.resolve() for p in defaults]
     return [_path(value, base, base) for value in cleaned]
+
+
+def _allowed_node_roots(values: Any, base: Path) -> list[Path]:
+    """规范化 WebUI 节点文件许可根目录，同时拒绝空项和过宽根目录。"""
+
+    if values is None:
+        values = ["../subscriptions"]
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("proxy.allowed_node_roots 必须是路径列表")
+    normalized: list[Path] = []
+    broad_roots = {
+        Path(os.path.abspath(os.fspath(base))),
+        Path(os.path.abspath(os.fspath(PROJECT_DIR))),
+        Path(os.path.abspath(os.fspath(WORKSPACE_DIR))),
+    }
+    for value in values:
+        if not isinstance(value, (str, os.PathLike)) or not str(value).strip():
+            raise ValueError("proxy.allowed_node_roots 不能包含空路径")
+        root = _managed_path(value, base, base)
+        if root == Path(root.anchor) or root in broad_roots:
+            raise ValueError("proxy.allowed_node_roots 不能指向过宽的项目或文件系统根目录")
+        if root not in normalized:
+            normalized.append(root)
+    return normalized
 
 
 @dataclass(slots=True)
@@ -182,6 +205,9 @@ class ProxySettings:
     subscription_urls: list[str] = field(default_factory=list)
     node_file: Path | None = None
     inline_nodes: list[str] = field(default_factory=list)
+    allowed_node_roots: list[Path] = field(
+        default_factory=lambda: [(WORKSPACE_DIR / "subscriptions").resolve()]
+    )
     allow_socks: bool = True
     probe_url: str = "https://example.com/"
     probe_timeout_seconds: float = 10.0
@@ -331,6 +357,9 @@ class AppSettings:
             subscription_urls=[str(x).strip() for x in proxy_data.get("subscription_urls", []) if str(x).strip()],
             node_file=_path(node_file_value, base, base) if node_file_value else None,
             inline_nodes=[str(x).strip() for x in proxy_data.get("inline_nodes", []) if str(x).strip()],
+            allowed_node_roots=_allowed_node_roots(
+                proxy_data.get("allowed_node_roots"), base
+            ),
             allow_socks=bool(proxy_data.get("allow_socks", True)),
             probe_url=str(proxy_data.get("probe_url", "https://example.com/")),
             probe_timeout_seconds=float(proxy_data.get("probe_timeout_seconds", 10.0)),
@@ -424,6 +453,11 @@ class AppSettings:
             raise ValueError("本地服务仅允许监听回环地址")
         if self.proxy.engine != "native":
             raise ValueError("proxy.engine 当前支持 native")
+        node_root_base = self.config_path.parent if self.config_path is not None else self.project_dir
+        self.proxy.allowed_node_roots = _allowed_node_roots(
+            self.proxy.allowed_node_roots,
+            node_root_base,
+        )
         if self.auth.browser_login_timeout_seconds <= 0:
             raise ValueError("auth.browser_login_timeout_seconds 必须大于 0")
         if self.auth.browser_poll_interval_seconds <= 0:
@@ -560,6 +594,18 @@ class AppSettings:
         host = f"[{parsed.hostname}]" if parsed.hostname and ":" in parsed.hostname else parsed.hostname
         return f"{parsed.scheme}://***@{host}:{parsed.port}"
 
+    def _public_proxy_path(self, path: Path | None) -> str | None:
+        """代理配置只公开项目相对路径或文件名，不回显额外主机绝对路径。"""
+
+        if path is None:
+            return None
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        for root in (self.project_dir, self.workspace_dir):
+            parent = Path(os.path.abspath(os.fspath(root)))
+            if candidate == parent or candidate.is_relative_to(parent):
+                return candidate.relative_to(parent).as_posix() or candidate.name
+        return candidate.name or "configured-path"
+
     def public_dict(self) -> dict[str, Any]:
         return {
             "runtime_dir": str(self.runtime_dir),
@@ -591,8 +637,11 @@ class AppSettings:
                 "auto_start": self.proxy.auto_start,
                 "engine": self.proxy.engine,
                 "subscription_count": len(self.proxy.subscription_urls),
-                "node_file": str(self.proxy.node_file) if self.proxy.node_file else None,
+                "node_file": self._public_proxy_path(self.proxy.node_file),
                 "inline_node_count": len(self.proxy.inline_nodes),
+                "allowed_node_roots": [
+                    self._public_proxy_path(root) for root in self.proxy.allowed_node_roots
+                ],
                 "allow_socks": self.proxy.allow_socks,
                 "probe_url": self.proxy.probe_url,
                 "probe_timeout_seconds": self.proxy.probe_timeout_seconds,

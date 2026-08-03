@@ -6,12 +6,13 @@ import logging
 import os
 import re
 import socket
+import sqlite3
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
@@ -22,11 +23,24 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .auth import AuthError, AuthManager
+from .auth import (
+    MAX_AUTH_PROXY_REQUEST_BYTES,
+    AuthError,
+    AuthManager,
+    vault_safe_browser_profile,
+    vault_safe_proxy_status,
+    vault_safe_session,
+    vault_safe_status,
+    vault_safe_statuses,
+)
 from .config import AppSettings
 from .crawl import CrawlPlanError, CrawlPlanner
 from .database import Database, TERMINAL_STATUSES
-from .diagnostics import readiness_snapshot
+from .diagnostics import (
+    diagnostics_config_snapshot,
+    diagnostics_scheduler_snapshot,
+    readiness_snapshot,
+)
 from .discovery import (
     DiscoveryError,
     DiscoveryService,
@@ -41,7 +55,27 @@ from .discovery import (
 )
 from .gallery import GalleryRunner
 from .ordered_crawl import OrderedCrawlManager
+from .policy_view import (
+    MAX_POLICY_REQUEST_BYTES,
+    POLICY_RESPONSE_PROFILE,
+    PolicyViewValidationError,
+    is_policy_site,
+    policy_view_item,
+    policy_view_snapshot,
+    safe_policy_dict,
+)
 from .proxy import ProxyPoolAdapter, ProxyPoolConflict, ProxyPoolError
+from .proxy_source_store import (
+    MAX_PROXY_SOURCE_REQUEST_BYTES,
+    ManagedProxySourceStore,
+    ProxySourceNotFound,
+    ProxySourcePathForbidden,
+    ProxySourceSnapshot,
+    ProxySourceStoreConflict,
+    ProxySourceStoreCorrupt,
+    ProxySourceStoreError,
+    ProxySourceValidationError,
+)
 from .redaction import redact_text
 from .review import DedupReviewManager, resolve_review_file
 from .scheduler import TaskScheduler
@@ -49,9 +83,13 @@ from .schemas import (
     AuthProxyUpdate,
     CrawlRerunRequest,
     CrawlRequest,
+    ProxyInlineNodesCreate,
+    ProxyInlineNodeUpdate,
+    ProxyNodeFileUpdate,
     ProxyProbeRequest,
     ProxyStartRequest,
     ProxyStopRequest,
+    ProxySubscriptionUpdate,
     RetryRequest,
     ReviewDecisions,
     SearchRequest,
@@ -67,6 +105,36 @@ from .site import SiteResolver
 _ALIAS_LOOKUP_WAIT_SECONDS = 30.0
 
 _search_logger = logging.getLogger("gdl_backend.search")
+AuthResponseView = Literal["legacy", "vault"]
+PolicyResponseView = Literal["legacy", "policy"]
+DiagnosticsResponseView = Literal["legacy", "diagnostics"]
+
+# VAULT profile 可以保留后端定义的受控错误码，但绝不透传任意错误码、消息或 details。
+_VAULT_SAFE_AUTH_ERROR_CODES = frozenset(
+    {
+        "unsupported_auth_site",
+        "managed_browser_unsupported",
+        "browser_login_session_not_found",
+        "browser_login_start_failed",
+        "shared_browser_busy",
+        "pixiv_oauth_start_failed",
+        "pixiv_oauth_start_timeout",
+        "pixiv_oauth_session_not_found",
+        "pixiv_oauth_session_expired",
+        "pixiv_oauth_exchange_active",
+        "pixiv_oauth_process_ended",
+        "pixiv_oauth_exchange_timeout",
+        "pixiv_oauth_exchange_failed",
+        "invalid_pixiv_oauth_code",
+        "pixiv_oauth_cache_failed",
+        "invalid_authorization_proxy",
+        "browser_profile_reset_active",
+        "browser_profile_busy",
+        "invalid_browser_profile_path",
+        "chrome_not_found",
+        "auth_cache_clear_failed",
+    }
+)
 
 
 class ApiError(RuntimeError):
@@ -87,7 +155,16 @@ class ServiceContainer:
             settings.database_path,
             max_logs_per_task=settings.scheduler.max_logs_per_task,
         )
-        self.proxy = ProxyPoolAdapter(settings.proxy, settings.runtime_dir)
+        self.proxy_sources = ManagedProxySourceStore(
+            settings.proxy,
+            settings.runtime_dir,
+            project_dir=settings.project_dir,
+        )
+        self.proxy = ProxyPoolAdapter(
+            settings.proxy,
+            settings.runtime_dir,
+            source_provider=self.proxy_sources,
+        )
         self.auth = AuthManager(settings)
         self.gallery = GalleryRunner(settings.gallery, settings.project_dir)
         self.scheduler = TaskScheduler(
@@ -340,13 +417,72 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
+        source_path = request.url.path
+        policy_request = (
+            source_path.startswith("/api/v1/sites/policies/")
+            and request.query_params.get("view") == POLICY_RESPONSE_PROFILE
+        )
+        sensitive_request = (
+            source_path.startswith("/api/v1/proxy/sources")
+            or source_path == "/api/v1/auth/proxy"
+            or policy_request
+        )
+        if sensitive_request:
+            # Pydantic 默认错误包含 input；敏感写接口不得回显刚提交的原文。
+            if policy_request:
+                allowed_fields = frozenset(SitePolicy.model_fields)
+                details = []
+                for item in exc.errors():
+                    location = list(item.get("loc") or ())
+                    field = next(
+                        (
+                            part for part in location
+                            if isinstance(part, str) and part in allowed_fields
+                        ),
+                        "policy",
+                    )
+                    index = next(
+                        (part for part in location if isinstance(part, int) and part >= 0),
+                        None,
+                    )
+                    reason = str(item.get("type") or "validation_error")
+                    if not re.fullmatch(r"[a-z0-9_.:-]{1,64}", reason, re.I):
+                        reason = "validation_error"
+                    detail = {"field": field, "reason": reason}
+                    if index is not None:
+                        detail["index"] = index
+                    details.append(detail)
+            else:
+                details = [
+                    {
+                        "type": item.get("type", "validation_error"),
+                        "loc": list(item.get("loc") or ()),
+                        "msg": item.get("msg", "请求字段无效"),
+                    }
+                    for item in exc.errors()
+                ]
+            if policy_request:
+                error_code = "invalid_policy"
+            elif source_path == "/api/v1/auth/proxy":
+                error_code = "invalid_authorization_proxy"
+            elif "/subscriptions" in source_path:
+                error_code = "invalid_proxy_subscription"
+            elif "/node-file" in source_path:
+                error_code = "invalid_proxy_node_file"
+            elif "/inline-nodes" in source_path:
+                error_code = "invalid_proxy_inline_node"
+            else:
+                error_code = "validation_error"
+        else:
+            details = jsonable_encoder(exc.errors())
+            error_code = "validation_error"
         return JSONResponse(
             status_code=422,
             content={
                 "error": {
-                    "code": "validation_error",
+                    "code": error_code,
                     "message": "请求参数校验失败",
-                    "details": jsonable_encoder(exc.errors()),
+                    "details": details,
                     "request_id": getattr(request.state, "request_id", ""),
                 }
             },
@@ -354,6 +490,55 @@ def create_app(
 
     def get_service(request: Request) -> ServiceContainer:
         return request.app.state.container
+
+    def _content_length(request: Request) -> int | None:
+        raw_length = request.headers.get("content-length")
+        if raw_length is None:
+            return None
+        try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise ApiError(400, "invalid_content_length", "Content-Length 无效") from exc
+        if length < 0:
+            raise ApiError(400, "invalid_content_length", "Content-Length 无效")
+        return length
+
+    async def enforce_proxy_source_body_limit(request: Request) -> None:
+        length = _content_length(request)
+        if length is not None and length > MAX_PROXY_SOURCE_REQUEST_BYTES:
+            raise ApiError(
+                413,
+                "proxy_sources_request_too_large",
+                "代理源请求体超过大小上限",
+            )
+
+    async def enforce_auth_proxy_body_limit(request: Request) -> None:
+        length = _content_length(request)
+        if length is not None and length > MAX_AUTH_PROXY_REQUEST_BYTES:
+            raise ApiError(
+                413,
+                "auth_request_too_large",
+                "授权代理请求体超过大小上限",
+            )
+
+    async def enforce_policy_body_limit(request: Request) -> None:
+        # 默认写接口保持原契约；桌面 WebUI profile 使用更小的专用请求边界。
+        if request.query_params.get("view") != POLICY_RESPONSE_PROFILE:
+            return
+        length = _content_length(request)
+        if length is not None and length > MAX_POLICY_REQUEST_BYTES:
+            raise ApiError(
+                413,
+                "policy_request_too_large",
+                "站点策略请求体超过大小上限",
+            )
+        # 不能信任客户端声明；FastAPI 已缓存请求体，这里再核对实际字节数。
+        if len(await request.body()) > MAX_POLICY_REQUEST_BYTES:
+            raise ApiError(
+                413,
+                "policy_request_too_large",
+                "站点策略请求体超过大小上限",
+            )
 
     api = APIRouter(prefix="/api/v1")
 
@@ -391,10 +576,18 @@ def create_app(
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
     @api.get("/config")
-    async def public_config(container: ServiceContainer = Depends(get_service)):
+    async def public_config(
+        view: DiagnosticsResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        if view == "diagnostics":
+            return diagnostics_config_snapshot(container.settings)
         return container.settings.public_dict()
 
-    def _raise_auth_error(exc: AuthError) -> None:
+    def _raise_auth_error(
+        exc: AuthError,
+        view: AuthResponseView = "legacy",
+    ) -> None:
         if exc.code in {
             "unsupported_auth_site",
             "pixiv_oauth_session_not_found",
@@ -405,96 +598,170 @@ def create_app(
             status_code = 422
         else:
             status_code = 409
+        if view == "vault":
+            code = (
+                exc.code
+                if exc.code in _VAULT_SAFE_AUTH_ERROR_CODES
+                else "authorization_operation_failed"
+            )
+            if status_code == 404:
+                message = "授权目标或会话不存在"
+            elif status_code == 422:
+                message = "授权请求不符合安全约束"
+            else:
+                message = "授权状态冲突或操作暂时不可用"
+            raise ApiError(status_code, code, message) from exc
         raise ApiError(status_code, exc.code, exc.message, exc.details) from exc
 
+    def _auth_browser_result(result: dict[str, Any], view: AuthResponseView) -> dict[str, Any]:
+        if view == "legacy":
+            return result
+        status = vault_safe_status(result.get("status"))
+        return {
+            "session": vault_safe_session(result.get("session"), site=status["site"]),
+            "status": status,
+        }
+
     @api.get("/auth")
-    async def auth_statuses(container: ServiceContainer = Depends(get_service)):
-        return container.auth.statuses()
+    async def auth_statuses(
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        result = container.auth.statuses()
+        return vault_safe_statuses(result) if view == "vault" else result
 
     # 注意：/auth/proxy 必须先于 /auth/{site} 注册，否则会被当成站点名匹配。
     @api.get("/auth/proxy")
-    async def auth_proxy_status(container: ServiceContainer = Depends(get_service)):
-        return container.auth.proxy_status()
+    async def auth_proxy_status(
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        result = container.auth.proxy_status()
+        return vault_safe_proxy_status(result) if view == "vault" else result
 
     @api.put("/auth/proxy")
     async def auth_set_proxy(
         payload: AuthProxyUpdate,
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_auth_proxy_body_limit),
+    ):
+        try:
+            result = await container.auth.set_authorization_proxy(payload.proxy_url)
+            return vault_safe_proxy_status(result) if view == "vault" else result
+        except AuthError as exc:
+            _raise_auth_error(exc, view)
+
+    @api.delete("/auth/proxy")
+    async def auth_reset_proxy(
+        view: AuthResponseView = Query("legacy"),
         container: ServiceContainer = Depends(get_service),
     ):
         try:
-            return await container.auth.set_authorization_proxy(payload.proxy_url)
+            result = await container.auth.clear_authorization_proxy()
+            return vault_safe_proxy_status(result) if view == "vault" else result
         except AuthError as exc:
-            _raise_auth_error(exc)
-
-    @api.delete("/auth/proxy")
-    async def auth_reset_proxy(container: ServiceContainer = Depends(get_service)):
-        return await container.auth.clear_authorization_proxy()
+            _raise_auth_error(exc, view)
 
     @api.get("/auth/{site}")
-    async def auth_status(site: str, container: ServiceContainer = Depends(get_service)):
+    async def auth_status(
+        site: str,
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
         try:
-            return container.auth.status(site)
+            result = container.auth.status(site)
+            return vault_safe_status(result) if view == "vault" else result
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.post("/auth/{site}/login/start", status_code=202)
     async def auth_start_browser_login(
         site: str,
+        view: AuthResponseView = Query("legacy"),
         container: ServiceContainer = Depends(get_service),
     ):
         try:
-            return await container.auth.start_browser_login(site)
+            result = await container.auth.start_browser_login(site)
+            return _auth_browser_result(result, view)
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.get("/auth/{site}/login/{session_id}")
     async def auth_browser_login_session(
         site: str,
         session_id: str,
+        view: AuthResponseView = Query("legacy"),
         container: ServiceContainer = Depends(get_service),
     ):
         try:
-            return container.auth.browser_login_session(site, session_id)
+            result = container.auth.browser_login_session(site, session_id)
+            return _auth_browser_result(result, view)
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.delete("/auth/{site}/login/{session_id}")
     async def auth_cancel_browser_login(
         site: str,
         session_id: str,
+        view: AuthResponseView = Query("legacy"),
         container: ServiceContainer = Depends(get_service),
     ):
         try:
-            return await container.auth.cancel_browser_login(site, session_id)
+            result = await container.auth.cancel_browser_login(site, session_id)
+            return _auth_browser_result(result, view)
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.post("/auth/pixiv/oauth/start")
-    async def auth_start_pixiv(container: ServiceContainer = Depends(get_service)):
+    async def auth_start_pixiv(
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
         try:
-            return await container.auth.start_pixiv_oauth()
+            result = await container.auth.start_pixiv_oauth()
+            return vault_safe_session(result, site="pixiv") if view == "vault" else result
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.delete("/auth/pixiv/oauth/session")
-    async def auth_cancel_pixiv(container: ServiceContainer = Depends(get_service)):
-        return await container.auth.cancel_pixiv_oauth()
+    async def auth_cancel_pixiv(
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        try:
+            result = await container.auth.cancel_pixiv_oauth()
+            return vault_safe_status(result) if view == "vault" else result
+        except AuthError as exc:
+            _raise_auth_error(exc, view)
 
     @api.delete("/auth/browser-profile")
     async def auth_clear_browser_profile(
+        view: AuthResponseView = Query("legacy"),
         container: ServiceContainer = Depends(get_service),
     ):
         try:
-            return await container.auth.clear_browser_profile()
+            result = await container.auth.clear_browser_profile()
+            if view == "legacy":
+                return result
+            return {
+                "browser_profile": vault_safe_browser_profile(result.get("browser_profile")),
+                "auth": vault_safe_statuses(result.get("auth")),
+            }
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     @api.delete("/auth/{site}")
-    async def auth_clear(site: str, container: ServiceContainer = Depends(get_service)):
+    async def auth_clear(
+        site: str,
+        view: AuthResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
         try:
-            return await container.auth.clear(site)
+            result = await container.auth.clear(site)
+            return vault_safe_status(result) if view == "vault" else result
         except AuthError as exc:
-            _raise_auth_error(exc)
+            _raise_auth_error(exc, view)
 
     def _validate_idempotency_key(value: str | None) -> str | None:
         if value is None:
@@ -1215,13 +1482,12 @@ def create_app(
             if source.get("status") == "succeeded":
                 continue
             _search_logger.warning(
-                "search source issue keyword=%r site=%s status=%s error=%s enrichment=[%s]",
-                body.keyword,
+                "search source issue site=%s status=%s error_code=%s enrichment_stages=[%s]",
                 source.get("site"),
                 source.get("status"),
-                (source.get("error") or {}).get("message"),
-                "; ".join(
-                    f"{item.get('stage')}: {str(item.get('message'))[:160]}"
+                (source.get("error") or {}).get("code"),
+                ",".join(
+                    str(item.get("stage") or "unknown")[:64]
                     for item in source.get("enrichment_errors") or []
                 ),
             )
@@ -1798,34 +2064,296 @@ def create_app(
             raise ApiError(404, "file_not_found", "任务文件不存在")
         return FileResponse(target)
 
+    def _require_policy_profile_site(name: str) -> None:
+        if not is_policy_site(name):
+            raise ApiError(
+                422,
+                "unsupported_policy_site",
+                "POLICY.CPL 不支持该来源",
+            )
+
+    def _raise_policy_store_error(exc: Exception) -> None:
+        raise ApiError(
+            503,
+            "policy_store_error",
+            "站点策略存储暂时不可用",
+        ) from exc
+
     @api.get("/sites/policies")
-    async def site_policies(container: ServiceContainer = Depends(get_service)):
-        return {
-            "default": SitePolicy.model_validate(container.settings.default_site_policy).model_dump(),
-            "items": container.db.list_site_policies(),
-        }
+    async def site_policies(
+        view: PolicyResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        if view == "legacy":
+            return {
+                "default": SitePolicy.model_validate(container.settings.default_site_policy).model_dump(),
+                "items": container.db.list_site_policies(),
+            }
+        try:
+            return policy_view_snapshot(
+                container.settings.default_site_policy,
+                container.db.list_site_policies(),
+                validate_gallery_args=container.gallery.validate_args,
+            )
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            _raise_policy_store_error(exc)
 
     @api.get("/sites/policies/{site}")
-    async def get_site_policy(site: str, container: ServiceContainer = Depends(get_service)):
+    async def get_site_policy(
+        site: str,
+        view: PolicyResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
         name = _validate_site_name(site)
-        stored = container.db.get_site_policy(name)
-        return stored or {"site": name, "policy": container.policy_for(name).model_dump(), "inherited": True}
+        if view == "legacy":
+            stored = container.db.get_site_policy(name)
+            return stored or {
+                "site": name,
+                "policy": container.policy_for(name).model_dump(),
+                "inherited": True,
+            }
+        _require_policy_profile_site(name)
+        try:
+            stored = container.db.get_site_policy(name)
+            if stored is None:
+                return policy_view_item(
+                    name,
+                    container.settings.default_site_policy,
+                    inherited=True,
+                    validate_gallery_args=container.gallery.validate_args,
+                )
+            return policy_view_item(
+                name,
+                stored.get("policy"),
+                inherited=False,
+                updated_at=stored.get("updated_at"),
+                validate_gallery_args=container.gallery.validate_args,
+            )
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            _raise_policy_store_error(exc)
 
     @api.put("/sites/policies/{site}")
-    async def put_site_policy(site: str, body: SitePolicy, container: ServiceContainer = Depends(get_service)):
+    async def put_site_policy(
+        site: str,
+        body: SitePolicy,
+        view: PolicyResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_policy_body_limit),
+    ):
         name = _validate_site_name(site)
+        if view == "legacy":
+            try:
+                container.gallery.validate_args(body.extra_args)
+            except ValueError as exc:
+                raise ApiError(422, "invalid_policy", str(exc)) from exc
+            return container.db.put_site_policy(name, body.model_dump())
+
+        _require_policy_profile_site(name)
         try:
-            container.gallery.validate_args(body.extra_args)
-        except ValueError as exc:
-            raise ApiError(422, "invalid_policy", str(exc)) from exc
-        return container.db.put_site_policy(name, body.model_dump())
+            policy = safe_policy_dict(
+                body,
+                validate_gallery_args=container.gallery.validate_args,
+                require_complete=True,
+            )
+        except PolicyViewValidationError as exc:
+            raise ApiError(
+                422,
+                "invalid_policy",
+                "站点策略字段不符合 POLICY 安全边界",
+                exc.safe_details(),
+            ) from exc
+        try:
+            stored = container.db.put_site_policy(name, policy)
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            _raise_policy_store_error(exc)
+        return policy_view_item(
+            name,
+            stored["policy"],
+            inherited=False,
+            updated_at=stored.get("updated_at"),
+            validate_gallery_args=container.gallery.validate_args,
+        )
 
     @api.delete("/sites/policies/{site}")
-    async def delete_site_policy(site: str, container: ServiceContainer = Depends(get_service)):
+    async def delete_site_policy(
+        site: str,
+        view: PolicyResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
         name = _validate_site_name(site)
-        if not container.db.delete_site_policy(name):
+        if view == "policy":
+            _require_policy_profile_site(name)
+        try:
+            deleted = container.db.delete_site_policy(name)
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            if view == "policy":
+                _raise_policy_store_error(exc)
+            raise
+        if not deleted:
             raise ApiError(404, "site_policy_not_found", "站点策略不存在")
+        if view == "policy":
+            return {
+                "response_profile": POLICY_RESPONSE_PROFILE,
+                "deleted": True,
+                "site": name,
+            }
         return {"deleted": True, "site": name}
+
+    def _raise_proxy_source_error(exc: ProxySourceStoreError) -> None:
+        if isinstance(exc, ProxySourceNotFound):
+            raise ApiError(404, "proxy_source_not_found", exc.message) from exc
+        if isinstance(exc, ProxySourcePathForbidden):
+            raise ApiError(
+                422,
+                "proxy_source_path_forbidden",
+                exc.message,
+                exc.details,
+            ) from exc
+        if isinstance(exc, ProxySourceValidationError):
+            code = {
+                "subscription": "invalid_proxy_subscription",
+                "inline_node": "invalid_proxy_inline_node",
+                "node_file": "invalid_proxy_node_file",
+                "source_id": "invalid_proxy_source_id",
+            }[exc.category]
+            raise ApiError(422, code, exc.message, exc.details) from exc
+        if isinstance(exc, (ProxySourceStoreCorrupt, ProxySourceStoreConflict)):
+            raise ApiError(
+                409,
+                "proxy_sources_store_error",
+                exc.message,
+                {"reason": exc.reason},
+            ) from exc
+        raise ApiError(
+            503,
+            "proxy_sources_store_error",
+            exc.message,
+            {"reason": exc.reason},
+        ) from exc
+
+    async def _proxy_sources_response(
+        container: ServiceContainer,
+        snapshot: ProxySourceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                container.proxy_sources.public_snapshot,
+                snapshot,
+                active_revision=container.proxy.active_revision,
+            )
+        except ProxySourceStoreError as exc:
+            _raise_proxy_source_error(exc)
+            raise AssertionError("unreachable")
+
+    async def _proxy_source_change(
+        container: ServiceContainer,
+        call,
+    ) -> dict[str, Any]:
+        try:
+            snapshot = await asyncio.to_thread(call)
+        except ProxySourceStoreError as exc:
+            _raise_proxy_source_error(exc)
+            raise AssertionError("unreachable")
+        return await _proxy_sources_response(container, snapshot)
+
+    @api.get("/proxy/sources")
+    async def proxy_sources(container: ServiceContainer = Depends(get_service)):
+        return await _proxy_sources_response(container)
+
+    @api.post("/proxy/sources/subscriptions")
+    async def add_proxy_subscription(
+        body: ProxySubscriptionUpdate,
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_proxy_source_body_limit),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.add_subscription(body.url),
+        )
+
+    @api.put("/proxy/sources/subscriptions/{source_id}")
+    async def replace_proxy_subscription(
+        source_id: str,
+        body: ProxySubscriptionUpdate,
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_proxy_source_body_limit),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.replace_subscription(source_id, body.url),
+        )
+
+    @api.delete("/proxy/sources/subscriptions/{source_id}")
+    async def delete_proxy_subscription(
+        source_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.delete_subscription(source_id),
+        )
+
+    @api.put("/proxy/sources/node-file")
+    async def set_proxy_node_file(
+        body: ProxyNodeFileUpdate,
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_proxy_source_body_limit),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.set_node_file(body.path),
+        )
+
+    @api.delete("/proxy/sources/node-file")
+    async def clear_proxy_node_file(
+        container: ServiceContainer = Depends(get_service),
+    ):
+        return await _proxy_source_change(
+            container,
+            container.proxy_sources.clear_node_file,
+        )
+
+    @api.post("/proxy/sources/inline-nodes")
+    async def add_proxy_inline_nodes(
+        body: ProxyInlineNodesCreate,
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_proxy_source_body_limit),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.add_inline_nodes(body.nodes),
+        )
+
+    @api.put("/proxy/sources/inline-nodes/{source_id}")
+    async def replace_proxy_inline_node(
+        source_id: str,
+        body: ProxyInlineNodeUpdate,
+        container: ServiceContainer = Depends(get_service),
+        _body_limit: None = Depends(enforce_proxy_source_body_limit),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.replace_inline_node(source_id, body.node),
+        )
+
+    @api.delete("/proxy/sources/inline-nodes/{source_id}")
+    async def delete_proxy_inline_node(
+        source_id: str,
+        container: ServiceContainer = Depends(get_service),
+    ):
+        return await _proxy_source_change(
+            container,
+            lambda: container.proxy_sources.delete_inline_node(source_id),
+        )
+
+    @api.delete("/proxy/sources/override")
+    async def reset_proxy_sources_override(
+        container: ServiceContainer = Depends(get_service),
+    ):
+        return await _proxy_source_change(
+            container,
+            container.proxy_sources.reset_override,
+        )
 
     @api.get("/proxy/status")
     async def proxy_status(container: ServiceContainer = Depends(get_service)):
@@ -1872,10 +2400,17 @@ def create_app(
         return await _proxy_action(lambda: container.proxy.probe(target_url=target, node_id=body.node_id))
 
     @api.get("/scheduler/status")
-    async def scheduler_status(container: ServiceContainer = Depends(get_service)):
+    async def scheduler_status(
+        view: DiagnosticsResponseView = Query("legacy"),
+        container: ServiceContainer = Depends(get_service),
+    ):
+        tasks = container.scheduler.active_summary()
+        ordered_crawls = container.ordered_crawls.status()
+        if view == "diagnostics":
+            return diagnostics_scheduler_snapshot(tasks, ordered_crawls)
         return {
-            "tasks": container.scheduler.active_summary(),
-            "ordered_crawls": container.ordered_crawls.status(),
+            "tasks": tasks,
+            "ordered_crawls": ordered_crawls,
         }
 
     app.include_router(api)

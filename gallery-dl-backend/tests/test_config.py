@@ -146,6 +146,79 @@ class DedupResourceConfigTests(unittest.TestCase):
             self.assertEqual(list(target.iterdir()), [])
 
 
+class ProxyNodeRootConfigTests(unittest.TestCase):
+    @staticmethod
+    def _write_config(root: Path, proxy: dict) -> Path:
+        path = root / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "runtime_dir": "runtime",
+                    "database_path": "runtime/backend.sqlite3",
+                    "default_output_root": "runtime/downloads",
+                    "gallery": {"cache_file": "credentials/managed/cache.sqlite3"},
+                    "dedup": {"enabled": False},
+                    "proxy": proxy,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_allowed_node_roots_are_absolute_but_public_values_are_relative(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self._write_config(
+                root,
+                {"allowed_node_roots": ["subscriptions", "external/nodes"]},
+            )
+            settings = AppSettings.load(path)
+            self.assertEqual(
+                settings.proxy.allowed_node_roots,
+                [
+                    Path(os.path.abspath(root / "subscriptions")),
+                    Path(os.path.abspath(root / "external" / "nodes")),
+                ],
+            )
+            public = settings.public_dict()["proxy"]["allowed_node_roots"]
+            self.assertEqual(public, ["subscriptions", "nodes"])
+            self.assertNotIn(str(root), json.dumps(public))
+
+    def test_default_node_root_is_dedicated_subscriptions_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = AppSettings.load(self._write_config(root, {}))
+            self.assertEqual(
+                settings.proxy.allowed_node_roots,
+                [Path(os.path.abspath(root / ".." / "subscriptions"))],
+            )
+
+    def test_empty_or_overbroad_node_root_is_rejected(self):
+        for value in ("", "   ", "."):
+            with self.subTest(value=repr(value)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                path = self._write_config(root, {"allowed_node_roots": [value]})
+                with self.assertRaisesRegex(ValueError, "allowed_node_roots"):
+                    AppSettings.load(path)
+
+    def test_config_node_file_remains_valid_outside_new_allow_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = root / "legacy" / "nodes.txt"
+            legacy.parent.mkdir()
+            legacy.write_text("http://127.0.0.1:18080#LEGACY\n", encoding="utf-8")
+            path = self._write_config(
+                root,
+                {
+                    "node_file": "legacy/nodes.txt",
+                    "allowed_node_roots": ["subscriptions"],
+                },
+            )
+            settings = AppSettings.load(path)
+            self.assertEqual(settings.proxy.node_file, legacy.resolve())
+            self.assertNotIn(legacy.resolve(), settings.proxy.allowed_node_roots)
+
+
 class AuthorizationProxyConfigTests(unittest.TestCase):
     def test_default_is_direct_and_reported_as_none(self):
         with tempfile.TemporaryDirectory() as temporary:

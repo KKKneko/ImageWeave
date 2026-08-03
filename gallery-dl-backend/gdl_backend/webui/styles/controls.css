@@ -1,0 +1,87 @@
+button {
+  border-radius: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.window-actions button {
+  display: grid;
+  width: var(--imageweave-control-size);
+  height: var(--imageweave-control-size);
+  padding: 0;
+  place-items: center;
+  border: var(--imageweave-border-width) solid var(--imageweave-surface);
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+}
+
+.window-actions button:focus-visible {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+  outline-color: var(--imageweave-surface);
+  outline-offset: -4px;
+}
+
+.app-view {
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.app-header {
+  display: grid;
+  justify-items: start;
+  margin-bottom: 24px;
+}
+
+.app-executable {
+  margin-bottom: 7px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.app-summary {
+  max-width: 70ch;
+  margin: 15px 0 0;
+}
+
+.deferred-panel {
+  padding: clamp(15px, 2.5vw, 24px);
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  box-shadow: var(--imageweave-small-shadow);
+}
+
+.deferred-capabilities {
+  display: grid;
+  grid-template-columns: repeat(var(--application-panel-columns, 1), minmax(0, 1fr));
+  gap: 10px 24px;
+  margin: 0;
+  padding-left: 24px;
+}
+
+.deferred-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.route-button {
+  min-height: 44px;
+  padding: 7px 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: var(--imageweave-small-shadow);
+  font-weight: 700;
+}
+
+.route-button:hover,
+.route-button:focus-visible {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+}

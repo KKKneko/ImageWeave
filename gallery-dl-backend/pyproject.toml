@@ -49,4 +49,13 @@ gdl-backend = "gdl_backend.__main__:main"
 include = ["gdl_backend*"]
 
 [tool.setuptools.package-data]
-gdl_backend = ["webui/*.html", "webui/*.css", "webui/*.js"]
+gdl_backend = [
+  "webui/*.html",
+  "webui/assets/*.png",
+  "webui/styles/*.css",
+  "webui/styles/apps/*.css",
+  "webui/js/*.js",
+  "webui/js/core/*.js",
+  "webui/js/components/*.js",
+  "webui/js/apps/*.js",
+]

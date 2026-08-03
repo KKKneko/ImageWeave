@@ -18,6 +18,16 @@ from .config import ProxySettings
 from .file_security import ensure_private_directory
 from .proxy_core import TunnelTransportCore
 from .proxy_runtime import LocalHTTPForwarder, NativeProxyPool, mask_proxy
+from .proxy_source_store import (
+    ProxySourcePathForbidden,
+    ProxySourceProviderLike,
+    ProxySourceSnapshot,
+    ProxySourceStoreError,
+    ProxySourceValidationError,
+    read_proxy_node_file,
+    safe_proxy_node_name,
+    snapshot_from_settings,
+)
 from .proxy_sources import ParsedProxyNode, fetch_subscriptions, parse_subscription_text
 from .redaction import redact_text
 
@@ -85,10 +95,16 @@ _REGIONS: dict[str, tuple[str, ...]] = {
 
 
 class ProxyPoolAdapter:
-    """Self-contained subscription proxy pool used by the backend."""
+    """后端内置代理池；每次生命周期操作只消费一份不可变源快照。"""
 
-    def __init__(self, settings: ProxySettings, runtime_dir: Path) -> None:
+    def __init__(
+        self,
+        settings: ProxySettings,
+        runtime_dir: Path,
+        source_provider: ProxySourceProviderLike | None = None,
+    ) -> None:
         self.settings = settings
+        self._source_provider = source_provider
         self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir / "proxy")))
         ensure_private_directory(self.runtime_dir)
         self._lock = threading.RLock()
@@ -105,6 +121,7 @@ class ProxyPoolAdapter:
         self._pending_acquires: dict[str, threading.Event] = {}
         self._generation = 0
         self._running = False
+        self._active_revision: str | None = None
         self._last_error = ""
         self._core_start_error = ""
         self._source_summary: dict[str, Any] = {
@@ -115,6 +132,15 @@ class ProxyPoolAdapter:
             "scheme_counts": {},
             "warnings": [],
         }
+
+    def _source_snapshot(self) -> ProxySourceSnapshot:
+        provider = self._source_provider
+        if provider is None:
+            return snapshot_from_settings(self.settings)
+        snapshot = provider() if callable(provider) else provider.snapshot()
+        if not isinstance(snapshot, ProxySourceSnapshot):
+            raise ProxyPoolError("代理源提供器返回了无效快照")
+        return snapshot
 
     def _set_records(self, records: list[_NodeRecord]) -> None:
         with self._lock:
@@ -171,40 +197,48 @@ class ProxyPoolAdapter:
         port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
         return f"https://{host}{port}{parsed.path or '/'}"
 
-    def _safe_warning(self, warning: object) -> str:
+    def _safe_warning(self, warning: object, snapshot: ProxySourceSnapshot) -> str:
         text = str(warning or "")
-        for index, url in enumerate(self.settings.subscription_urls, start=1):
+        for index, url in enumerate(snapshot.subscription_urls, start=1):
             text = text.replace(url, f"SUBSCRIPTION_URL_{index}")
         return redact_text(text, limit=500)
 
-    def _collect_nodes(self, *, force_refresh: bool) -> tuple[list[_NodeRecord], dict[str, Any]]:
-        del force_refresh  # Fetches are explicit; no hidden external cache is used.
+    def _collect_nodes(
+        self,
+        *,
+        force_refresh: bool,
+        snapshot: ProxySourceSnapshot | None = None,
+    ) -> tuple[list[_NodeRecord], dict[str, Any]]:
+        del force_refresh  # 拉取始终显式执行，不存在隐藏的外部缓存。
+        sources = snapshot or self._source_snapshot()
         parsed_nodes: list[ParsedProxyNode] = []
         warnings: list[str] = []
-        if self.settings.subscription_urls:
+        if sources.subscription_urls:
             try:
                 remote_nodes, remote_warnings = fetch_subscriptions(
-                    self.settings.subscription_urls,
+                    sources.subscription_urls,
                     timeout=self.settings.subscription_timeout_seconds,
-                    max_workers=min(8, max(1, len(self.settings.subscription_urls))),
+                    max_workers=min(8, max(1, len(sources.subscription_urls))),
                 )
             except ValueError as exc:
-                # fetch_subscriptions raises when every subscription fails. Only abort if
-                # subscriptions are the sole source; with a node_file / inline_nodes
-                # fallback configured, degrade to a warning so those still get a chance
-                # (start() raises later if the whole pool ends up empty).
-                if not self.settings.node_file and not self.settings.inline_nodes:
+                # 订阅并非唯一来源时允许本地文件和内联节点继续加载。
+                if not sources.node_file and not sources.inline_nodes:
                     raise
-                remote_nodes, remote_warnings = [], [self._safe_warning(exc)]
+                remote_nodes, remote_warnings = [], [self._safe_warning(exc, sources)]
             parsed_nodes.extend(remote_nodes)
             warnings.extend(remote_warnings)
-        if self.settings.node_file:
-            node_file = self.settings.node_file.resolve()
-            if not node_file.is_file():
-                raise ProxyPoolError(f"节点文件不存在: {node_file}")
-            parsed_nodes.extend(parse_subscription_text(node_file.read_text(encoding="utf-8-sig")))
-        if self.settings.inline_nodes:
-            parsed_nodes.extend(parse_subscription_text("\n".join(self.settings.inline_nodes)))
+        if sources.node_file:
+            try:
+                _, file_nodes = read_proxy_node_file(sources.node_file)
+            except (
+                ProxySourcePathForbidden,
+                ProxySourceStoreError,
+                ProxySourceValidationError,
+            ) as exc:
+                raise ProxyPoolError("节点文件不可用或未通过安全校验") from exc
+            parsed_nodes.extend(file_nodes)
+        if sources.inline_nodes:
+            parsed_nodes.extend(parse_subscription_text("\n".join(sources.inline_nodes)))
 
         records: list[_NodeRecord] = []
         core_candidates: list[ParsedProxyNode] = []
@@ -226,7 +260,7 @@ class ProxyPoolAdapter:
             if node.endpoint in seen:
                 continue
             seen.add(node.endpoint)
-            name = node.name or f"{scheme}-{node.host}"
+            name = safe_proxy_node_name(node.name) or f"{scheme}-{node.host}"
             node_id = hashlib.sha256(node.endpoint.encode("utf-8")).hexdigest()[:20]
             records.append(
                 _NodeRecord(
@@ -242,21 +276,28 @@ class ProxyPoolAdapter:
         with self._lock:
             self._core_candidates = list(core_candidates)
         summary = {
-            "subscriptions": len(self.settings.subscription_urls),
+            "subscriptions": len(sources.subscription_urls),
             "source_nodes": len(parsed_nodes),
             "pool_nodes": len(records),
             "core_candidates": len(core_candidates),
             "core_nodes": 0,
             "skipped_nodes": skipped,
             "scheme_counts": scheme_counts,
-            "warnings": [self._safe_warning(item) for item in warnings[:20]],
+            "warnings": [self._safe_warning(item, sources) for item in warnings[:20]],
         }
         return records, summary
 
-    def start(self, *, force_refresh: bool = True, probe_url: str | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        *,
+        force_refresh: bool = True,
+        probe_url: str | None = None,
+        _source_snapshot: ProxySourceSnapshot | None = None,
+    ) -> dict[str, Any]:
         with self._lifecycle_lock:
             if not self.settings.enabled:
                 raise ProxyPoolError("代理池配置为停用状态")
+            source_snapshot = _source_snapshot or self._source_snapshot()
             with self._lock:
                 if self._leases or self._pending_acquires:
                     raise ProxyPoolConflict("仍有任务正在申请或持有代理租约")
@@ -275,7 +316,10 @@ class ProxyPoolAdapter:
                 old_core.stop()
             new_core: TunnelTransportCore | None = None
             try:
-                records, summary = self._collect_nodes(force_refresh=force_refresh)
+                records, summary = self._collect_nodes(
+                    force_refresh=force_refresh,
+                    snapshot=source_snapshot,
+                )
                 with self._lock:
                     core_candidates = list(self._core_candidates)
                 if core_candidates:
@@ -302,9 +346,12 @@ class ProxyPoolAdapter:
                         raise
                     else:
                         for endpoint in core_endpoints:
+                            safe_name = safe_proxy_node_name(endpoint.name) or (
+                                f"{endpoint.source_protocol}-{endpoint.source_host}"
+                            )
                             tags = set(
                                 self._node_tags(
-                                    endpoint.name,
+                                    safe_name,
                                     endpoint.source_protocol,
                                     endpoint.source_host,
                                 )
@@ -313,7 +360,7 @@ class ProxyPoolAdapter:
                             records.append(
                                 _NodeRecord(
                                     id=endpoint.id,
-                                    name=endpoint.name,
+                                    name=safe_name,
                                     protocol="http",
                                     endpoint=endpoint.local_http,
                                     tags=sorted(tags),
@@ -333,11 +380,13 @@ class ProxyPoolAdapter:
                     self._running = True
                     self._generation += 1
                 probed = self.probe(target_url=probe_url or self.settings.probe_url)
-                self._last_error = "" if probed.get("healthy") else "全部代理节点探活未通过"
+                with self._lock:
+                    self._active_revision = source_snapshot.configured_revision
+                    self._last_error = "" if probed.get("healthy") else "全部代理节点探活未通过"
                 return {
                     "start": {"engine": self.settings.engine, "nodes": len(records)},
                     "probe": probed,
-                    "status": self.status(),
+                    "status": self.status(_configured_snapshot=source_snapshot),
                 }
             except Exception as exc:
                 with self._lock:
@@ -356,13 +405,23 @@ class ProxyPoolAdapter:
 
     def reload(self, *, force_refresh: bool = True, probe_url: str | None = None) -> dict[str, Any]:
         with self._lifecycle_lock:
+            source_snapshot = self._source_snapshot()
             with self._lock:
                 if self._leases or self._pending_acquires:
                     raise ProxyPoolConflict("仍有任务正在申请或持有代理租约")
-            self.stop(force=False)
-            return self.start(force_refresh=force_refresh, probe_url=probe_url)
+            self.stop(force=False, _configured_snapshot=source_snapshot)
+            return self.start(
+                force_refresh=force_refresh,
+                probe_url=probe_url,
+                _source_snapshot=source_snapshot,
+            )
 
-    def stop(self, *, force: bool = False) -> dict[str, Any]:
+    def stop(
+        self,
+        *,
+        force: bool = False,
+        _configured_snapshot: ProxySourceSnapshot | None = None,
+    ) -> dict[str, Any]:
         with self._lifecycle_lock:
             with self._lock:
                 active_task_ids = list(self._leases)
@@ -388,7 +447,7 @@ class ProxyPoolAdapter:
                 pool.close()
             if transport_core is not None:
                 transport_core.stop()
-            return self.status()
+            return self.status(_configured_snapshot=_configured_snapshot)
 
     def _node_rows(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -419,11 +478,17 @@ class ProxyPoolAdapter:
                 )
             return rows
 
-    def status(self) -> dict[str, Any]:
+    def status(
+        self,
+        *,
+        _configured_snapshot: ProxySourceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        configured = _configured_snapshot or self._source_snapshot()
         nodes = self._node_rows()
         with self._lock:
             transport_core = self._transport_core
             core_start_error = self._core_start_error
+            active_revision = self._active_revision
         core_status = (
             transport_core.status()
             if transport_core is not None
@@ -441,6 +506,9 @@ class ProxyPoolAdapter:
             "auto_start": self.settings.auto_start,
             "executable_required": False,
             "running": bool(self._running and self._pool is not None),
+            "configured_revision": configured.configured_revision,
+            "active_revision": active_revision,
+            "reload_required": configured.configured_revision != active_revision,
             "total": len(nodes),
             "healthy": sum(1 for node in nodes if node["healthy"]),
             "retry_eligible": sum(1 for node in nodes if node["retry_eligible"]),
@@ -715,6 +783,11 @@ class ProxyPoolAdapter:
                 success=not proxy_fault,
                 cooldown_seconds=self.settings.fail_cooldown_seconds if proxy_fault else 0.0,
             )
+
+    @property
+    def active_revision(self) -> str | None:
+        with self._lock:
+            return self._active_revision
 
     @property
     def active_leases(self) -> int:

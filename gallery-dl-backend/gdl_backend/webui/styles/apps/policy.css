@@ -1,0 +1,500 @@
+.policy-app {
+  display: grid;
+  gap: 18px;
+  max-width: 1180px;
+  min-width: 0;
+}
+
+.policy-app-header {
+  margin-bottom: 0;
+}
+
+.policy-app h2,
+.policy-app h3,
+.policy-app p {
+  overflow-wrap: anywhere;
+}
+
+.policy-app h2,
+.policy-app h3 {
+  margin: 0;
+}
+
+.policy-panel {
+  display: grid;
+  gap: 15px;
+  min-width: 0;
+  padding: clamp(14px, 2.4vw, 24px);
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: var(--imageweave-small-shadow);
+}
+
+.policy-panel-heading {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.policy-panel-heading > div {
+  min-width: 0;
+}
+
+.policy-panel-heading p {
+  max-width: 78ch;
+  margin: 5px 0 0;
+}
+
+.policy-operation-live,
+.policy-scope-note,
+.policy-dirty-live,
+.policy-error-detail,
+.policy-preserved-field,
+.policy-contract-warning {
+  margin: 0;
+  padding: 10px 12px;
+  border: var(--imageweave-border-width) dotted var(--imageweave-accent);
+  background: var(--imageweave-surface);
+}
+
+.policy-operation-live {
+  border-style: dashed;
+  font-weight: 800;
+}
+
+.policy-scope-note {
+  border-left: 6px double var(--imageweave-accent);
+  font-weight: 750;
+}
+
+.policy-error-host:empty,
+.policy-warning-host:empty,
+.policy-validation:empty,
+.policy-preserved-field:empty {
+  display: none;
+}
+
+.policy-error-detail {
+  font-weight: 800;
+}
+
+.policy-contract-list,
+.policy-definition-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.policy-contract-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.policy-contract-list > div,
+.policy-definition-list > div {
+  display: grid;
+  grid-template-columns: minmax(102px, 0.55fr) minmax(0, 1.45fr);
+  gap: 8px;
+  min-width: 0;
+  padding: 7px;
+  border-bottom: var(--imageweave-border-width) dotted var(--imageweave-accent);
+}
+
+.policy-contract-list dt,
+.policy-definition-list dt {
+  font-weight: 900;
+}
+
+.policy-contract-list dd,
+.policy-definition-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.policy-warning-host {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.policy-contract-warning {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  border-style: dashed;
+}
+
+.policy-contract-warning p {
+  margin: 0;
+}
+
+.policy-source-fieldset,
+.policy-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.policy-source-fieldset > legend,
+.policy-fieldset > legend {
+  padding: 0;
+  font-weight: 900;
+}
+
+.policy-source-fieldset > legend {
+  font-size: 1.05rem;
+}
+
+.policy-source-options {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.policy-source-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "input badge"
+    "mark copy";
+  gap: 7px 8px;
+  align-content: start;
+  min-width: 0;
+  min-height: 110px;
+  padding: 10px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  cursor: pointer;
+}
+
+.policy-source-option:has(input:checked) {
+  border-style: double;
+  border-width: 4px;
+  background: repeating-linear-gradient(
+    135deg,
+    var(--imageweave-surface) 0 9px,
+    var(--imageweave-accent) 9px 11px
+  );
+}
+
+.policy-source-option:has(input:checked) > * {
+  background: var(--imageweave-surface);
+}
+
+.policy-source-option:has(input:focus-visible) {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 3px;
+}
+
+.policy-source-option[data-policy-state="error"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.policy-source-option > input {
+  grid-area: input;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--imageweave-accent);
+}
+
+.policy-source-option > .status-badge {
+  grid-area: badge;
+  justify-self: end;
+}
+
+.policy-source-mark {
+  display: grid;
+  grid-area: mark;
+  width: 44px;
+  min-height: 44px;
+  place-items: center;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.policy-source-copy {
+  display: grid;
+  grid-area: copy;
+  align-content: start;
+  min-width: 0;
+}
+
+.policy-source-copy strong,
+.policy-source-copy small {
+  overflow-wrap: anywhere;
+}
+
+.policy-source-copy small {
+  margin-top: 3px;
+  font-size: 0.7rem;
+}
+
+.policy-source-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+  padding: 13px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+}
+
+.policy-source-summary .empty-state {
+  grid-column: 1 / -1;
+}
+
+.policy-form {
+  display: grid;
+  gap: 15px;
+  min-width: 0;
+}
+
+.policy-fieldset {
+  display: grid;
+  gap: 11px;
+  padding-top: 14px;
+  border-top: 4px double var(--imageweave-accent);
+}
+
+.policy-fieldset:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.policy-fieldset > legend {
+  margin-bottom: 8px;
+  font-size: 1.08rem;
+}
+
+.policy-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.policy-field {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+  padding: 11px;
+  border: var(--imageweave-border-width) dotted var(--imageweave-accent);
+}
+
+.policy-field--wide {
+  grid-column: 1 / -1;
+}
+
+.policy-field > label,
+.policy-checkbox-field label {
+  font-weight: 900;
+}
+
+.policy-field input[type="number"],
+.policy-field input[type="url"],
+.policy-field select,
+.policy-field textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  font: inherit;
+}
+
+.policy-field textarea {
+  min-height: 112px;
+  resize: vertical;
+  tab-size: 2;
+}
+
+.policy-field input:focus-visible,
+.policy-field select:focus-visible,
+.policy-field textarea:focus-visible {
+  outline: var(--imageweave-focus-width) solid var(--imageweave-accent);
+  outline-offset: 2px;
+}
+
+.policy-field [aria-invalid="true"] {
+  border-style: double;
+  border-width: 4px;
+}
+
+.policy-checkbox-field label {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  min-height: 44px;
+}
+
+.policy-checkbox-field input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  accent-color: var(--imageweave-accent);
+}
+
+.policy-field-help {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.policy-preserved-field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px 12px;
+  align-items: center;
+  border-style: dashed;
+}
+
+.policy-preserved-field p {
+  flex: 1 1 420px;
+  margin: 0;
+}
+
+.policy-validation:not(:empty) {
+  margin: 0;
+  padding: 9px 11px;
+  border: 4px double var(--imageweave-accent);
+  font-weight: 800;
+}
+
+.policy-dirty-live {
+  border-style: solid;
+  font-weight: 850;
+}
+
+.policy-dirty-live[data-dirty="true"] {
+  border-style: dashed;
+  background: repeating-linear-gradient(
+    135deg,
+    var(--imageweave-surface) 0 8px,
+    var(--imageweave-accent) 8px 10px
+  );
+}
+
+.policy-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.policy-button {
+  min-height: 44px;
+  padding: 7px 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: 2px 2px 0 var(--imageweave-accent);
+  font-weight: 850;
+}
+
+.policy-button:hover:not(:disabled),
+.policy-button:focus-visible:not(:disabled),
+.policy-button--primary {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+}
+
+.policy-button--primary:hover:not(:disabled),
+.policy-button--primary:focus-visible:not(:disabled) {
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+}
+
+.policy-button--dangerous {
+  border-style: double;
+  border-width: 4px;
+}
+
+.policy-button[aria-busy="true"] {
+  border-style: dashed;
+  background-image: repeating-linear-gradient(
+    135deg,
+    transparent 0 6px,
+    currentColor 6px 8px
+  );
+}
+
+.policy-action-reasons {
+  margin: 0;
+  padding: 9px 9px 9px 32px;
+  border-left: 6px double var(--imageweave-accent);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 1007px) {
+  .policy-panel-heading {
+    display: grid;
+  }
+
+  .policy-panel-heading > .policy-button {
+    width: 100%;
+  }
+
+  .policy-source-options {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .policy-contract-list,
+  .policy-warning-host {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 767px) {
+  .policy-app {
+    gap: 13px;
+  }
+
+  .policy-panel {
+    padding: 12px;
+    box-shadow: 2px 2px 0 var(--imageweave-accent);
+  }
+
+  .policy-source-options,
+  .policy-field-grid,
+  .policy-source-summary,
+  .policy-contract-list > div,
+  .policy-definition-list > div {
+    grid-template-columns: 1fr;
+  }
+
+  .policy-source-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .policy-field--wide {
+    grid-column: auto;
+  }
+
+  .policy-form-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .policy-button {
+    width: 100%;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 380px) {
+  .policy-source-options {
+    grid-template-columns: 1fr;
+  }
+}

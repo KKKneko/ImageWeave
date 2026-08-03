@@ -5,6 +5,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from .proxy_source_store import (
+    MAX_INLINE_NODES,
+    MAX_INLINE_NODE_LENGTH,
+    MAX_INLINE_NODE_TOTAL_CHARS,
+    MAX_PROXY_SOURCE_PATH_LENGTH,
+    MAX_SUBSCRIPTION_URL_LENGTH,
+)
+
 
 ProxyMode = Literal["direct", "prefer", "required"]
 EHImageMode = Literal["original", "resample"]
@@ -313,6 +321,39 @@ class RetryRequest(BaseModel):
 class CrawlRerunRequest(BaseModel):
     additional_attempts: int = Field(default=1, ge=1, le=20)
     requeue_succeeded: bool = False
+
+
+class ProxySubscriptionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=MAX_SUBSCRIPTION_URL_LENGTH)
+
+
+class ProxyNodeFileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=MAX_PROXY_SOURCE_PATH_LENGTH)
+
+
+class ProxyInlineNodesCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[str] = Field(min_length=1, max_length=MAX_INLINE_NODES)
+
+    @field_validator("nodes")
+    @classmethod
+    def validate_node_lengths(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > MAX_INLINE_NODE_LENGTH for value in values):
+            raise ValueError("nodes 包含空节点或过长节点")
+        if sum(len(value) for value in values) > MAX_INLINE_NODE_TOTAL_CHARS:
+            raise ValueError("nodes 总长度超过上限")
+        return values
+
+
+class ProxyInlineNodeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node: str = Field(min_length=1, max_length=MAX_INLINE_NODE_LENGTH)
 
 
 class ProxyStartRequest(BaseModel):

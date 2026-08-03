@@ -1,0 +1,65 @@
+.imageweave-dialog {
+  width: min(520px, calc(100vw - 28px));
+  max-height: calc(100dvh - 28px);
+  padding: 0;
+  overflow: auto;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-radius: 0;
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  box-shadow: var(--imageweave-hard-shadow);
+}
+
+.imageweave-dialog::backdrop {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--imageweave-accent) 28%, transparent) 0 4px,
+    transparent 4px 8px
+  );
+}
+
+.imageweave-dialog__panel {
+  padding: clamp(18px, 4vw, 28px);
+}
+
+.imageweave-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.imageweave-dialog__actions button {
+  min-width: 96px;
+  min-height: 44px;
+  padding: 7px 12px;
+  border: var(--imageweave-border-width) solid var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  font-weight: 800;
+}
+
+.imageweave-dialog__actions .dialog-confirm,
+.imageweave-dialog__actions button:hover,
+.imageweave-dialog__actions button:focus-visible {
+  color: var(--imageweave-surface);
+  background: var(--imageweave-accent);
+}
+
+.imageweave-dialog--dangerous {
+  border-width: 4px;
+  border-style: double;
+}
+
+.dialog-confirmation-copy {
+  padding: 9px;
+  border: var(--imageweave-border-width) dashed var(--imageweave-accent);
+  font-weight: 700;
+}
+
+@media (max-width: 480px) {
+  .imageweave-dialog__actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+}

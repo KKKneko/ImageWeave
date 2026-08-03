@@ -16,6 +16,7 @@ from gdl_backend.auth import (
     ManagedBrowserHost,
     PixivOAuthSession,
     chrome_proxy_server,
+    vault_safe_statuses,
 )
 
 from tests.helpers import make_settings
@@ -51,6 +52,47 @@ class AuthManagerTests(unittest.TestCase):
         serialized = json.dumps(payload)
         self.assertNotIn("refresh_token", serialized)
         self.assertNotIn("cookies_file", serialized)
+
+    def test_vault_safe_projection_drops_authorization_url_and_raw_diagnostics(self):
+        secret = "VAULT_AUTH_SECRET_9ad31f"
+        payload = self.auth.statuses()
+        pixiv = next(item for item in payload["items"] if item["site"] == "pixiv")
+        pixiv.update(
+            {
+                "state": "authorizing",
+                "oauth": {
+                    "session_id": "f" * 32,
+                    "state": "awaiting_login",
+                    "created_at": 10,
+                    "expires_at": 610,
+                    "authorization_url": f"https://example.invalid/?state={secret}",
+                    "message": f"token={secret}",
+                    "error": f"/home/private/{secret}",
+                },
+            }
+        )
+        twitter = next(item for item in payload["items"] if item["site"] == "twitter")
+        twitter["invalid_reason"] = f"Cookie: {secret}"
+        payload["authorization_proxy"]["config_proxy_url"] = (
+            f"http://user:{secret}@127.0.0.1:7890"
+        )
+        projected = vault_safe_statuses(payload)
+        serialized = json.dumps(projected)
+        self.assertEqual(projected["response_profile"], "vault")
+        self.assertEqual(
+            next(item for item in projected["items"] if item["site"] == "pixiv")[
+                "oauth"
+            ]["session_id"],
+            "f" * 32,
+        )
+        for forbidden in (
+            secret,
+            "authorization_url",
+            "invalid_reason",
+            "config_proxy_url",
+            "/home/private",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def test_managed_cookie_file_is_automatically_resolved(self):
         path = self.auth.managed_dir / "twitter.cookies.txt"
@@ -259,6 +301,23 @@ class AuthManagerTests(unittest.TestCase):
         result = asyncio.run(self.auth.clear_browser_profile())
         self.assertFalse(profile_marker.exists())
         self.assertFalse(result["browser_profile"]["present"])
+
+    def test_clear_browser_profile_rejects_symlink_without_touching_target(self):
+        outside = Path(self.temp.name) / "outside-profile"
+        outside.mkdir()
+        marker = outside / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        try:
+            self.auth.browser_profile_dir.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"当前平台无法创建目录符号链接: {exc}")
+
+        with self.assertRaises(AuthError) as context:
+            asyncio.run(self.auth.clear_browser_profile())
+        self.assertEqual(context.exception.code, "invalid_browser_profile_path")
+        self.assertTrue(marker.is_file())
+        self.assertTrue(self.auth.browser_profile_dir.is_symlink())
+        self.assertFalse(self.auth._profile_resetting)
 
     def test_clear_browser_profile_keeps_exported_site_credentials(self):
         profile_marker = self.auth.browser_profile_dir / "profile-marker"

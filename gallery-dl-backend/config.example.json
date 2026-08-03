@@ -40,6 +40,9 @@
     "subscription_urls": [],
     "node_file": "",
     "inline_nodes": [],
+    "allowed_node_roots": [
+      "../subscriptions"
+    ],
     "allow_socks": true,
     "probe_url": "https://example.com/",
     "probe_timeout_seconds": 10,

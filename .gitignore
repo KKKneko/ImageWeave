@@ -63,6 +63,9 @@ Desktop.ini
 /.repowise/
 /gallery-dl-backend/test-dl/
 
+# Local visual reference project; never tracked, built, or packaged
+/blog/
+
 # gallery-dl backend machine-local configuration and run output
 /gallery-dl-backend/config.json
 /gallery-dl-backend/credentials/

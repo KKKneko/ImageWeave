@@ -1,0 +1,18 @@
+:root {
+  --imageweave-hue: 345;
+  --imageweave-accent: #a43d63;
+  --imageweave-accent: oklch(0.55 0.12 var(--imageweave-hue));
+  --imageweave-surface: #fff;
+  --imageweave-border-width: 2px;
+  --imageweave-hard-shadow: 5px 5px 0 var(--imageweave-accent);
+  --imageweave-small-shadow: 3px 3px 0 var(--imageweave-accent);
+  --imageweave-focus-width: 3px;
+  --imageweave-taskbar-height: 40px;
+  --imageweave-window-title-height: 40px;
+  --imageweave-control-size: 32px;
+  color-scheme: light;
+  color: var(--imageweave-accent);
+  background: var(--imageweave-surface);
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, "Microsoft YaHei UI", monospace;
+  font-synthesis: none;
+}

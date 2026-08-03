@@ -8,7 +8,8 @@
   EH 卡死检测心跳）由 `gdl_backend/worker_patches.py` 在 worker 进程内以运行时
   补丁实现，上游接口变化时补丁自动跳过并在任务日志输出 `[gdl-backend-patch]` 告警；
 - `gdl_backend/` 负责搜索、规划、调度、授权、代理池和状态持久化；
-- `/ui/` 提供随后端打包的静态操作界面，无需单独构建前端。
+- `/ui/` 提供随后端打包、已接入真实 API 的桌面化 WebUI，无需单独构建前端；旧单页资源和
+  临时 `/ui-next/` 挂载已在正式切换时删除。
 
 ## 运行要求
 
@@ -60,8 +61,10 @@ block 512 且不主动改变 Torch 线程；CPU 服务器应明确使用 `device
 
 完整字段以 [`config.example.json`](./config.example.json) 为准。示例中的项目抓取代理池和去重
 默认禁用，避免在没有节点源、根 venv 或模型时静默进入半可用状态；Linux 安装器会按所选设备
-准备模型并启用去重。直连抓取可以保持 `proxy.enabled=false`；需要抓取代理池时再显式启用并
-配置订阅、`proxy.node_file` 或 `inline_nodes`：
+准备模型并启用去重。直连抓取可以保持 `proxy.enabled=false`；需要抓取代理池时再显式启用。
+`config.json` 可提供启动基线；代理源管理 API 的修改会作为完整快照写入
+`runtime/proxy/managed-sources.json`，且保存不会自动重载代理池。节点文件写接口只接受
+`allowed_node_roots` 内的普通、非符号链接文件：
 
 ```json
 {
@@ -69,10 +72,67 @@ block 512 且不主动改变 Torch 线程；CPU 服务器应明确使用 `device
     "enabled": true,
     "auto_start": true,
     "subscription_urls": ["https://SUBSCRIPTION_URL"],
+    "allowed_node_roots": ["../subscriptions"],
     "transport_core_enabled": true
   }
 }
 ```
+
+可通过 `GET /api/v1/proxy/sources` 读取脱敏快照，并用其 `/subscriptions`、`/node-file`、
+`/inline-nodes` 子路由增删改；`DELETE /api/v1/proxy/sources/override` 恢复 `config.json`
+基线。桌面化入口 `/ui/#/proxy` 的 `PROXY.CPL` 已提供这些操作及运行池控制；保存与应用严格
+分离，修改后需显式执行“应用并重载”，活动租约存在时仍返回冲突。
+
+`/ui/` 的七个主应用已完成真实 API 接入：
+
+- `CRAWL.EXE`：autocomplete、聚合搜索、弱证据/EH 标签过滤、来源与地址排序，以及严格批次提交；
+- `TASKMGR.EXE`：最近/活动批次、图片任务、1.5 秒活动态轮询、批次取消、失败补齐和重新规划；
+- `PROXY.CPL`：运行池控制、脱敏代理源编辑，以及保存/显式重载分离；
+- `VAULT.CPL`：五个目标的安全状态、X/Pixiv/EH 共享浏览器授权、材料/Profile 清理和授权专用代理；
+- `REVIEW.EXE`：显式分析、服务端分页、逐页决定、离页前保存和危险应用确认；
+- `POLICY.CPL`：Danbooru、X、Pixiv、EH 与 Pawchive 的站点运行策略；
+- `DIAG.EXE`：20 秒只读轮询健康、就绪、最小配置能力和调度摘要，离线时保留安全旧快照。
+
+`GALLERY.EXE`、`SCHEDULE.EXE` 与 `EXPORT.EXE` 仍是明确的“功能开发中”边界入口，不发送业务
+API。`VAULT.CPL` 不提供后端不存在的手工 Cookie/Token、浏览器导入、文件路径导入或远端验证
+按钮；来源勾选/排序、每请求路由和 EH 标签 include/exclude 过滤只属于 `CRAWL.EXE`。
+
+### POLICY.CPL 契约与边界
+
+桌面 WebUI 只使用同一路由的 `?view=policy` 最小 profile；不传 query 时 legacy 响应与写入语义保持
+兼容。实际操作如下（PUT/DELETE 尝试无论成功或失败都会再 GET 权威快照；失败时 DOM 草稿恢复，
+若基线已被其他客户端改变则进入显式冲突态）：
+
+| 操作 | method 与 endpoint | 请求/响应 | 语义 |
+| --- | --- | --- | --- |
+| 读取 | `GET /api/v1/sites/policies?view=policy` | 五个受控来源、启动默认和站点覆盖的安全投影 | 激活、保存/reset 后及手动刷新读取；不轮询 |
+| 保存 | `PUT /api/v1/sites/policies/{site}?view=policy` | 完整 `SitePolicy` 白名单；返回单站安全投影 | SQLite 单行事务 upsert；随后 UI 再 GET 权威快照 |
+| 重置 | `DELETE /api/v1/sites/policies/{site}?view=policy` | 不带请求体；返回受控删除确认 | 删除该站点 override，重新继承进程启动默认 |
+
+`SitePolicy` 可编辑字段是 `max_concurrency`（1–128）、`retry_limit`（0–20）、
+`backoff_base_seconds`（0–3600）、`proxy_mode`（`direct|prefer|required`）、安全 HTTPS
+`probe_url`、`probe_before_use`、最多 32 个 `node_tags`、`http_timeout`（1–3600）、
+`gallery_retries`（0–50）、`task_timeout_seconds` 与 EH 专用
+`download_stall_timeout_seconds`（0–604800），以及最多 128 个受后端托管参数禁用表保护的
+`extra_args`。UI 每行输入一个标签/argv：纯空行过滤；标签 trim、转小写、稳定去重；argv 保留顺序
+与重复。`probe_url=null` 表示没有站点专用目标，空标签/argv 数组表示不增加约束；缺失字段不是
+PATCH，保存始终发送完整白名单。`SitePolicy.eh_download` 是已知后端字段，但旧 UI 将其作为每请求
+抓取选项，4B 只安全原样保留，不提供编辑器。
+
+启动默认是进程启动时“内置常量 + 所选 config 文件”的内存快照；外部修改 config 不会热重载。
+保存后，后续新搜索、新规划与新建任务会读取新策略；已创建（包括排队或运行）的任务保留创建时
+持久化的策略快照。SQLite 使用 `BEGIN IMMEDIATE` 单事务、私有数据库权限与 symlink 拒绝，失败
+回滚，不存在多文件部分写。后端没有 revision、ETag 或版本前置条件，多个客户端采用最后完成写入
+生效；前端 `lifecycle/write/read` 世代门只防止本页旧 GET 覆盖写后状态，不伪装跨客户端冲突保护。
+
+POLICY profile 不返回未知站点 ID 的配置，只给出计数；不返回绝对路径、URL 凭据/query/fragment、
+疑似秘密赋值、Cookie、Token、代理凭据或完整 config。写入另有 16 KiB UTF-8 JSON 请求边界及
+字段/数量/长度校验；前端按最终序列化字节数预检，后端同时核对声明值与实际 body。前端
+`policy-model.js` 再次白名单投影后才通过 `policy/configReceived` 进入独立 Store slice；
+未保存草稿只在当前 DOM/控制器中，放弃、reset、刷新覆盖、最小化、关闭、路由切换和销毁都会清除，
+不会进入 Storage、URL、通知历史或 diagnostics。来源“后端支持”、每请求“选择/启用”、VAULT 的
+“本地授权材料”与“当前远端可用”分别展示；POLICY 不读取 Auth Store、不发起登录、探活、抓取或
+代理重载。
 
 `HTTP_PROXY`/`HTTPS_PROXY` 和 setup 的 `--proxy` 只服务于 git/pip/Mihomo/模型下载，不会写入
 config，也不会被 doctor 当作抓取代理池节点。Mihomo 是抓取池中 VLESS/VMess/Trojan 等隧道
@@ -151,6 +211,25 @@ Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件
 
 界面直接调用下述 API；搜索归并、执行顺序、代理租约和任务状态均以后端数据库为准。
 
+### 桌面 WebUI 状态、轮询与安全边界
+
+所有业务请求只经同源 `js/core/api.js` 和应用 `context.api` 发出；应用模块不直接调用
+`fetch`/XHR。后端响应必须先经过对应 model 白名单投影，再通过受控 action 进入中央 Store。
+爬取提交所需的原始地址只在 CRAWL 控制器内短暂保留，批次/任务/review 响应中的 URL、绝对路径、
+原始错误和内部载荷不会进入 Store 或 DOM。Storage 只保存当前应用 ID、活动批次 UUID、窗口最大化
+布尔值和受控 UI 偏好，不保存凭据、代理源、搜索词、审核选择或响应快照。
+
+`TASKMGR.EXE` 仅对活动批次执行一个 1.5 秒、生命周期受控且不重叠的轮询，终态、404、最小化、
+关闭或切出应用即停止；写操作加锁并在完成后读取权威快照。`REVIEW.EXE` 只在分析处理中轮询，翻页、
+切换批次或离开应用前先保存当前脏页，保存失败则阻止切换。`DIAG.EXE` 使用一个 20 秒只读轮询；
+`GET /api/v1/config?view=diagnostics` 与 `GET /api/v1/scheduler/status?view=diagnostics` 只返回受控
+布尔值、计数和枚举，不返回主机路径、秘密、配置正文、任务标识或原始异常。默认不带 `view` 的
+legacy API 契约保持兼容。
+
+异常界面只显示受控错误码与恢复动作，不渲染后端 `details`。控制台只允许固定文本的壳层故障提示，
+不记录用户输入、请求/响应、凭据、路径或异常对象。桌面 WebUI 不需要 Node/npm、打包器、跨域服务或
+独立前端进程，其模块、样式与资源均随后端 wheel 同源提供。
+
 ## 托管授权
 
 | 站点 | 授权方式 | 托管结果 |
@@ -169,6 +248,17 @@ X、Pixiv 和 EH 共用项目目录中的持久 Chrome Profile，但每次授权
 清理浏览器状态，但不会自动删除已经导出的站点凭证。权限、缓存交换和失效恢复细节见
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#进程边界)。
 
+`VAULT.CPL` 使用相同路由的 `?view=vault` 响应 profile。默认 `legacy` 响应保持兼容；`vault`
+投影只保留受控站点/会话 ID、布尔能力、计数与时间，移除 Pixiv 完整授权 URL、原始会话错误、
+失效原因、绝对路径及非必要代理字段；VAULT 操作失败也只返回白名单错误码和受控消息，不透传
+`AuthError.message/details`。前端再经 `js/core/vault-model.js` 二次白名单投影后才进入中央
+Store；会话 ID 只短暂保存在应用控制器中，不进入 Store、DOM 或 Storage。
+
+授权代理是唯一由 VAULT 表单提交的敏感自由文本：输入使用默认隐藏控件，构造 JSON 后、发请求
+前即清空，成功、失败、确认取消、最小化、关闭、路由切换和销毁都会再次清空。代理写接口限制
+字段长度和 `Content-Length`，Pydantic 错误不含原始 `input`。普通状态只在激活、写后和手动刷新
+时读取；仅活动授权会话使用一个 `vault.authorization`、800ms、隐藏暂停的非关键轮询器。
+
 ## API 概览
 
 请求和响应模型以运行中的 [Swagger](http://127.0.0.1:8787/docs) 为准。主要端点：
@@ -181,14 +271,24 @@ POST /api/v1/proxy/probe
 POST /api/v1/proxy/stop
 
 GET    /api/v1/auth
+GET    /api/v1/auth/proxy
+PUT    /api/v1/auth/proxy
+DELETE /api/v1/auth/proxy
 GET    /api/v1/auth/{site}
 POST   /api/v1/auth/{site}/login/start
 GET    /api/v1/auth/{site}/login/{session_id}
 DELETE /api/v1/auth/{site}/login/{session_id}
+POST   /api/v1/auth/pixiv/oauth/start
+DELETE /api/v1/auth/pixiv/oauth/session
+DELETE /api/v1/auth/browser-profile
 DELETE /api/v1/auth/{site}
 
 GET  /api/v1/search/sites
+GET  /api/v1/search/autocomplete
 POST /api/v1/search
+
+GET  /api/v1/config?view=diagnostics
+GET  /api/v1/scheduler/status?view=diagnostics
 
 POST /api/v1/crawls
 GET  /api/v1/crawls
@@ -196,6 +296,7 @@ GET  /api/v1/crawls/{batch_id}
 GET  /api/v1/crawls/{batch_id}/tasks
 POST /api/v1/crawls/{batch_id}/cancel
 POST /api/v1/crawls/{batch_id}/retry
+POST /api/v1/crawls/{batch_id}/rerun
 GET  /api/v1/crawls/{batch_id}/review
 POST /api/v1/crawls/{batch_id}/review/start
 PUT  /api/v1/crawls/{batch_id}/review/decisions
@@ -212,10 +313,14 @@ GET  /api/v1/tasks/{id}/logs
 GET  /api/v1/tasks/{id}/events
 GET  /api/v1/tasks/{id}/files
 
-PUT /api/v1/sites/policies/{site}
+GET    /api/v1/sites/policies
+GET    /api/v1/sites/policies/{site}
+PUT    /api/v1/sites/policies/{site}
+DELETE /api/v1/sites/policies/{site}
 ```
 
-Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swagger 或 WebUI 调用。
+授权读取与操作端点均接受可选 `view=vault`，供桌面 WebUI 取得不含完整 OAuth URL 和原始诊断文本
+的最小响应；不传该参数时保持旧响应兼容。Pixiv OAuth 和共享 Profile 清理使用上表专用端点。
 
 ### 搜索
 

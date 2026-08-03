@@ -21,6 +21,12 @@ def _reject_symlink(path: Path) -> None:
             raise ValueError(f"应用管理路径不能包含符号链接: {candidate}")
 
 
+def reject_symlink_path(path: Path) -> None:
+    """公开的 no-follow 前置检查，供其他私有文件组件复用。"""
+
+    _reject_symlink(Path(path))
+
+
 def _apply_windows_acl(path: Path) -> None:
     username = os.environ.get("USERNAME") or getpass.getuser()
     domain = os.environ.get("USERDOMAIN")

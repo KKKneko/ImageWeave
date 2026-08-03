@@ -10,9 +10,10 @@ python -m gdl_backend.worker_entry --marker TASK_TOKEN --gallery-root PATH -- GA
 
 `worker_entry` 从指定源码目录导入 gallery-dl。命令行 marker 用于后端重启时核验 PID，降低 PID 复用导致误终止其他进程的风险。
 
-FastAPI 同源挂载 `/ui/` 下的纯 HTML/CSS/JavaScript 测试台。界面直接调用现有
-`/api/v1/search`、`/api/v1/crawls` 与代理池接口，只负责候选选择、顺序调整和状态
-展示；搜索归并、顺序约束、代理租约及任务状态仍以后端数据库为准。
+FastAPI 在 `/ui/` 同源挂载无需构建的桌面 WebUI（纯 HTML/CSS/JavaScript）；旧单页资源和临时
+`/ui-next/` 挂载已在正式切换时删除。WebUI 应用只经中央 API 客户端调用现有搜索、批次、任务、代理、授权、
+审核、策略与诊断接口，响应先经白名单投影再进入 Store；搜索归并、顺序约束、代理租约及任务状态
+仍以后端数据库为准。
 
 代理池控制面运行在 FastAPI 主进程内：`proxy_sources` 先完成全部机场订阅、节点文件和内联节点的解析，再由 `NativeProxyPool` 管理轮换、原子租约和冷却。导入及探活没有节点数量上限。带认证的 HTTP 上游在租约期间由 `LocalHTTPForwarder` 暴露为随机本地端口，任务结束时同步关闭。普通 HTTP/SOCKS 代理直接交给 gallery-dl。
 

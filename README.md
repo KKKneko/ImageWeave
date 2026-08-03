@@ -176,13 +176,17 @@ if (-not (Test-Path .\gallery-dl-backend\config.json)) {
 | 完整就绪检查 | <http://127.0.0.1:8787/readyz> |
 
 `/healthz` 只检查进程和 SQLite；`/readyz` 还会检查 gallery-dl、代理池、Mihomo、去重 Python、
-PyTorch 与模型缓存。
+PyTorch 与模型缓存。`/ui/` 直接提供已完成七个主应用真实 API 接入的桌面化 WebUI；旧单页
+实现和临时 `/ui-next/` 入口已经移除。
 
 ## 配置抓取代理池
 
-WebUI 可以启动、重载和探活代理池，但订阅源需要写入
-`gallery-dl-backend/config.json`。远程订阅使用 `subscription_urls`；本地 Clash 文件建议放入
-仓库根目录已忽略的 `subscriptions/`，再通过 `node_file` 引用：
+桌面化入口 `/ui/` 提供 CRAWL.EXE、TASKMGR.EXE、PROXY.CPL、VAULT.CPL、
+REVIEW.EXE、POLICY.CPL 与只读 DIAG.EXE。`PROXY.CPL` 接入代理池
+运行控制与脱敏代理源管理，通过 `/api/v1/proxy/sources` 把订阅、本地节点文件和内联节点保存为
+私有运行时覆盖；`gallery-dl-backend/config.json` 仍是代理源启动基线。本地 Clash 文件建议放入
+仓库根目录已忽略的 `subscriptions/`，并通过
+`allowed_node_roots` 限制 API 可选范围：
 
 ```json
 {
@@ -192,12 +196,14 @@ WebUI 可以启动、重载和探活代理池，但订阅源需要写入
     "subscription_urls": [],
     "node_file": "../subscriptions/provider.yaml",
     "inline_nodes": [],
+    "allowed_node_roots": ["../subscriptions"],
     "transport_core_enabled": true
   }
 }
 ```
 
-修改节点源后重启后端；同一路径文件内容更新后可在 WebUI 点击“重载节点”。订阅 URL、节点文件、
+API 保存只修改 `runtime/proxy/managed-sources.json`，不会停止代理池或活动租约；需显式调用
+`POST /api/v1/proxy/reload` 才会应用，存在租约时仍返回冲突。订阅 URL、节点文件、
 `config.json`、凭据、runtime、模型和 venv 均属于本地隐私或运行数据，不应提交到 Git。
 
 以下三类代理互相独立：
@@ -236,6 +242,7 @@ Windows：
 ## 文档
 
 - [后端配置、API 与工作流](./gallery-dl-backend/README.md)
+- [WebUI 桌面化重写开发方案](./gallery-dl-backend/docs/WEBUI_REWRITE.md)
 - [架构与状态机](./gallery-dl-backend/docs/ARCHITECTURE.md)
 - [Mihomo 安装说明](./gallery-dl-backend/docs/MIHOMO.md)
 - [部署修复记录](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)
