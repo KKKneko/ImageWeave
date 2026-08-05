@@ -3,6 +3,9 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from gdl_backend.config import AppSettings
 
 
@@ -29,3 +32,10 @@ def make_settings(root: Path) -> AppSettings:
     settings.ensure_directories()
     (root / "credentials").mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def local_test_client(app: FastAPI, settings: AppSettings) -> TestClient:
+    return TestClient(
+        app,
+        base_url=f"http://127.0.0.1:{settings.server.port}",
+    )

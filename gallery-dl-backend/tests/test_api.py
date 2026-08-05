@@ -7,14 +7,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi.testclient import TestClient
-
 from gdl_backend.app import ServiceContainer, _validate_network_target, create_app
 from gdl_backend.auth import AuthError, AuthManager
 from gdl_backend.crawl import CrawlUnit
 from gdl_backend.discovery import DiscoveryError
 
-from tests.helpers import make_settings
+from tests.helpers import local_test_client, make_settings
 
 
 class _TagCollector(HTMLParser):
@@ -107,7 +105,7 @@ class ApiTests(unittest.TestCase):
         self.settings = make_settings(Path(self.temp.name))
         self.container = ServiceContainer(self.settings)
         self.app = create_app(self.settings, container=self.container, start_background=False)
-        self.client_context = TestClient(self.app)
+        self.client_context = local_test_client(self.app, self.settings)
         self.client = self.client_context.__enter__()
         self.headers = {}
 

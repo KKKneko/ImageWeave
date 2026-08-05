@@ -448,16 +448,16 @@ BaseHTTPMiddleware 里抛出的异常不会进入 `@app.exception_handler(ApiErr
 
 ### 验收标准
 
-- [ ] C1 守卫覆盖全部路径，无任何路径白名单。
-- [ ] C2 守卫处于中间件栈最外层（在 `request_id_middleware` 之后注册）。
-- [ ] C3 允许集从 `settings.server.port` 推导，未新增配置项。
-- [ ] C4 Host 匹配大小写不敏感、容忍末尾点、缺失即拒。
-- [ ] C5 `Sec-Fetch-Site` 为 `cross-site`/`same-site` 拒绝，其余（含缺失）放行。
-- [ ] C6 拒绝响应为 403 + 标准 error 包络，带 `X-Request-ID`，不回显 Host。
-- [ ] C7 上列 9 处 `TestClient` 全部改为回环 `base_url`，`helpers.py` 提供统一工厂。
-- [ ] C8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] C1 守卫覆盖全部路径，无任何路径白名单。
+- [x] C2 守卫处于中间件栈最外层（在 `request_id_middleware` 之后注册）。
+- [x] C3 允许集从 `settings.server.port` 推导，未新增配置项。
+- [x] C4 Host 匹配大小写不敏感、容忍末尾点、缺失即拒。
+- [x] C5 `Sec-Fetch-Site` 为 `cross-site`/`same-site` 拒绝，其余（含缺失）放行。
+- [x] C6 拒绝响应为 403 + 标准 error 包络，带 `X-Request-ID`，不回显 Host。
+- [x] C7 上列 9 处 `TestClient` 全部改为回环 `base_url`，`helpers.py` 提供统一工厂。
+- [x] C8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
-- [ ] C9 `README.md` 的「本地网络与安全边界」小节补一条：仅接受回环 Host，
+- [x] C9 `README.md` 的「本地网络与安全边界」小节补一条：仅接受回环 Host，
       反向代理/自定义域名访问不受支持（SSH 本地端口转发仍可用）。
 
 ---

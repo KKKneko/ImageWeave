@@ -5,13 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from gdl_backend.app import ServiceContainer, create_app
 from gdl_backend.config import DedupSettings
 from gdl_backend.database import Database
 from gdl_backend.review import DedupReviewManager
-from tests.helpers import make_settings
+from tests.helpers import local_test_client, make_settings
 
 
 def create_terminal_batch(
@@ -258,8 +256,9 @@ class ReviewApiTests(unittest.TestCase):
         self.container.db.replace_crawl_review_manifest(
             "batch-api-review", review_manifest(output)
         )
-        self.client_context = TestClient(
-            create_app(self.settings, container=self.container, start_background=False)
+        self.client_context = local_test_client(
+            create_app(self.settings, container=self.container, start_background=False),
+            self.settings,
         )
         self.client = self.client_context.__enter__()
 
@@ -319,8 +318,9 @@ class ReviewRegistrationApiTests(unittest.TestCase):
             create_terminal_batch(container.db, root, "batch-history-enabled")
             self.assertIsNone(container.db.get_crawl_review("batch-history-enabled"))
 
-            with TestClient(
-                create_app(settings, container=container, start_background=False)
+            with local_test_client(
+                create_app(settings, container=container, start_background=False),
+                settings,
             ) as client:
                 response = client.get("/api/v1/crawls/batch-history-enabled")
                 self.assertEqual(response.status_code, 200, response.text)
@@ -350,8 +350,9 @@ class ReviewRegistrationApiTests(unittest.TestCase):
             container = ServiceContainer(settings)
             create_terminal_batch(container.db, root, "batch-history-disabled")
 
-            with TestClient(
-                create_app(settings, container=container, start_background=False)
+            with local_test_client(
+                create_app(settings, container=container, start_background=False),
+                settings,
             ) as client:
                 detail = client.get("/api/v1/crawls/batch-history-disabled")
                 self.assertEqual(detail.status_code, 200, detail.text)

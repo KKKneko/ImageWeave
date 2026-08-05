@@ -9,11 +9,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from gdl_backend.app import ServiceContainer, create_app
 
-from tests.helpers import make_settings
+from tests.helpers import local_test_client, make_settings
 
 
 class LocalGalleryIntegrationTests(unittest.TestCase):
@@ -39,7 +37,7 @@ class LocalGalleryIntegrationTests(unittest.TestCase):
                 settings = make_settings(root)
                 container = ServiceContainer(settings)
                 app = create_app(settings, container=container, start_background=True)
-                with TestClient(app) as client:
+                with local_test_client(app, settings) as client:
                     response = client.post(
                         "/api/v1/tasks",
                         json={
@@ -142,7 +140,7 @@ class LocalGalleryIntegrationTests(unittest.TestCase):
 
                 container.proxy._probe_endpoint = successful_probe
                 app = create_app(settings, container=container, start_background=True)
-                with TestClient(app) as client:
+                with local_test_client(app, settings) as client:
                     response = client.post(
                         "/api/v1/tasks",
                         json={

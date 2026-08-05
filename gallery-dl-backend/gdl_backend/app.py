@@ -382,6 +382,17 @@ def create_app(
 ) -> FastAPI:
     settings = settings or AppSettings.load()
     settings.validate()
+    port = settings.server.port
+    allowed_hosts = frozenset(
+        {
+            f"127.0.0.1:{port}",
+            f"localhost:{port}",
+            f"[::1]:{port}",
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+        }
+    )
     service = container or ServiceContainer(settings)
 
     @asynccontextmanager
@@ -418,6 +429,40 @@ def create_app(
         request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         request.state.request_id = request_id
         response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @app.middleware("http")
+    async def local_origin_guard(request: Request, call_next):
+        host = request.headers.get("host", "").strip().lower()
+        hostname, separator, port_suffix = host.rpartition(":")
+        if separator and hostname.endswith("."):
+            host = f"{hostname[:-1]}:{port_suffix}"
+        elif host.endswith("."):
+            host = host[:-1]
+
+        fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+        if host not in allowed_hosts:
+            error_code = "forbidden_host"
+            error_message = "仅允许从本机回环地址访问"
+        elif fetch_site in {"cross-site", "same-site"}:
+            error_code = "forbidden_cross_site"
+            error_message = "仅允许同源访问"
+        else:
+            return await call_next(request)
+
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        response = JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": error_code,
+                    "message": error_message,
+                    "details": None,
+                    "request_id": request_id,
+                }
+            },
+        )
         response.headers["X-Request-ID"] = request_id
         return response
 

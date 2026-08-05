@@ -9,8 +9,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-
 from gdl_backend.app import ServiceContainer, create_app
 from gdl_backend.proxy import ProxyPoolAdapter, ProxyPoolConflict
 from gdl_backend.proxy_source_store import (
@@ -26,7 +24,7 @@ from gdl_backend.proxy_source_store import (
     ProxySourceValidationError,
 )
 
-from tests.helpers import make_settings
+from tests.helpers import local_test_client, make_settings
 
 
 TEST_SUBSCRIPTION = "https://fixture.invalid/private/subscription?ticket=fixture-value"
@@ -396,8 +394,9 @@ class ProxySourceApiTests(unittest.TestCase):
         self.allowed_root.mkdir()
         self.settings.proxy.allowed_node_roots = [self.allowed_root]
         self.container = ServiceContainer(self.settings)
-        self.client_context = TestClient(
-            create_app(self.settings, container=self.container, start_background=False)
+        self.client_context = local_test_client(
+            create_app(self.settings, container=self.container, start_background=False),
+            self.settings,
         )
         self.client = self.client_context.__enter__()
 
@@ -600,8 +599,9 @@ class ProxySourceApiTests(unittest.TestCase):
         # ServiceContainer 已冻结启动基线，所以先重建容器以模拟服务重启。
         self.client_context.__exit__(None, None, None)
         self.container = ServiceContainer(self.settings)
-        self.client_context = TestClient(
-            create_app(self.settings, container=self.container, start_background=False)
+        self.client_context = local_test_client(
+            create_app(self.settings, container=self.container, start_background=False),
+            self.settings,
         )
         self.client = self.client_context.__enter__()
         self.container.proxy_sources.path.write_text("not-json", encoding="utf-8")
@@ -754,8 +754,9 @@ class ProxySourceRevisionAndLeaseTests(unittest.TestCase):
     def test_api_save_does_not_touch_lease_and_api_reload_still_conflicts(self):
         container = ServiceContainer(self.settings)
         container.proxy.probe = lambda **_: _mark_all_records_healthy(container.proxy)
-        context = TestClient(
-            create_app(self.settings, container=container, start_background=False)
+        context = local_test_client(
+            create_app(self.settings, container=container, start_background=False),
+            self.settings,
         )
         with context as client:
             container.proxy.start()

@@ -78,7 +78,7 @@ class DiagnosticsCacheTests(unittest.TestCase):
         try:
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://testserver",
+                base_url=f"http://127.0.0.1:{self.settings.server.port}",
             ) as client:
                 with patch.object(
                     diagnostics,
