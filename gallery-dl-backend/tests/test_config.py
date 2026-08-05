@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 from gdl_backend.config import AppSettings, normalize_authorization_proxy
@@ -31,6 +33,45 @@ class ConfigDefaultsTests(unittest.TestCase):
         settings = AppSettings()
         self.assertIsNone(settings.proxy.transport_core_binary)
         self.assertEqual(settings.proxy.transport_core_sha256, "")
+
+    def test_strict_target_dns_defaults_true_and_is_public(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = AppSettings.load(Path(temporary) / "missing-config.json")
+
+        self.assertIs(settings.server.strict_target_dns, True)
+        self.assertIs(
+            settings.public_dict()["server"]["strict_target_dns"],
+            True,
+        )
+
+    def test_strict_target_dns_is_loaded_and_warns_when_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config_path.write_text(
+                json.dumps({"server": {"strict_target_dns": False}}),
+                encoding="utf-8",
+            )
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                settings = AppSettings.load(config_path)
+
+        self.assertIs(settings.server.strict_target_dns, False)
+        self.assertIs(
+            settings.public_dict()["server"]["strict_target_dns"],
+            False,
+        )
+        self.assertIn("server.strict_target_dns=false", stderr.getvalue())
+        self.assertIn("已降级", stderr.getvalue())
+
+    def test_strict_target_dns_rejects_non_boolean_value(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config_path.write_text(
+                json.dumps({"server": {"strict_target_dns": "false"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "必须是布尔值"):
+                AppSettings.load(config_path)
 
     def test_explicit_transport_core_path_and_digest_are_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:

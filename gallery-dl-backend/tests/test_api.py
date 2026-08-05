@@ -28,6 +28,79 @@ class _TagCollector(HTMLParser):
         self.tags.append((tag, dict(attrs)))
 
 
+class NetworkTargetValidationTests(unittest.TestCase):
+    @staticmethod
+    def _dns_entry(address: str):
+        return (None, None, None, None, (address, 443))
+
+    def test_strict_rejects_mixed_global_and_loopback(self):
+        url = "https://example.com/gallery/123"
+        addresses = [
+            self._dns_entry("1.1.1.1"),
+            self._dns_entry("127.0.0.1"),
+        ]
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=addresses):
+            with self.assertRaisesRegex(
+                ValueError, r"IPv4: 127\.0\.0\.1"
+            ) as caught:
+                _validate_network_target(url, False)
+
+        self.assertNotIn(url, str(caught.exception))
+
+    def test_strict_rejects_mixed_global_and_private_v6(self):
+        url = "https://example.com/gallery/456"
+        addresses = [
+            self._dns_entry("1.1.1.1"),
+            self._dns_entry("fd00::1"),
+        ]
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=addresses):
+            with self.assertRaisesRegex(ValueError, r"IPv6: fd00::1") as caught:
+                _validate_network_target(url, False)
+
+        self.assertNotIn(url, str(caught.exception))
+
+    def test_strict_rejects_unparsable_entry(self):
+        url = "https://example.com/gallery/789"
+        addresses = [self._dns_entry("not-an-ip-address")]
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=addresses):
+            with self.assertRaisesRegex(ValueError, "无法识别") as caught:
+                _validate_network_target(url, False)
+
+        self.assertNotIn(url, str(caught.exception))
+
+    def test_strict_allows_all_global(self):
+        addresses = [
+            self._dns_entry("1.1.1.1"),
+            self._dns_entry("2001:4860:4860::8888"),
+        ]
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=addresses):
+            _validate_network_target("https://example.com/gallery", False)
+
+    def test_non_strict_restores_legacy_behaviour(self):
+        addresses = [
+            self._dns_entry("1.1.1.1"),
+            self._dns_entry("127.0.0.1"),
+        ]
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=addresses):
+            _validate_network_target(
+                "https://example.com/gallery",
+                False,
+                strict=False,
+            )
+
+    def test_allow_private_short_circuits(self):
+        getaddrinfo = Mock(side_effect=AssertionError("不应执行 DNS 解析"))
+        with patch("gdl_backend.app.socket.getaddrinfo", getaddrinfo):
+            _validate_network_target("http://127.0.0.1:8080/a", True)
+
+        getaddrinfo.assert_not_called()
+
+    def test_strict_rejects_empty_dns_result(self):
+        with patch("gdl_backend.app.socket.getaddrinfo", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "DNS 未返回任何地址"):
+                _validate_network_target("https://example.com/gallery", False)
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1285,7 +1358,8 @@ class ApiTests(unittest.TestCase):
             (None, None, None, None, ("1.1.1.1", 443)),
         ]
         with patch("gdl_backend.app.socket.getaddrinfo", return_value=mixed):
-            _validate_network_target("https://example.com/a", False)
+            with self.assertRaises(ValueError):
+                _validate_network_target("https://example.com/a", False)
 
     def test_known_site_must_match_extractor(self):
         response = self.client.post(

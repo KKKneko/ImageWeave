@@ -143,6 +143,7 @@ class ServerSettings:
     port: int = 8787
     cors_origins: list[str] = field(default_factory=list)
     allow_private_targets: bool = False
+    strict_target_dns: bool = True
 
 
 @dataclass(slots=True)
@@ -328,6 +329,7 @@ class AppSettings:
             port=int(os.environ.get("GDL_BACKEND_PORT", server_data.get("port", 8787))),
             cors_origins=[str(x) for x in server_data.get("cors_origins", [])],
             allow_private_targets=bool(server_data.get("allow_private_targets", False)),
+            strict_target_dns=server_data.get("strict_target_dns", True),
         )
         gallery = GallerySettings(
             repo_path=_path(gallery_data.get("repo_path"), base, WORKSPACE_DIR / "gallery-dl-codeberg"),
@@ -462,6 +464,14 @@ class AppSettings:
         )
         if not 1 <= int(self.server.port) <= 65535:
             raise ValueError("server.port 超出范围")
+        if not isinstance(self.server.strict_target_dns, bool):
+            raise ValueError("server.strict_target_dns 必须是布尔值")
+        if not self.server.strict_target_dns:
+            print(
+                "警告：server.strict_target_dns=false，目标 DNS 校验已降级；"
+                "仅应在确认合法站点被误拒时使用。",
+                file=sys.stderr,
+            )
         host = self.server.host.strip().lower()
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("本地服务仅允许监听回环地址")
@@ -631,6 +641,7 @@ class AppSettings:
                 "port": self.server.port,
                 "cors_origins": list(self.server.cors_origins),
                 "allow_private_targets": self.server.allow_private_targets,
+                "strict_target_dns": self.server.strict_target_dns,
             },
             "gallery": {
                 "repo_path": str(self.gallery.repo_path),

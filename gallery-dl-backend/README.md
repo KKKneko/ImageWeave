@@ -191,8 +191,15 @@ Mihomo、去重 Python、Torch 实际设备及 SSCD/DINOv2 缓存。禁用组件
 修复上述项目管理路径。`default_output_root` 位于 runtime 内时由应用维护；用户配置到外部的
 输出根目录不被 setup、应用或 doctor 递归 `chmod`，doctor 只诊断。
 
-服务只允许绑定回环地址。任务和探活目标默认拒绝回环、私网、链路本地及保留 IP；本地部署
-确需访问局域网图站时，在 `server` 配置中设置 `"allow_private_targets": true`。
+服务只允许绑定回环地址。任务和探活目标默认拒绝回环、私网、链路本地及保留 IP。
+`server` 区域的目标地址校验开关如下：
+
+| 配置字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `strict_target_dns` | `true` | 要求 DNS 返回的每个地址均为公网；仅在确认某个合法站点被误拒时才改为 `false`，退回“至少一个公网地址”的兼容模式。 |
+
+本地部署确需访问局域网图站时，在 `server` 配置中设置
+`"allow_private_targets": true`。
 
 ## Linux CPU CI 分层
 

@@ -338,14 +338,14 @@ CGNAT `100.64.0.0/10` 等）。为了让用户不改代码就能自救：
 
 ### 验收标准
 
-- [ ] B1 混合解析结果（公网 + 回环/私网）一律被拒绝。
-- [ ] B2 无法识别的解析条目不再被静默跳过。
-- [ ] B3 错误信息包含地址族与 IP，不包含完整目标 URL。
-- [ ] B4 `server.strict_target_dns` 默认 `true`，可从 config 读取，进入 `public_dict()`。
-- [ ] B5 `strict_target_dns=false` 时启动打印降级提示。
-- [ ] B6 `config.example.json` 与 `README.md` 都已补充说明。
-- [ ] B7 `allow_private_targets=True` 行为零变化。
-- [ ] B8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] B1 混合解析结果（公网 + 回环/私网）一律被拒绝。
+- [x] B2 无法识别的解析条目不再被静默跳过。
+- [x] B3 错误信息包含地址族与 IP，不包含完整目标 URL。
+- [x] B4 `server.strict_target_dns` 默认 `true`，可从 config 读取，进入 `public_dict()`。
+- [x] B5 `strict_target_dns=false` 时启动打印降级提示。
+- [x] B6 `config.example.json` 与 `README.md` 都已补充说明。
+- [x] B7 `allow_private_targets=True` 行为零变化。
+- [x] B8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
 
 ---

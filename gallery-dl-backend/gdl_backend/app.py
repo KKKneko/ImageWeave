@@ -326,7 +326,12 @@ def _task_files(task: dict[str, Any], limit: int = 2000) -> list[dict[str, Any]]
     return files
 
 
-def _validate_network_target(url: str, allow_private: bool) -> None:
+def _validate_network_target(
+    url: str,
+    allow_private: bool,
+    *,
+    strict: bool = True,
+) -> None:
     if allow_private:
         return
     text = url.strip()
@@ -344,15 +349,27 @@ def _validate_network_target(url: str, allow_private: bool) -> None:
         addresses = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise ValueError("目标主机 DNS 解析失败") from exc
+    resolved_count = 0
     has_global = False
     for entry in addresses:
         address = entry[4][0].split("%", 1)[0]
         try:
             ip = ipaddress.ip_address(address)
-        except ValueError:
+        except ValueError as exc:
+            if strict:
+                raise ValueError("目标主机解析出无法识别的地址") from exc
             continue
+        if strict and not ip.is_global:
+            raise ValueError(
+                f"目标 URL 解析到非公网地址（IPv{ip.version}: {ip}），已拒绝"
+            )
         if ip.is_global:
             has_global = True
+        resolved_count += 1
+    if strict:
+        if not resolved_count:
+            raise ValueError("目标主机 DNS 未返回任何地址")
+        return
     if not has_global:
         raise ValueError("目标 URL 指向本机或私有网络")
 
@@ -831,6 +848,7 @@ def create_app(
                     _validate_network_target,
                     body.url,
                     container.settings.server.allow_private_targets,
+                    strict=container.settings.server.strict_target_dns,
                 )
             site_info = await asyncio.to_thread(container.resolver.resolve, body.url)
             if body.site:
@@ -1050,6 +1068,7 @@ def create_app(
                     _validate_network_target,
                     search_url,
                     container.settings.server.allow_private_targets,
+                    strict=container.settings.server.strict_target_dns,
                 )
                 credentials_ref, cookies_value, config_value = _managed_request_credentials(
                     container,
@@ -1649,6 +1668,7 @@ def create_app(
                         _validate_network_target,
                         url,
                         container.settings.server.allow_private_targets,
+                        strict=container.settings.server.strict_target_dns,
                     )
                     site_info = await asyncio.to_thread(container.resolver.resolve, url)
                     if site_info.supported:
@@ -2404,6 +2424,7 @@ def create_app(
                     _validate_network_target,
                     target,
                     container.settings.server.allow_private_targets,
+                    strict=container.settings.server.strict_target_dns,
                 )
             except ValueError as exc:
                 raise ApiError(422, "invalid_probe_target", str(exc)) from exc
