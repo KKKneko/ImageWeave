@@ -218,6 +218,7 @@ class ProxySettings:
     probe_url: str = "https://example.com/"
     probe_timeout_seconds: float = 10.0
     probe_workers: int = 32
+    probe_cache_ttl_seconds: float = 600.0
     health_interval_seconds: float = 60.0
     fail_cooldown_seconds: float = 30.0
     subscription_timeout_seconds: float = 20.0
@@ -377,6 +378,9 @@ class AppSettings:
             probe_url=str(proxy_data.get("probe_url", "https://example.com/")),
             probe_timeout_seconds=float(proxy_data.get("probe_timeout_seconds", 10.0)),
             probe_workers=int(proxy_data.get("probe_workers", 32)),
+            probe_cache_ttl_seconds=float(
+                proxy_data.get("probe_cache_ttl_seconds", 600.0)
+            ),
             health_interval_seconds=float(proxy_data.get("health_interval_seconds", 60.0)),
             fail_cooldown_seconds=float(proxy_data.get("fail_cooldown_seconds", 30.0)),
             subscription_timeout_seconds=float(proxy_data.get("subscription_timeout_seconds", 20.0)),
@@ -494,6 +498,8 @@ class AppSettings:
             raise ValueError(f"auth.authorization_proxy 无效: {exc}") from exc
         if not 1 <= int(self.proxy.probe_workers) <= 64:
             raise ValueError("proxy.probe_workers 必须位于 1..64")
+        if not self.proxy.probe_cache_ttl_seconds >= 0:
+            raise ValueError("proxy.probe_cache_ttl_seconds 必须大于等于 0")
         if self.proxy.probe_timeout_seconds <= 0 or self.proxy.subscription_timeout_seconds <= 0:
             raise ValueError("代理超时必须大于 0")
         if self.proxy.health_interval_seconds <= 0:
@@ -670,6 +676,7 @@ class AppSettings:
                 "allow_socks": self.proxy.allow_socks,
                 "probe_url": self.proxy.probe_url,
                 "probe_timeout_seconds": self.proxy.probe_timeout_seconds,
+                "probe_cache_ttl_seconds": self.proxy.probe_cache_ttl_seconds,
                 "transport_core_enabled": self.proxy.transport_core_enabled,
                 "transport_core_binary": (
                     str(self.proxy.transport_core_binary) if self.proxy.transport_core_binary else None

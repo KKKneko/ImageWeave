@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import re
@@ -119,6 +120,9 @@ class ProxyPoolAdapter:
         self._node_meta: dict[str, dict[str, Any]] = {}
         self._leases: dict[str, ProxyLease] = {}
         self._pending_acquires: dict[str, threading.Event] = {}
+        self._probe_cache: dict[
+            tuple[str, str, int], tuple[float, dict[str, Any]]
+        ] = {}
         self._generation = 0
         self._running = False
         self._active_revision: str | None = None
@@ -144,6 +148,7 @@ class ProxyPoolAdapter:
 
     def _set_records(self, records: list[_NodeRecord]) -> None:
         with self._lock:
+            self._probe_cache.clear()
             self._records = records
             self._record_by_endpoint = {record.endpoint: record for record in records}
             self._record_by_id = {record.id: record for record in records}
@@ -177,6 +182,28 @@ class ProxyPoolAdapter:
         return sorted(tags)
 
     @staticmethod
+    def _probe_cache_key(url: str) -> tuple[str, str, int]:
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except (TypeError, ValueError) as exc:
+            raise ProxyPoolError("探活地址无法解析") from exc
+        scheme = (parsed.scheme or "").lower()
+        hostname = parsed.hostname
+        if not scheme or not hostname:
+            raise ProxyPoolError("探活地址必须包含协议和主机名")
+        if port is None:
+            if scheme == "https":
+                port = 443
+            elif scheme == "http":
+                port = 80
+            else:
+                raise ProxyPoolError("探活地址需要显式端口")
+        if not 1 <= port <= 65535:
+            raise ProxyPoolError("探活端口超出范围")
+        return scheme, hostname.lower(), port
+
+    @staticmethod
     def _probe_parts(url: str) -> tuple[str, int]:
         parsed = urlsplit(url)
         if parsed.scheme.lower() != "https" or not parsed.hostname:
@@ -196,6 +223,108 @@ class ProxyPoolAdapter:
             host = f"[{host}]"
         port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
         return f"https://{host}{port}{parsed.path or '/'}"
+
+    def _cached_probe_result(
+        self,
+        key: tuple[str, str, int],
+    ) -> dict[str, Any] | None:
+        ttl = float(self.settings.probe_cache_ttl_seconds)
+        if ttl <= 0:
+            return None
+        with self._lock:
+            cached = self._probe_cache.get(key)
+            if cached is None:
+                return None
+            timestamp, probe_result = cached
+            age = max(0.0, time.monotonic() - timestamp)
+            if age >= ttl:
+                self._probe_cache.pop(key, None)
+                return None
+            result = copy.deepcopy(probe_result)
+            result["cached"] = True
+            result["age_seconds"] = age
+            return result
+
+    def _store_probe_cache_result(
+        self,
+        target_url: str,
+        probe_result: dict[str, Any],
+    ) -> None:
+        ttl = float(self.settings.probe_cache_ttl_seconds)
+        key = self._probe_cache_key(target_url)
+        with self._lock:
+            if ttl <= 0:
+                self._probe_cache.clear()
+                return
+            stored = copy.deepcopy(probe_result)
+            stored["cached"] = False
+            stored.pop("age_seconds", None)
+            self._probe_cache[key] = (time.monotonic(), stored)
+
+    def _merge_single_probe_cache_result(
+        self,
+        target_url: str,
+        node_id: str,
+        node_result: dict[str, Any],
+    ) -> None:
+        """把单节点真探结果并入已有完整项；没有完整项时保持缓存失效。"""
+
+        ttl = float(self.settings.probe_cache_ttl_seconds)
+        key = self._probe_cache_key(target_url)
+        with self._lock:
+            if ttl <= 0:
+                self._probe_cache.clear()
+                return
+            cached = self._probe_cache.get(key)
+            if cached is None:
+                return
+            timestamp, probe_result = cached
+            merged = copy.deepcopy(probe_result)
+            results = merged.get("results")
+            if not isinstance(results, list):
+                self._probe_cache.pop(key, None)
+                return
+            matched = False
+            for index, item in enumerate(results):
+                if isinstance(item, dict) and str(item.get("id") or "") == node_id:
+                    results[index] = copy.deepcopy(node_result)
+                    matched = True
+            if not matched:
+                # 节点集合与缓存快照不一致时宁可重探，也不能制造不完整 allowlist。
+                self._probe_cache.pop(key, None)
+                return
+            merged["total"] = len(results)
+            merged["healthy"] = sum(
+                1 for item in results if isinstance(item, dict) and item.get("healthy")
+            )
+            if not merged["healthy"]:
+                self._probe_cache.pop(key, None)
+                return
+            merged["cached"] = False
+            merged.pop("age_seconds", None)
+            self._probe_cache[key] = (timestamp, merged)
+
+    def _mark_probe_cache_node_unhealthy_locked(self, node_id: str) -> None:
+        """在持有 ``_lock`` 时降级所有目标缓存中的指定节点。"""
+
+        for key, (timestamp, probe_result) in list(self._probe_cache.items()):
+            results = probe_result.get("results")
+            if not isinstance(results, list):
+                continue
+            matched = False
+            for item in results:
+                if isinstance(item, dict) and str(item.get("id") or "") == node_id:
+                    item["healthy"] = False
+                    matched = True
+            if not matched:
+                continue
+            probe_result["healthy"] = sum(
+                1 for item in results if isinstance(item, dict) and item.get("healthy")
+            )
+            if not probe_result["healthy"]:
+                self._probe_cache.pop(key, None)
+            else:
+                self._probe_cache[key] = (timestamp, probe_result)
 
     def _safe_warning(self, warning: object, snapshot: ProxySourceSnapshot) -> str:
         text = str(warning or "")
@@ -295,6 +424,8 @@ class ProxyPoolAdapter:
         _source_snapshot: ProxySourceSnapshot | None = None,
     ) -> dict[str, Any]:
         with self._lifecycle_lock:
+            with self._lock:
+                self._probe_cache.clear()
             if not self.settings.enabled:
                 raise ProxyPoolError("代理池配置为停用状态")
             source_snapshot = _source_snapshot or self._source_snapshot()
@@ -405,6 +536,8 @@ class ProxyPoolAdapter:
 
     def reload(self, *, force_refresh: bool = True, probe_url: str | None = None) -> dict[str, Any]:
         with self._lifecycle_lock:
+            with self._lock:
+                self._probe_cache.clear()
             source_snapshot = self._source_snapshot()
             with self._lock:
                 if self._leases or self._pending_acquires:
@@ -424,6 +557,7 @@ class ProxyPoolAdapter:
     ) -> dict[str, Any]:
         with self._lifecycle_lock:
             with self._lock:
+                self._probe_cache.clear()
                 active_task_ids = list(self._leases)
                 has_pending = bool(self._pending_acquires)
                 if (active_task_ids or has_pending) and not force:
@@ -495,6 +629,10 @@ class ProxyPoolAdapter:
             transport_core = self._transport_core
             core_start_error = self._core_start_error
             active_revision = self._active_revision
+            probe_cache = {
+                "entries": len(self._probe_cache),
+                "ttl_seconds": float(self.settings.probe_cache_ttl_seconds),
+            }
         core_status = (
             transport_core.status()
             if transport_core is not None
@@ -522,6 +660,7 @@ class ProxyPoolAdapter:
             "last_error": self._last_error,
             "transport_core": core_status,
             "sources": dict(self._source_summary),
+            "probe_cache": probe_cache,
             "nodes": nodes,
         }
 
@@ -574,6 +713,8 @@ class ProxyPoolAdapter:
                     success=healthy,
                     cooldown_seconds=self.settings.fail_cooldown_seconds,
                 )
+            if not healthy:
+                self._mark_probe_cache_node_unhealthy_locked(node_id)
         return {
             "id": node_id,
             "healthy": healthy,
@@ -617,15 +758,49 @@ class ProxyPoolAdapter:
                                     success=False,
                                     cooldown_seconds=self.settings.fail_cooldown_seconds,
                                 )
+                            self._mark_probe_cache_node_unhealthy_locked(record.id)
                         results.append({"id": record.id, "healthy": False, "error": error})
             healthy = sum(1 for item in results if item.get("healthy"))
-            self._last_error = "" if healthy else f"探活目标 {self._public_probe_target(target)} 无健康节点"
-            return {
+            with self._lock:
+                self._last_error = (
+                    ""
+                    if healthy
+                    else f"探活目标 {self._public_probe_target(target)} 无健康节点"
+                )
+            result = {
                 "total": len(results),
                 "healthy": healthy,
                 "results": results,
                 "target": self._public_probe_target(target),
+                "cached": False,
             }
+            if node_id is None:
+                self._store_probe_cache_result(target, result)
+            elif results:
+                # 单节点手动探活只能合并已有完整快照；不能覆盖成单节点 allowlist。
+                self._merge_single_probe_cache_result(target, node_id, results[0])
+            return result
+
+    def probe_for_target(self, target_url: str) -> dict[str, Any]:
+        """按目标主机复用全量探活结果，缓存 miss 时执行生命周期单飞。"""
+
+        self._probe_parts(target_url)
+        key = self._probe_cache_key(target_url)
+        cached = self._cached_probe_result(key)
+        if cached is not None:
+            return cached
+
+        # 首次查询不持有 _lock 再等待生命周期锁，保持统一的锁顺序；进入后
+        # 再查一次，避免排队期间另一调用已经完成同目标探活。
+        with self._lifecycle_lock:
+            cached = self._cached_probe_result(key)
+            if cached is not None:
+                return cached
+            result = dict(self.probe(target_url=target_url))
+            result["cached"] = False
+            result.pop("age_seconds", None)
+            self._store_probe_cache_result(target_url, result)
+            return copy.deepcopy(result)
 
     def acquire(
         self,
@@ -791,6 +966,8 @@ class ProxyPoolAdapter:
                     record.cooldown_until = time.time() + self.settings.fail_cooldown_seconds
                 else:
                     record.success_count += 1
+            if proxy_fault:
+                self._mark_probe_cache_node_unhealthy_locked(lease.node_id)
             pool = self._pool
         if forwarder is not None:
             forwarder.stop()

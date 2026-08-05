@@ -23,11 +23,50 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertTrue(settings.proxy.allow_socks)
         self.assertIsNone(settings.proxy.node_file)
         self.assertEqual(settings.proxy.probe_timeout_seconds, 10.0)
+        self.assertEqual(settings.proxy.probe_cache_ttl_seconds, 600.0)
+        self.assertEqual(
+            settings.public_dict()["proxy"]["probe_cache_ttl_seconds"],
+            600.0,
+        )
         self.assertFalse(hasattr(settings.proxy, "max_nodes"))
         self.assertNotIn("max_nodes", settings.public_dict()["proxy"])
 
         self.assertIsNone(settings.proxy.transport_core_binary)
         self.assertEqual(settings.proxy.transport_core_sha256, "")
+
+    def test_probe_cache_ttl_is_configurable_and_zero_is_preserved(self):
+        for value in (45.5, 0.0):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config_path = root / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "runtime_dir": "runtime",
+                            "database_path": "runtime/backend.sqlite3",
+                            "default_output_root": "runtime/downloads",
+                            "gallery": {
+                                "cache_file": "credentials/managed/cache.sqlite3"
+                            },
+                            "dedup": {"enabled": False},
+                            "proxy": {"probe_cache_ttl_seconds": value},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                settings = AppSettings.load(config_path)
+
+            self.assertEqual(settings.proxy.probe_cache_ttl_seconds, value)
+            self.assertEqual(
+                settings.public_dict()["proxy"]["probe_cache_ttl_seconds"],
+                value,
+            )
+
+    def test_negative_probe_cache_ttl_is_rejected(self):
+        settings = AppSettings()
+        settings.proxy.probe_cache_ttl_seconds = -0.01
+        with self.assertRaisesRegex(ValueError, "probe_cache_ttl_seconds"):
+            settings.validate()
 
     def test_transport_core_defaults_are_external_on_all_platforms(self):
         settings = AppSettings()

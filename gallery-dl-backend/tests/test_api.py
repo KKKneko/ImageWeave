@@ -126,6 +126,31 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(self.client.get("/api/v1/tasks").status_code, 200)
 
+    def test_manual_probe_endpoint_bypasses_cache(self):
+        expected = {
+            "total": 1,
+            "healthy": 1,
+            "results": [{"id": "node-a", "healthy": True}],
+            "cached": False,
+        }
+        real_probe = Mock(return_value=expected)
+        cached_probe = Mock(
+            return_value={**expected, "cached": True, "age_seconds": 1.0}
+        )
+        self.container.proxy.probe = real_probe
+        self.container.proxy.probe_for_target = cached_probe
+
+        response = self.client.post(
+            "/api/v1/proxy/probe",
+            headers=self.headers,
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), expected)
+        real_probe.assert_called_once_with(target_url=None, node_id=None)
+        cached_probe.assert_not_called()
+
     def test_diagnostics_profiles_are_minimal_and_legacy_compatible(self):
         legacy_config = self.client.get("/api/v1/config")
         self.assertEqual(legacy_config.status_code, 200, legacy_config.text)
@@ -2145,7 +2170,7 @@ class ApiTests(unittest.TestCase):
 
         events: list[tuple[str, str]] = []
 
-        def probe(*, target_url, **_kwargs):
+        def probe(target_url):
             events.append(("probe", target_url))
             return {
                 "total": 3,
@@ -2177,7 +2202,7 @@ class ApiTests(unittest.TestCase):
                 ]
             }
 
-        self.container.proxy.probe = Mock(side_effect=probe)
+        self.container.proxy.probe_for_target = Mock(side_effect=probe)
         self.container.discovery.discover_url = AsyncMock(side_effect=discover)
         response = self.client.post(
             "/api/v1/crawls",
@@ -2388,7 +2413,7 @@ class ApiTests(unittest.TestCase):
     def test_required_crawl_stops_before_planning_when_site_probe_has_no_nodes(self):
         import asyncio
 
-        self.container.proxy.probe = Mock(
+        self.container.proxy.probe_for_target = Mock(
             return_value={"total": 2, "healthy": 0, "results": []}
         )
         self.container.discovery.discover_url = AsyncMock()

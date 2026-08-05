@@ -311,7 +311,7 @@ class OrderedCrawlManager:
 
         target = self._probe_target(address, policy)
         try:
-            result = await asyncio.to_thread(self.proxy.probe, target_url=target)
+            result = await asyncio.to_thread(self.proxy.probe_for_target, target)
             healthy_node_ids = sorted(
                 {
                     str(item["id"])

@@ -48,6 +48,7 @@
     "probe_url": "https://example.com/",
     "probe_timeout_seconds": 10,
     "probe_workers": 32,
+    "probe_cache_ttl_seconds": 600.0,
     "health_interval_seconds": 60,
     "fail_cooldown_seconds": 30,
     "subscription_timeout_seconds": 20,

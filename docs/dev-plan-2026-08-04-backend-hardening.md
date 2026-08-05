@@ -839,16 +839,16 @@ with self._lifecycle_lock:
 
 ### 验收标准
 
-- [ ] G1 `proxy.probe_cache_ttl_seconds` 默认 600.0，可配置，`0` 禁用。
-- [ ] G2 缓存 key 为 `(scheme, host, port)`，不含 path。
-- [ ] G3 缓存命中路径**不取** `_lifecycle_lock`、**不发**网络请求。
-- [ ] G4 `start`/`reload`/`stop`/`_set_records` 均清空缓存。
-- [ ] G5 `proxy_fault` 释放与单节点探活失败均会降级缓存中的对应节点。
-- [ ] G6 缓存项健康数降至 0 时被删除。
-- [ ] G7 `POST /api/v1/proxy/probe` 仍强制真探。
-- [ ] G8 `status()["probe_cache"]` 不泄露主机名。
-- [ ] G9 `ordered_crawl._probe_address_policy` 已切换到 `probe_for_target`。
-- [ ] G10 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] G1 `proxy.probe_cache_ttl_seconds` 默认 600.0，可配置，`0` 禁用。
+- [x] G2 缓存 key 为 `(scheme, host, port)`，不含 path。
+- [x] G3 缓存命中路径**不取** `_lifecycle_lock`、**不发**网络请求。
+- [x] G4 `start`/`reload`/`stop`/`_set_records` 均清空缓存。
+- [x] G5 `proxy_fault` 释放与单节点探活失败均会降级缓存中的对应节点。
+- [x] G6 缓存项健康数降至 0 时被删除。
+- [x] G7 `POST /api/v1/proxy/probe` 仍强制真探。
+- [x] G8 `status()["probe_cache"]` 不泄露主机名。
+- [x] G9 `ordered_crawl._probe_address_policy` 已切换到 `probe_for_target`。
+- [x] G10 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
 
 ---
