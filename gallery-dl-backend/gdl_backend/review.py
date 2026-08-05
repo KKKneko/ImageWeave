@@ -120,7 +120,8 @@ class DedupReviewManager:
                 manifest, log_path = await self._run_worker(claimed)
             await asyncio.to_thread(self._validate_manifest, claimed, manifest)
             self.db.replace_crawl_review_manifest(batch_id, manifest, log_path=log_path)
-            if self.db.get_crawl_review(batch_id)["status"] == "auto_applying":
+            review = self.db.get_crawl_review(batch_id)
+            if review is not None and review["status"] == "auto_applying":
                 await asyncio.to_thread(self._apply_automatic_rejections, claimed)
         except asyncio.CancelledError:
             await self._terminate_process()
@@ -231,10 +232,14 @@ class DedupReviewManager:
     @staticmethod
     def _log_tail(path: Path, limit: int = 4000) -> str:
         try:
-            data = path.read_bytes()
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - limit))
+                data = handle.read(limit)
         except OSError:
             return ""
-        return data[-limit:].decode("utf-8", "replace").strip()
+        return data.decode("utf-8", "replace").strip()
 
     @staticmethod
     def _validate_manifest(claimed: dict[str, Any], manifest: dict[str, Any]) -> None:

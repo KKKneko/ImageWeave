@@ -17,6 +17,9 @@ from .redaction import redact_text
 from .schemas import TaskPolicy
 
 
+_DISPATCH_REFILL_ROUNDS = 2
+
+
 class TaskScheduler:
     def __init__(
         self,
@@ -36,6 +39,7 @@ class TaskScheduler:
         self.auth_failure_callback = auth_failure_callback
         self._loop_task: asyncio.Task | None = None
         self._active: dict[str, tuple[asyncio.Task, str]] = {}
+        self._credential_blocked: set[str] = set()
         self._wake = asyncio.Event()
         self._stopping = False
 
@@ -94,28 +98,63 @@ class TaskScheduler:
             try:
                 self._wake.clear()
                 self._reap_finished()
+                if self._credential_blocked:
+                    blocked_snapshot = set(self._credential_blocked)
+                    queued_blocked = await asyncio.to_thread(
+                        self.db.queued_task_ids,
+                        blocked_snapshot,
+                    )
+                    self._credential_blocked.intersection_update(queued_blocked)
                 capacity = self.settings.max_concurrent_tasks - len(self._active)
                 if capacity > 0:
                     active_sites = Counter(site for _, site in self._active.values())
-                    for task in self.db.queued_tasks(limit=200):
-                        if capacity <= 0:
+                    saturated_sites: set[str] = set()
+                    for _dispatch_round in range(_DISPATCH_REFILL_ROUNDS + 1):
+                        queued = self.db.queued_tasks(
+                            limit=200,
+                            exclude_sites=saturated_sites or None,
+                        )
+                        if not queued:
                             break
-                        policy = self._policy(task)
-                        site = task["site"]
-                        if self.credential_validator and not self.credential_validator(
-                            site,
-                            task.get("cookies_file"),
-                        ):
-                            continue
-                        if active_sites[site] >= policy.max_concurrency:
-                            continue
-                        if not self.db.claim_task(task["id"]):
-                            continue
-                        worker = asyncio.create_task(self._execute(task["id"]), name=f"gallery-task-{task['id']}")
-                        self._active[task["id"]] = (worker, site)
-                        active_sites[site] += 1
-                        capacity -= 1
-                        worker.add_done_callback(lambda _done, task_id=task["id"]: self._worker_done(task_id))
+                        hit_site_limit = False
+                        for task in queued:
+                            if capacity <= 0:
+                                break
+                            task_id = task["id"]
+                            policy = self._policy(task)
+                            site = task["site"]
+                            if self.credential_validator and not self.credential_validator(
+                                site,
+                                task.get("cookies_file"),
+                            ):
+                                if task_id not in self._credential_blocked:
+                                    recorded = await asyncio.to_thread(
+                                        self.db.mark_task_credentials_unavailable,
+                                        task_id,
+                                        site,
+                                    )
+                                    if recorded:
+                                        self._credential_blocked.add(task_id)
+                                continue
+                            self._credential_blocked.discard(task_id)
+                            if active_sites[site] >= policy.max_concurrency:
+                                saturated_sites.add(site)
+                                hit_site_limit = True
+                                continue
+                            if not self.db.claim_task(task_id):
+                                continue
+                            worker = asyncio.create_task(
+                                self._execute(task_id),
+                                name=f"gallery-task-{task_id}",
+                            )
+                            self._active[task_id] = (worker, site)
+                            active_sites[site] += 1
+                            capacity -= 1
+                            worker.add_done_callback(
+                                lambda _done, task_id=task_id: self._worker_done(task_id)
+                            )
+                        if capacity <= 0 or not hit_site_limit:
+                            break
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=self.settings.poll_interval_seconds)
                 except asyncio.TimeoutError:
@@ -290,7 +329,15 @@ class TaskScheduler:
                     raise _ExecutionFinished
                 except Exception as exc:
                     if proxy_mode == "required":
-                        raise
+                        decision = FailureDecision(
+                            "proxy_unavailable",
+                            True,
+                            True,
+                            "required 模式下代理租约获取失败："
+                            f"{redact_text(exc, limit=500)}",
+                        )
+                        await log("backend", decision.message)
+                        raise _ExecutionFinished
                     await log("backend", f"代理池降级，本次任务使用直连：{redact_text(exc, limit=500)}")
                     lease = None
                 if lease is not None:

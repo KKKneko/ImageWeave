@@ -1213,14 +1213,14 @@ if proxy_mode == "required":
 
 ### 验收标准
 
-- [ ] J1 `review.py` 的 `get_crawl_review` 返回值已做 `None` 保护。
-- [ ] J2 `_log_tail` 使用 `seek`，不再全文读取；小文件行为正确。
-- [ ] J3 required 模式 acquire 异常分类为 `proxy_unavailable`，`ProxyPoolUnavailable`
+- [x] J1 `review.py` 的 `get_crawl_review` 返回值已做 `None` 保护。
+- [x] J2 `_log_tail` 使用 `seek`，不再全文读取；小文件行为正确。
+- [x] J3 required 模式 acquire 异常分类为 `proxy_unavailable`，`ProxyPoolUnavailable`
       仍为不可重试终态。
-- [ ] J4 凭证被限任务有一条可见 event + `last_error`，且不重复写。
-- [ ] J5 凭证被限任务状态仍为 `queued`，`attempt_count` 未增长，恢复后可自动继续。
-- [ ] J6 调度循环最多额外补抽 2 轮，不同站点不再互相饥饿。
-- [ ] J7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] J4 凭证被限任务有一条可见 event + `last_error`，且不重复写。
+- [x] J5 凭证被限任务状态仍为 `queued`，`attempt_count` 未增长，恢复后可自动继续。
+- [x] J6 调度循环最多额外补抽 2 轮，不同站点不再互相饥饿。
+- [x] J7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
 
 ---

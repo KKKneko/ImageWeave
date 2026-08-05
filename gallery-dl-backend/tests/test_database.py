@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,25 @@ class DatabaseTests(unittest.TestCase):
                 {**policy, "http_timeout": 1},
             )
         self.assertTrue(self.db.delete_site_policy("example.com"))
+
+    def test_exclude_sites_caps_parameter_count(self):
+        self.db.create_task(task_values(self.root))
+        excluded_sites = {f"site-{index:03d}" for index in range(100)}
+        previous_limit = self.db._conn.setlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+            66,
+        )
+        try:
+            queued = self.db.queued_tasks(
+                limit=200,
+                exclude_sites=excluded_sites,
+            )
+        finally:
+            self.db._conn.setlimit(
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                previous_limit,
+            )
+        self.assertEqual([task["id"] for task in queued], ["task-1"])
 
     def test_lease_cleanup_is_scoped_to_attempt(self):
         self.db.create_task(task_values(self.root))

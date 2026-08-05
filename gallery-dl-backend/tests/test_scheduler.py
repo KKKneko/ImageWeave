@@ -91,6 +91,12 @@ class UnavailableProxy(FakeProxy):
         raise ProxyPoolUnavailable("代理池未运行（隧道核心启动失败）")
 
 
+class AcquireFailingProxy(FakeProxy):
+    def acquire(self, task_id: str, **kwargs):
+        super().acquire(task_id, **kwargs)
+        raise RuntimeError("代理租约服务异常")
+
+
 class ReleaseFailingProxy(FakeProxy):
     def release(self, task_id: str, *, proxy_fault: bool, reason: str = ""):
         super().release(task_id, proxy_fault=proxy_fault, reason=reason)
@@ -298,6 +304,52 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any("不会回退直连" in line for line in logs))
                 self.assertFalse(any("本次任务使用直连" in line for line in logs))
 
+    async def test_required_proxy_acquire_failure_classified_as_proxy_unavailable(self):
+        self.db.create_task(values(self.root, proxy_mode="required", attempts=2))
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = FakeGallery([])
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            AcquireFailingProxy(),
+            self.settings.scheduler,
+        )
+
+        await scheduler._execute("task-1")
+
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["last_error_class"], "proxy_unavailable")
+        self.assertEqual(task["attempt_count"], 1)
+        self.assertTrue(task["latest_attempt"]["retryable"])
+        self.assertEqual(gallery.calls, [])
+        self.assertTrue(
+            any(
+                "required 模式下代理租约获取失败" in row["line"]
+                for row in self.db.get_logs("task-1")
+            )
+        )
+
+    async def test_proxy_pool_unavailable_still_terminal(self):
+        self.db.create_task(values(self.root, proxy_mode="required", attempts=3))
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = FakeGallery([])
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            UnavailableProxy(),
+            self.settings.scheduler,
+        )
+
+        await scheduler._execute("task-1")
+
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["last_error_class"], "proxy_unavailable")
+        self.assertEqual(task["attempt_count"], 1)
+        self.assertFalse(task["latest_attempt"]["retryable"])
+        self.assertEqual(gallery.calls, [])
+
     async def test_proxy_failure_switches_node_then_succeeds(self):
         self.db.create_task(values(self.root, proxy_mode="required", attempts=2))
         gallery = FakeGallery(
@@ -350,6 +402,186 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         serialized = str(task) + str(self.db.get_logs("task-1"))
         self.assertNotIn("proxy-user", serialized)
         self.assertNotIn("proxy-secret", serialized)
+
+    async def test_credential_blocked_task_emits_event_once(self):
+        self.settings.scheduler.poll_interval_seconds = 60.0
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values.update(
+            {
+                "site": "twitter",
+                "cookies_file": str(self.root / "twitter.cookies.txt"),
+            }
+        )
+        self.db.create_task(task_values)
+        five_rounds = asyncio.Event()
+        validation_count = 0
+        scheduler = None
+
+        def validate(_site, _cookies_file):
+            nonlocal validation_count
+            validation_count += 1
+            if validation_count < 5:
+                scheduler.notify()
+            else:
+                five_rounds.set()
+            return False
+
+        scheduler = TaskScheduler(
+            self.db,
+            FakeGallery([]),
+            FakeProxy(),
+            self.settings.scheduler,
+            credential_validator=validate,
+        )
+        await scheduler.start()
+        await asyncio.wait_for(five_rounds.wait(), timeout=2.0)
+        await scheduler.stop()
+
+        task = self.db.get_task("task-1")
+        credential_events = [
+            event
+            for event in self.db.get_events("task-1")
+            if event["event_type"] == "credentials_unavailable"
+        ]
+        self.assertEqual(validation_count, 5)
+        self.assertEqual(len(credential_events), 1)
+        self.assertEqual(credential_events[0]["payload"], {"site": "twitter"})
+        self.assertEqual(task["last_error_class"], "credentials_unavailable")
+        self.assertEqual(
+            task["last_error"],
+            "站点托管授权已失效，等待在 VAULT.CPL 重新授权",
+        )
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["attempt_count"], 0)
+        self.assertIsNone(task["latest_attempt"])
+        self.assertEqual(self.db.get_logs("task-1"), [])
+
+    async def test_credential_recovery_resumes_task(self):
+        self.settings.scheduler.poll_interval_seconds = 60.0
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values.update(
+            {
+                "site": "twitter",
+                "cookies_file": str(self.root / "twitter.cookies.txt"),
+            }
+        )
+        self.db.create_task(task_values)
+        gallery = FakeGallery([GalleryRunResult(0, "done", False, "m", 101)])
+        first_block = asyncio.Event()
+        available = False
+
+        def validate(_site, _cookies_file):
+            if not available:
+                first_block.set()
+            return available
+
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            credential_validator=validate,
+        )
+        await scheduler.start()
+        await asyncio.wait_for(first_block.wait(), timeout=2.0)
+        available = True
+        scheduler.notify()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+
+        credential_events = [
+            event
+            for event in self.db.get_events("task-1")
+            if event["event_type"] == "credentials_unavailable"
+        ]
+        self.assertEqual(len(credential_events), 1)
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(task["attempt_count"], 1)
+        self.assertEqual(len(gallery.calls), 1)
+
+    async def test_dispatch_refills_across_sites(self):
+        self.settings.scheduler.poll_interval_seconds = 60.0
+        danbooru_count = 201
+        for index in range(danbooru_count):
+            task_values = values(self.root, proxy_mode="direct", attempts=1)
+            task_values.update(
+                {
+                    "id": f"task-danbooru-{index:03d}",
+                    "url": f"https://danbooru.donmai.us/posts/{index}",
+                    "site": "danbooru",
+                    "priority": 1,
+                    "policy": SitePolicy(
+                        max_concurrency=1,
+                        retry_limit=0,
+                        proxy_mode="direct",
+                    ).model_dump(),
+                }
+            )
+            self.db.create_task(task_values)
+
+        exhentai_task = values(self.root, proxy_mode="direct", attempts=1)
+        exhentai_task.update(
+            {
+                "id": "task-exhentai",
+                "url": "https://e-hentai.org/g/1/token/",
+                "site": "exhentai",
+                "priority": 0,
+                "policy": SitePolicy(
+                    max_concurrency=1,
+                    retry_limit=0,
+                    proxy_mode="direct",
+                ).model_dump(),
+            }
+        )
+        self.db.create_task(exhentai_task)
+        self.assertEqual(
+            len(self.db.queued_tasks(limit=1000)),
+            danbooru_count + 1,
+        )
+
+        query_exclusions: list[set[str]] = []
+        original_queued_tasks = self.db.queued_tasks
+
+        def record_queued_tasks(limit=100, exclude_sites=None):
+            query_exclusions.append(set(exclude_sites or ()))
+            return original_queued_tasks(limit=limit, exclude_sites=exclude_sites)
+
+        self.db.queued_tasks = record_queued_tasks
+        dispatched: list[str] = []
+        exhentai_dispatched = asyncio.Event()
+        release_workers = asyncio.Event()
+        scheduler = TaskScheduler(
+            self.db,
+            FakeGallery([]),
+            FakeProxy(),
+            self.settings.scheduler,
+        )
+
+        async def hold_execution(task_id: str):
+            dispatched.append(task_id)
+            if task_id == "task-exhentai":
+                exhentai_dispatched.set()
+            await release_workers.wait()
+
+        scheduler._execute = hold_execution
+        await scheduler.start()
+        await asyncio.wait_for(exhentai_dispatched.wait(), timeout=2.0)
+
+        task = self.db.get_task("task-exhentai")
+        all_tasks = self.db.list_tasks(limit=500)
+        self.assertEqual(task["status"], "starting")
+        self.assertEqual(dispatched[-1], "task-exhentai")
+        self.assertEqual(len(dispatched), 2)
+        self.assertEqual(query_exclusions, [set(), {"danbooru"}])
+        self.assertEqual(sum(row["status"] == "starting" for row in all_tasks), 2)
+        self.assertTrue(all(row["attempt_count"] == 0 for row in all_tasks))
+        self.assertEqual(
+            self.db._conn.execute("SELECT COUNT(*) FROM task_logs").fetchone()[0],
+            0,
+        )
+
+        release_workers.set()
+        await scheduler.stop()
 
     async def test_invalid_managed_login_pauses_queue_until_reauthorized(self):
         task_values = values(self.root, proxy_mode="direct", attempts=1)

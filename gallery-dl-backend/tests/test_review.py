@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from gdl_backend.app import ServiceContainer, create_app
 from gdl_backend.config import DedupSettings
@@ -143,6 +144,60 @@ def write_review_files(
 
 
 class ReviewManagerTests(unittest.TestCase):
+    def test_review_handles_missing_review_row(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db = Database(root / "backend.sqlite3")
+            try:
+                output = create_terminal_batch(db, root, "batch-missing-review")
+                write_review_files(output)
+                db.start_crawl_review("batch-missing-review")
+
+                async def runner(_claimed):
+                    return review_manifest(output), str(root / "analysis.log")
+
+                manager = DedupReviewManager(
+                    db,
+                    DedupSettings(enabled=True),
+                    root / "runtime",
+                    runner=runner,
+                )
+                with (
+                    mock.patch.object(db, "get_crawl_review", return_value=None),
+                    mock.patch.object(
+                        db,
+                        "fail_crawl_review",
+                        wraps=db.fail_crawl_review,
+                    ) as fail_review,
+                ):
+                    self.assertTrue(asyncio.run(manager.run_once()))
+                self.assertFalse(fail_review.called)
+            finally:
+                db.close()
+
+    def test_log_tail_reads_only_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            large_log = root / "large.log"
+            large_data = b"log-start\n" + (b"x" * 48_000) + b"\nlog-tail"
+            large_log.write_bytes(large_data)
+
+            tail = DedupReviewManager._log_tail(large_log)
+            self.assertLessEqual(len(tail.encode("utf-8")), 4000)
+            self.assertEqual(
+                tail,
+                large_data[-4000:].decode("utf-8", "replace").strip(),
+            )
+            self.assertTrue(tail.endswith("log-tail"))
+
+            small_log = root / "small.log"
+            small_data = b"small log\nlast line"
+            small_log.write_bytes(small_data)
+            self.assertEqual(
+                DedupReviewManager._log_tail(small_log),
+                small_data.decode("utf-8"),
+            )
+
     def test_strict_auto_rejections_run_before_remaining_images_enter_review(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -605,17 +605,73 @@ class Database:
             ).fetchall()
             return [self._task(row) for row in rows]  # type: ignore[misc]
 
-    def queued_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
+    def queued_tasks(
+        self,
+        limit: int = 100,
+        exclude_sites: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        excluded = sorted(exclude_sites or ())[:64]
+        site_filter = ""
+        params: list[Any] = [time.time()]
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            site_filter = f" AND site NOT IN ({placeholders})"
+            params.extend(excluded)
+        params.append(max(1, min(int(limit), 1000)))
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM tasks
                 WHERE status='queued' AND cancel_requested=0 AND next_run_at<=?
+                {site_filter}
                 ORDER BY priority DESC, created_at ASC LIMIT ?
                 """,
-                (time.time(), max(1, min(int(limit), 1000))),
+                params,
             ).fetchall()
             return [self._task(row) for row in rows]  # type: ignore[misc]
+
+    def queued_task_ids(self, task_ids: set[str]) -> set[str]:
+        ids = sorted(task_ids)
+        if not ids:
+            return set()
+        queued: set[str] = set()
+        now = time.time()
+        with self._lock:
+            for offset in range(0, len(ids), 63):
+                chunk = ids[offset : offset + 63]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT id FROM tasks
+                    WHERE status='queued' AND cancel_requested=0
+                      AND next_run_at<=? AND id IN ({placeholders})
+                    """,
+                    (now, *chunk),
+                ).fetchall()
+                queued.update(str(row["id"]) for row in rows)
+        return queued
+
+    def mark_task_credentials_unavailable(self, task_id: str, site: str) -> bool:
+        message = "站点托管授权已失效，等待在 VAULT.CPL 重新授权"
+        now = time.time()
+        with self._transaction() as conn:
+            updated = conn.execute(
+                """
+                UPDATE tasks SET last_error_class='credentials_unavailable',
+                    last_error=?, updated_at=?, version=version+1
+                WHERE id=? AND status='queued' AND cancel_requested=0
+                """,
+                (redact_text(message, limit=2000), now, task_id),
+            )
+            if not updated.rowcount:
+                return False
+            self._event(
+                conn,
+                task_id,
+                "credentials_unavailable",
+                {"site": site},
+            )
+            return True
 
     def claim_task(self, task_id: str) -> bool:
         now = time.time()
