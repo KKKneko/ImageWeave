@@ -32,6 +32,10 @@ class Database:
         self.max_logs_per_task = max(100, int(max_logs_per_task))
         self._since_prune: dict[str, int] = {}
         self._lock = threading.RLock()
+        self._reader_local = threading.local()
+        self._reader_registry: list[sqlite3.Connection] = []
+        self._reader_registry_lock = threading.Lock()
+        # `_conn` 始终是唯一写连接；所有写事务继续由 `_transaction()` 串行化。
         self._conn = sqlite3.connect(
             str(self.path),
             timeout=30.0,
@@ -39,13 +43,12 @@ class Database:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=10000")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._initialize()
-            secure_sqlite_files(self.path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=10000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._initialize()
+        secure_sqlite_files(self.path)
 
     def _initialize(self) -> None:
         # 先读取持久版本，再创建缺失结构；不能在数据迁移前提前抬高版本号。
@@ -383,6 +386,36 @@ class Database:
                     (str(CURRENT_SCHEMA_VERSION),),
                 )
 
+    def _reader(self) -> sqlite3.Connection:
+        conn = getattr(self._reader_local, "connection", None)
+        if conn is not None:
+            return conn
+        conn = sqlite3.connect(
+            str(self.path),
+            timeout=30.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA query_only=ON")
+        except Exception:
+            conn.close()
+            raise
+        with self._reader_registry_lock:
+            self._reader_registry.append(conn)
+        self._reader_local.connection = conn
+        return conn
+
+    # 可见性铁律：任何需要观察“当前未提交事务写入”的读，必须使用
+    # `_transaction()` 产出的 `conn`，绝不能调用基于 `_read()` 的公开方法。
+    # WAL 下读连接只能看到已提交快照。
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        yield self._reader()
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
@@ -503,11 +536,15 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
-            secure_sqlite_files(self.path)
+        with self._reader_registry_lock:
+            for conn in self._reader_registry:
+                conn.close()
+            self._reader_registry.clear()
+        secure_sqlite_files(self.path)
 
     def ping(self) -> bool:
-        with self._lock:
-            return self._conn.execute("SELECT 1").fetchone()[0] == 1
+        with self._read() as conn:
+            return conn.execute("SELECT 1").fetchone()[0] == 1
 
     def _event(self, conn: sqlite3.Connection, task_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
         conn.execute(
@@ -523,9 +560,9 @@ class Database:
                     "SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)
                 ).fetchone()
                 if existing is not None:
-                    # Return the same shape as the normal create path (get_task attaches
-                    # latest_attempt/lease); a bare _task() row here would make a
-                    # concurrent same-key request receive a task dict missing those keys.
+                    # 幂等命中只可能读取本事务开始前已提交的行，因此在这里调用基于
+                    # `_read()` 的 `get_task()` 是安全的；它还能补齐
+                    # `latest_attempt` 与 `lease`，保持和普通查询一致的返回形状。
                     return self.get_task(str(existing["id"])), False  # type: ignore[return-value]
             task_id = str(values.get("id") or uuid.uuid4())
             conn.execute(
@@ -563,22 +600,22 @@ class Database:
             return self._task(row), True  # type: ignore[return-value]
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             task = self._task(row)
             if task is None:
                 return None
-            attempt = self._conn.execute(
+            attempt = conn.execute(
                 "SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1", (task_id,)
             ).fetchone()
             task["latest_attempt"] = self._attempt(attempt)
-            lease = self._conn.execute("SELECT * FROM leases WHERE task_id=?", (task_id,)).fetchone()
+            lease = conn.execute("SELECT * FROM leases WHERE task_id=?", (task_id,)).fetchone()
             task["lease"] = dict(lease) if lease else None
             return task
 
     def get_task_by_idempotency(self, key: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (key,)).fetchone()
+        with self._read() as conn:
+            row = conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (key,)).fetchone()
         return self.get_task(row["id"]) if row else None
 
     def list_tasks(
@@ -599,8 +636,8 @@ class Database:
             params.append(site)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.extend([max(1, min(int(limit), 500)), max(0, int(offset))])
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 f"SELECT * FROM tasks{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", params
             ).fetchall()
             return [self._task(row) for row in rows]  # type: ignore[misc]
@@ -618,8 +655,8 @@ class Database:
             site_filter = f" AND site NOT IN ({placeholders})"
             params.extend(excluded)
         params.append(max(1, min(int(limit), 1000)))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT * FROM tasks
                 WHERE status='queued' AND cancel_requested=0 AND next_run_at<=?
@@ -1218,22 +1255,22 @@ class Database:
         return int(log_id or 0)
 
     def get_logs(self, task_id: str, *, since: int = 0, tail: int | None = None, limit: int = 1000) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._read() as conn:
             if tail is not None:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     "SELECT * FROM task_logs WHERE task_id=? ORDER BY id DESC LIMIT ?",
                     (task_id, max(1, min(int(tail), 5000))),
                 ).fetchall()
                 return [dict(row) for row in reversed(rows)]
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM task_logs WHERE task_id=? AND id>? ORDER BY id ASC LIMIT ?",
                 (task_id, max(0, int(since)), max(1, min(int(limit), 5000))),
             ).fetchall()
             return [dict(row) for row in rows]
 
     def get_events(self, task_id: str, *, since: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 "SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id ASC LIMIT ?",
                 (task_id, max(0, int(since)), max(1, min(int(limit), 5000))),
             ).fetchall()
@@ -1333,15 +1370,15 @@ class Database:
         return self.get_crawl_batch(str(row["id"])) if row else None
 
     def get_crawl_batch(self, batch_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 "SELECT * FROM crawl_batches WHERE id=?",
                 (batch_id,),
             ).fetchone()
             batch = self._crawl_batch(row)
             if batch is None:
                 return None
-            rows = self._conn.execute(
+            rows = conn.execute(
                 """
                 SELECT ca.*, cap.target_url AS proxy_probe_target,
                     cap.total_count AS probed_proxy_count,
@@ -1425,8 +1462,8 @@ class Database:
         return batch
 
     def list_crawl_batches(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 """
                 SELECT * FROM crawl_batches
                 ORDER BY created_at DESC LIMIT ? OFFSET ?
@@ -1436,15 +1473,15 @@ class Database:
             return [self._crawl_batch(row) for row in rows]  # type: ignore[misc]
 
     def get_crawl_review(self, batch_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 "SELECT * FROM crawl_reviews WHERE batch_id=?",
                 (batch_id,),
             ).fetchone()
             review = self._crawl_review(row)
             if review is None:
                 return None
-            image_counts = self._conn.execute(
+            image_counts = conn.execute(
                 """
                 SELECT
                     SUM(CASE WHEN selected=1 THEN 1 ELSE 0 END) AS selected_count,
@@ -1455,7 +1492,7 @@ class Database:
                 """,
                 (batch_id,),
             ).fetchone()
-            decided = self._conn.execute(
+            decided = conn.execute(
                 """
                 SELECT COUNT(*) FROM crawl_review_groups
                 WHERE batch_id=? AND decided=1 AND kind NOT LIKE 'auto_%'
@@ -1823,14 +1860,14 @@ class Database:
             params.append(kind)
         page_limit = max(1, min(int(limit), 50))
         page_offset = max(0, int(offset))
-        with self._lock:
+        with self._read() as conn:
             total = int(
-                self._conn.execute(
+                conn.execute(
                     f"SELECT COUNT(*) FROM crawl_review_groups WHERE {where}",
                     params,
                 ).fetchone()[0]
             )
-            rows = self._conn.execute(
+            rows = conn.execute(
                 f"""
                 SELECT * FROM crawl_review_groups WHERE {where}
                 ORDER BY ordinal LIMIT ? OFFSET ?
@@ -1842,7 +1879,7 @@ class Database:
                 group = self._crawl_review_group(row)
                 if group is None:
                     continue
-                image_rows = self._conn.execute(
+                image_rows = conn.execute(
                     """
                     SELECT * FROM crawl_review_images
                     WHERE batch_id=? AND group_id=? ORDER BY ordinal
@@ -1931,8 +1968,8 @@ class Database:
             )
 
     def get_crawl_review_image(self, batch_id: str, image_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 """
                 SELECT cri.*, cb.output_dir FROM crawl_review_images cri
                 JOIN crawl_batches cb ON cb.id=cri.batch_id
@@ -2105,8 +2142,8 @@ class Database:
         return self.get_crawl_review(batch_id)
 
     def active_crawl_batch_ids(self) -> list[str]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 """
                 SELECT id FROM crawl_batches
                 WHERE status IN ('queued','running','cancelling')
@@ -2177,14 +2214,14 @@ class Database:
         return self.get_crawl_address_proxy_probe(address_id)  # type: ignore[return-value]
 
     def get_crawl_address_proxy_probe(self, address_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 "SELECT * FROM crawl_address_proxy_probes WHERE address_id=?",
                 (address_id,),
             ).fetchone()
             if row is None:
                 return None
-            node_rows = self._conn.execute(
+            node_rows = conn.execute(
                 """
                 SELECT node_id FROM crawl_address_proxy_nodes
                 WHERE address_id=? ORDER BY node_id
@@ -2226,8 +2263,8 @@ class Database:
         """Return the crawl batch a task belongs to, or None for a standalone task.
         Used to route task-level retries of crawl media tasks back through the batch
         endpoint so address/batch counters stay consistent."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 """
                 SELECT ca.batch_id FROM crawl_address_tasks cat
                 JOIN crawl_addresses ca ON ca.id=cat.address_id
@@ -2240,8 +2277,8 @@ class Database:
     def crawl_batch_cancel_requested(self, batch_id: str) -> bool | None:
         """Cheap cancel-flag read for hot planning loops, avoiding get_crawl_batch's
         full address + review load. None means the batch no longer exists."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 "SELECT cancel_requested FROM crawl_batches WHERE id=?", (batch_id,)
             ).fetchone()
         if row is None:
@@ -2475,8 +2512,8 @@ class Database:
             return bool(cur.rowcount)
 
     def crawl_address_tasks(self, address_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 """
                 SELECT t.*, cat.sequence_no FROM crawl_address_tasks cat
                 JOIN tasks t ON t.id=cat.task_id
@@ -2500,8 +2537,8 @@ class Database:
             where += " AND ca.id=?"
             params.append(address_id)
         params.extend([max(1, min(int(limit), 1000)), max(0, int(offset))])
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT t.*, ca.id AS crawl_address_id, ca.source_order, ca.address_order,
                     cat.sequence_no
@@ -2526,9 +2563,9 @@ class Database:
             return result
 
     def crawl_batch_task_count(self, batch_id: str) -> int:
-        with self._lock:
+        with self._read() as conn:
             return int(
-                self._conn.execute(
+                conn.execute(
                     """
                     SELECT COUNT(*) FROM crawl_address_tasks cat
                     JOIN crawl_addresses ca ON ca.id=cat.address_id
@@ -2539,9 +2576,9 @@ class Database:
             )
 
     def crawl_address_task_count(self, address_id: str) -> int:
-        with self._lock:
+        with self._read() as conn:
             return int(
-                self._conn.execute(
+                conn.execute(
                     "SELECT COUNT(*) FROM crawl_address_tasks WHERE address_id=?",
                     (address_id,),
                 ).fetchone()[0]
@@ -2785,15 +2822,15 @@ class Database:
         return {"site": site, "policy": normalized, "updated_at": now}
 
     def get_site_policy(self, site: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM site_policies WHERE site=?", (site,)).fetchone()
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM site_policies WHERE site=?", (site,)).fetchone()
             if row is None:
                 return None
             return {"site": row["site"], "policy": json.loads(row["policy_json"]), "updated_at": row["updated_at"]}
 
     def list_site_policies(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM site_policies ORDER BY site").fetchall()
+        with self._read() as conn:
+            rows = conn.execute("SELECT * FROM site_policies ORDER BY site").fetchall()
             return [
                 {"site": row["site"], "policy": json.loads(row["policy_json"]), "updated_at": row["updated_at"]}
                 for row in rows
@@ -2804,8 +2841,8 @@ class Database:
             return bool(conn.execute("DELETE FROM site_policies WHERE site=?", (site,)).rowcount)
 
     def incomplete_processes(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 "SELECT id, pid, process_marker, status, attempt_count, max_attempts FROM tasks WHERE status IN ('starting','running','cancelling')"
             ).fetchall()
             return [dict(row) for row in rows]

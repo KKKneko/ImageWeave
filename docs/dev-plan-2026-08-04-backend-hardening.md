@@ -689,13 +689,13 @@ async def log(stream: str, line: str) -> None:
 
 ### 验收标准
 
-- [ ] E1 读连接为 `threading.local()` 按线程创建，并开了 `PRAGMA query_only=ON`。
-- [ ] E2 `_read()` 不取任何锁；`_transaction()` 仍取 `self._lock` 且仍 `BEGIN IMMEDIATE`。
-- [ ] E3 `close()` 关闭全部读连接。
-- [ ] E4 §5.3 列出的 23 个方法已全部转为 `_read()`。
-- [ ] E5 `_read()` 上方有可见性铁律注释；`create_task` 内部调用处有解释注释。
-- [ ] E6 已产出 `docs/database-read-write-audit.md`，覆盖全部公开方法。
-- [ ] E7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] E1 读连接为 `threading.local()` 按线程创建，并开了 `PRAGMA query_only=ON`。
+- [x] E2 `_read()` 不取任何锁；`_transaction()` 仍取 `self._lock` 且仍 `BEGIN IMMEDIATE`。
+- [x] E3 `close()` 关闭全部读连接。
+- [x] E4 §5.3 列出的 23 个方法已全部转为 `_read()`。
+- [x] E5 `_read()` 上方有可见性铁律注释；`create_task` 内部调用处有解释注释。
+- [x] E6 已产出 `docs/database-read-write-audit.md`，覆盖全部公开方法。
+- [x] E7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
 
 ---

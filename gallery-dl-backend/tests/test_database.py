@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -57,6 +58,170 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
         self.temp.cleanup()
+
+    def test_reader_connection_rejects_writes(self):
+        with self.db._read() as conn:
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('reader-write', '1')"
+                )
+
+    def test_reader_is_per_thread(self):
+        readers: list[sqlite3.Connection | None] = [None, None]
+        errors: list[BaseException | None] = [None, None]
+
+        def open_reader(index: int) -> None:
+            try:
+                with self.db._read() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                    readers[index] = conn
+            except BaseException as exc:
+                errors[index] = exc
+
+        threads = [
+            threading.Thread(target=open_reader, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [None, None])
+        self.assertIsNotNone(readers[0])
+        self.assertIsNotNone(readers[1])
+        self.assertIsNot(readers[0], readers[1])
+
+    def test_reader_sees_committed_writes(self):
+        self.db.create_task(task_values(self.root))
+        seen: list[dict | None] = [None]
+        errors: list[BaseException | None] = [None]
+
+        def read_task() -> None:
+            try:
+                seen[0] = self.db.get_task("task-1")
+            except BaseException as exc:
+                errors[0] = exc
+
+        thread = threading.Thread(target=read_task)
+        thread.start()
+        thread.join()
+
+        self.assertIsNone(errors[0])
+        self.assertIsNotNone(seen[0])
+        self.assertEqual(seen[0]["id"], "task-1")
+
+    def test_concurrent_reads_are_not_serialized(self):
+        self.db.create_task(task_values(self.root))
+        reader_count = 3
+        all_readers_ready = threading.Event()
+        release_readers = threading.Event()
+        counter_lock = threading.Lock()
+        entered = 0
+        results: list[str | None] = [None] * reader_count
+        errors: list[BaseException | None] = [None] * reader_count
+
+        def wait_for_release() -> int:
+            nonlocal entered
+            with counter_lock:
+                entered += 1
+                if entered == reader_count:
+                    all_readers_ready.set()
+            release_readers.wait()
+            return 1
+
+        def run_read(index: int) -> None:
+            try:
+                with self.db._read() as conn:
+                    conn.create_function("wait_for_release", 0, wait_for_release)
+                    row = conn.execute(
+                        "SELECT wait_for_release() AS ready, id "
+                        "FROM tasks WHERE id=?",
+                        ("task-1",),
+                    ).fetchone()
+                    results[index] = str(row["id"])
+            except BaseException as exc:
+                errors[index] = exc
+
+        threads = [
+            threading.Thread(target=run_read, args=(index,))
+            for index in range(reader_count)
+        ]
+        for thread in threads:
+            thread.start()
+
+        readers_overlapped = all_readers_ready.wait(timeout=5.0)
+        write_result: tuple[dict, bool] | None = None
+        try:
+            if readers_overlapped:
+                write_result = self.db.create_task(
+                    {**task_values(self.root), "id": "task-2"}
+                )
+        finally:
+            release_readers.set()
+        for thread in threads:
+            thread.join()
+
+        self.assertTrue(readers_overlapped)
+        self.assertEqual(errors, [None] * reader_count)
+        self.assertEqual(results, ["task-1"] * reader_count)
+        self.assertIsNotNone(write_result)
+        self.assertTrue(write_result[1])
+        self.assertEqual(self.db.get_task("task-2")["id"], "task-2")
+
+    def test_close_closes_all_reader_connections(self):
+        readers: list[sqlite3.Connection | None] = [None, None]
+        errors: list[BaseException | None] = [None, None]
+
+        def open_reader(index: int) -> None:
+            try:
+                with self.db._read() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                    readers[index] = conn
+            except BaseException as exc:
+                errors[index] = exc
+
+        threads = [
+            threading.Thread(target=open_reader, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [None, None])
+
+        self.db.close()
+
+        for conn in readers:
+            self.assertIsNotNone(conn)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+    def test_create_task_idempotent_hit_returns_full_shape(self):
+        created, is_new = self.db.create_task(
+            task_values(self.root), idempotency_key="full-shape"
+        )
+        self.assertTrue(is_new)
+        self.assertTrue(self.db.claim_task(created["id"]))
+        attempt = self.db.begin_attempt(created["id"])
+        self.db.set_lease(
+            created["id"],
+            attempt["id"],
+            "node-1",
+            "http://127.0.0.1:28000",
+            "example.com",
+        )
+
+        duplicate, is_new = self.db.create_task(
+            {**task_values(self.root), "id": "task-duplicate"},
+            idempotency_key="full-shape",
+        )
+
+        self.assertFalse(is_new)
+        self.assertEqual(duplicate["id"], created["id"])
+        self.assertIn("latest_attempt", duplicate)
+        self.assertIn("lease", duplicate)
+        self.assertIsNotNone(duplicate["latest_attempt"])
+        self.assertIsNotNone(duplicate["lease"])
 
     def test_task_attempt_retry_and_completion(self):
         created, is_new = self.db.create_task(task_values(self.root), idempotency_key="same")
