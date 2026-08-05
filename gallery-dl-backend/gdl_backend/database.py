@@ -533,6 +533,7 @@ class Database:
             data[key] = bool(data.get(key))
         return data
 
+    # 该方法负责连接生命周期，必须在锁保护下关闭写连接并清理全部读连接。
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -552,6 +553,7 @@ class Database:
             (task_id, time.time(), event_type, json.dumps(redact_data(payload or {}), ensure_ascii=False)),
         )
 
+    # 创建与幂等检查必须共用写事务，不能迁移到只读连接。
     def create_task(self, values: dict[str, Any], *, idempotency_key: str | None = None) -> tuple[dict[str, Any], bool]:
         now = time.time()
         with self._transaction() as conn:
@@ -673,11 +675,11 @@ class Database:
             return set()
         queued: set[str] = set()
         now = time.time()
-        with self._lock:
+        with self._read() as conn:
             for offset in range(0, len(ids), 63):
                 chunk = ids[offset : offset + 63]
                 placeholders = ",".join("?" for _ in chunk)
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT id FROM tasks
                     WHERE status='queued' AND cancel_requested=0
@@ -688,6 +690,7 @@ class Database:
                 queued.update(str(row["id"]) for row in rows)
         return queued
 
+    # 凭证状态与事件必须在同一写事务内原子提交。
     def mark_task_credentials_unavailable(self, task_id: str, site: str) -> bool:
         message = "站点托管授权已失效，等待在 VAULT.CPL 重新授权"
         now = time.time()
@@ -710,6 +713,7 @@ class Database:
             )
             return True
 
+    # 条件领取与事件记录必须在同一写事务内完成。
     def claim_task(self, task_id: str) -> bool:
         now = time.time()
         with self._transaction() as conn:
@@ -726,6 +730,7 @@ class Database:
                 return True
             return False
 
+    # 任务状态读取与 attempt、事件写入必须在同一写事务内完成。
     def begin_attempt(self, task_id: str) -> dict[str, Any]:
         now = time.time()
         with self._transaction() as conn:
@@ -754,6 +759,7 @@ class Database:
             task = self._task(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
             return {"id": attempt_id, "attempt_no": attempt_no, "task": task}
 
+    # attempt 进程字段与事件必须在同一写事务内更新。
     def set_process(self, task_id: str, attempt_id: str, pid: int, marker: str) -> None:
         now = time.time()
         with self._transaction() as conn:
@@ -774,6 +780,7 @@ class Database:
                 )
                 self._event(conn, task_id, "process_started", {"pid": int(pid), "attempt_id": attempt_id})
 
+    # attempt 归属读取及完成状态与事件写入必须共用写事务。
     def finish_attempt(
         self,
         attempt_id: str,
@@ -816,6 +823,7 @@ class Database:
                     {"attempt": row["attempt_no"], "status": status, "exit_code": exit_code, "error_class": error_class},
                 )
 
+    # 终态更新、租约清理、事件和返回行必须共用同一写事务连接。
     def complete_task(
         self,
         task_id: str,
@@ -861,6 +869,7 @@ class Database:
                 self._event(conn, task_id, status, {"exit_code": exit_code, "error_class": error_class})
             return self._task(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
+    # 重新排队、租约清理与事件写入必须在同一写事务内完成。
     def requeue_task(
         self,
         task_id: str,
@@ -904,6 +913,7 @@ class Database:
                 self._event(conn, task_id, "retry_scheduled", {"next_run_at": next_run_at, "error_class": error_class})
             return bool(cur.rowcount)
 
+    # 状态判定、取消更新、事件和返回行必须共用同一写事务连接。
     def request_cancel(self, task_id: str) -> dict[str, Any] | None:
         now = time.time()
         with self._transaction() as conn:
@@ -933,6 +943,7 @@ class Database:
                 self._event(conn, task_id, "cancelling")
             return self._task(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
+    # 终态与尝试次数读取、预算更新及返回行必须共用写事务。
     def retry_task(self, task_id: str, additional_attempts: int) -> dict[str, Any] | None:
         now = time.time()
         with self._transaction() as conn:
@@ -1007,6 +1018,7 @@ class Database:
             )
         return task_ids
 
+    # 批次、地址和任务的读取、重排与计数刷新必须保持原子写事务。
     def retry_failed_crawl_tasks(
         self,
         batch_id: str,
@@ -1089,6 +1101,7 @@ class Database:
             "replanned_address_ids": replanned_address_ids,
         }
 
+    # 终态校验、任务重排、地址复位、审核清理与计数刷新必须原子完成。
     def rerun_crawl_batch(
         self,
         batch_id: str,
@@ -1176,6 +1189,7 @@ class Database:
             "requeue_succeeded": bool(requeue_succeeded),
         }
 
+    # 租约与事件必须在同一写事务内写入。
     def set_lease(self, task_id: str, attempt_id: str, node_id: str, endpoint: str, site: str) -> None:
         now = time.time()
         with self._transaction() as conn:
@@ -1191,6 +1205,7 @@ class Database:
             )
             self._event(conn, task_id, "proxy_acquired", {"node_id": node_id, "endpoint": endpoint})
 
+    # 租约删除必须保留单一写连接事务。
     def clear_lease(self, task_id: str, attempt_id: str | None = None) -> None:
         with self._transaction() as conn:
             if attempt_id is None:
@@ -1201,6 +1216,7 @@ class Database:
                     (task_id, attempt_id),
                 )
 
+    # 批量日志插入、裁剪与计数维护必须保留 T4 的单一写事务。
     def append_logs_bulk(
         self,
         rows: Iterable[tuple[str, str | None, float, str, str]],
@@ -1248,6 +1264,7 @@ class Database:
                 self._since_prune[task_id] = 0 if task_id in prune_task_ids else count
         return int(last_row[0]) if last_row is not None else None
 
+    # 单行日志委托批量写入路径，必须沿用其单一写事务。
     def append_log(self, task_id: str, attempt_id: str | None, stream: str, line: str) -> int:
         log_id = self.append_logs_bulk(
             [(task_id, attempt_id, time.time(), stream, line)]
@@ -1284,6 +1301,7 @@ class Database:
                 result.append(data)
             return result
 
+    # 产物计数更新属于写路径，必须保留单一写事务。
     def update_artifacts(self, task_id: str, count: int, total_bytes: int) -> None:
         with self._transaction() as conn:
             conn.execute(
@@ -1291,6 +1309,7 @@ class Database:
                 (max(0, int(count)), max(0, int(total_bytes)), time.time(), task_id),
             )
 
+    # 幂等检查与批次、地址创建必须在同一写事务内完成。
     def create_crawl_batch(
         self,
         values: dict[str, Any],
@@ -1362,8 +1381,8 @@ class Database:
             return batch_id, True
 
     def get_crawl_batch_by_idempotency(self, key: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 "SELECT id FROM crawl_batches WHERE idempotency_key=?",
                 (key,),
             ).fetchone()
@@ -1510,6 +1529,7 @@ class Database:
         review["decided_group_count"] = int(decided or 0)
         return review
 
+    # 批次终态校验与审核登记必须通过写事务原子衔接。
     def start_crawl_review(self, batch_id: str) -> dict[str, Any]:
         now = time.time()
         with self._transaction() as conn:
@@ -1535,6 +1555,7 @@ class Database:
             raise RuntimeError("去重分析任务建立后读取失败")
         return review
 
+    # 重启恢复会更新审核状态，必须保留单一写事务。
     def recover_crawl_reviews(self) -> int:
         now = time.time()
         with self._transaction() as conn:
@@ -1556,6 +1577,7 @@ class Database:
             ).rowcount
             return int(analyzing + applying)
 
+    # 候选选择与条件领取必须在同一写事务内完成。
     def claim_next_crawl_review(self) -> dict[str, Any] | None:
         now = time.time()
         with self._transaction() as conn:
@@ -1583,8 +1605,8 @@ class Database:
             return {"batch_id": str(row["batch_id"]), "output_dir": str(row["output_dir"])}
 
     def next_crawl_review_automatic(self) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 """
                 SELECT cr.batch_id, cb.output_dir FROM crawl_reviews cr
                 JOIN crawl_batches cb ON cb.id=cr.batch_id
@@ -1599,6 +1621,7 @@ class Database:
                 "output_dir": str(row["output_dir"]),
             }
 
+    # 审核重新排队会修改状态，必须保留单一写事务。
     def requeue_crawl_review(self, batch_id: str) -> None:
         with self._transaction() as conn:
             conn.execute(
@@ -1609,6 +1632,7 @@ class Database:
                 (time.time(), batch_id),
             )
 
+    # 审核失败状态与脱敏错误必须通过写事务保存。
     def fail_crawl_review(self, batch_id: str, error: str, *, log_path: str = "") -> None:
         with self._transaction() as conn:
             conn.execute(
@@ -1619,6 +1643,7 @@ class Database:
                 (redact_text(error, limit=4000), log_path, time.time(), batch_id),
             )
 
+    # 状态校验、旧清单删除与审核复位必须在同一写事务内完成。
     def retry_crawl_review(self, batch_id: str) -> bool:
         now = time.time()
         with self._transaction() as conn:
@@ -1644,6 +1669,7 @@ class Database:
             )
             return True
 
+    # 状态校验、清单替换与汇总更新必须在同一写事务内完成。
     def replace_crawl_review_manifest(
         self,
         batch_id: str,
@@ -1896,6 +1922,7 @@ class Database:
                 groups.append(group)
         return {"items": groups, "total": total, "limit": page_limit, "offset": page_offset}
 
+    # 审核状态、组和图片归属校验必须与选择更新原子完成。
     def update_crawl_review_decisions(
         self,
         batch_id: str,
@@ -1979,6 +2006,7 @@ class Database:
             ).fetchone()
             return self._crawl_review_image(row)
 
+    # 审核与批次状态、未决组检查必须和 applying 更新共用写事务。
     def begin_crawl_review_apply(self, batch_id: str) -> bool:
         with self._transaction() as conn:
             review = conn.execute(
@@ -2018,8 +2046,8 @@ class Database:
             return bool(updated.rowcount)
 
     def crawl_review_apply_images(self, batch_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 """
                 SELECT * FROM crawl_review_images WHERE batch_id=?
                 ORDER BY group_id, ordinal
@@ -2029,8 +2057,8 @@ class Database:
             return [self._crawl_review_image(row) for row in rows]  # type: ignore[misc]
 
     def crawl_review_automatic_images(self, batch_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read() as conn:
+            rows = conn.execute(
                 """
                 SELECT cri.* FROM crawl_review_images cri
                 JOIN crawl_review_groups crg
@@ -2042,6 +2070,7 @@ class Database:
             ).fetchall()
             return [self._crawl_review_image(row) for row in rows]  # type: ignore[misc]
 
+    # 自动处置计数与审核状态更新必须在同一写事务内完成。
     def finish_crawl_review_automatic(self, batch_id: str) -> dict[str, Any] | None:
         now = time.time()
         with self._transaction() as conn:
@@ -2072,6 +2101,7 @@ class Database:
                 return None
         return self.get_crawl_review(batch_id)
 
+    # 文件移动阶段状态会被持久化，必须保留单一写事务。
     def stage_crawl_review_image_move(
         self,
         batch_id: str,
@@ -2087,6 +2117,7 @@ class Database:
                 (final_relative_path, time.time(), batch_id, image_id),
             )
 
+    # 图片处置结果与脱敏错误必须通过写事务保存。
     def finish_crawl_review_image(
         self,
         batch_id: str,
@@ -2114,6 +2145,7 @@ class Database:
                 ),
             )
 
+    # 处置计数与审核终态更新必须在同一写事务内完成。
     def finish_crawl_review_apply(self, batch_id: str) -> dict[str, Any] | None:
         now = time.time()
         with self._transaction() as conn:
@@ -2153,8 +2185,8 @@ class Database:
             return [str(row["id"]) for row in rows]
 
     def next_crawl_address(self, batch_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 """
                 SELECT * FROM crawl_addresses
                 WHERE batch_id=? AND status NOT IN ('succeeded','failed','cancelled')
@@ -2164,6 +2196,7 @@ class Database:
             ).fetchone()
             return self._crawl_address(row)
 
+    # 探测汇总与节点集合替换必须在同一写事务内原子完成。
     def save_crawl_address_proxy_probe(
         self,
         address_id: str,
@@ -2232,6 +2265,7 @@ class Database:
         result["node_ids"] = [str(item["node_id"]) for item in node_rows]
         return result
 
+    # 地址存在性读取、条件状态更新与批次激活必须共用写事务。
     def begin_crawl_address_planning(self, address_id: str) -> bool:
         now = time.time()
         with self._transaction() as conn:
@@ -2285,6 +2319,7 @@ class Database:
             return None
         return bool(row["cancel_requested"])
 
+    # 链接冲突读取、来源键写入与批次计数更新必须共用写事务。
     def link_crawl_task(
         self,
         address_id: str,
@@ -2373,11 +2408,11 @@ class Database:
         if not keys:
             return set()
         matched: set[str] = set()
-        with self._lock:
+        with self._read() as conn:
             for offset in range(0, len(keys), 500):
                 chunk = keys[offset : offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT DISTINCT ctsk.source_key
                     FROM crawl_task_source_keys ctsk
@@ -2403,8 +2438,8 @@ class Database:
             prefix = "twitter"
         if prefix not in {"pixiv", "twitter"}:
             return 0
-        with self._lock:
-            row = self._conn.execute(
+        with self._read() as conn:
+            row = conn.execute(
                 """
                 SELECT COUNT(DISTINCT ctsk.source_key)
                 FROM crawl_task_source_keys ctsk
@@ -2418,6 +2453,7 @@ class Database:
             ).fetchone()
         return int(row[0] or 0)
 
+    # 地址预去重计数更新属于写路径，必须保留单一写事务。
     def set_crawl_address_pre_dedup_skipped_count(
         self,
         address_id: str,
@@ -2433,6 +2469,7 @@ class Database:
             )
             return bool(cur.rowcount)
 
+    # 地址与批次状态校验、终态及计数刷新必须共用写事务。
     def finish_crawl_address_as_pre_deduplicated(
         self,
         address_id: str,
@@ -2463,6 +2500,7 @@ class Database:
             self._refresh_crawl_batch_counts(conn, str(row["batch_id"]))
             return True
 
+    # 已链接任务计数、地址状态与批次计数校准必须共用写事务。
     def mark_crawl_address_running(
         self, address_id: str, *, last_error: str = "", planning_error: str = ""
     ) -> bool:
@@ -2500,6 +2538,7 @@ class Database:
                     self._refresh_crawl_batch_counts(conn, str(batch_row["batch_id"]))
             return bool(cur.rowcount)
 
+    # 地址规划状态复位属于写路径，必须保留单一写事务。
     def reset_crawl_address_planning(self, address_id: str, error: str = "") -> bool:
         with self._transaction() as conn:
             cur = conn.execute(
@@ -2614,6 +2653,7 @@ class Database:
             ),
         )
 
+    # 地址、任务与批次状态读取及终态计数更新必须共用写事务。
     def finish_crawl_address_if_terminal(self, address_id: str) -> bool:
         terminal = {"succeeded", "failed", "cancelled"}
         now = time.time()
@@ -2661,6 +2701,7 @@ class Database:
             self._refresh_crawl_batch_counts(conn, str(address["batch_id"]))
             return True
 
+    # 地址归属读取、失败状态与批次计数更新必须共用写事务。
     def fail_crawl_address(self, address_id: str, error: str) -> None:
         now = time.time()
         with self._transaction() as conn:
@@ -2689,6 +2730,7 @@ class Database:
             )
             self._refresh_crawl_batch_counts(conn, str(row["batch_id"]))
 
+    # 批次与地址状态读取、计数刷新及终态更新必须共用写事务。
     def finish_crawl_batch_if_ready(self, batch_id: str) -> bool:
         now = time.time()
         with self._transaction() as conn:
@@ -2731,6 +2773,7 @@ class Database:
             )
             return True
 
+    # 批次状态读取、地址取消与待取消任务读取必须共用写事务。
     def request_cancel_crawl_batch(self, batch_id: str) -> tuple[dict[str, Any] | None, list[str]]:
         now = time.time()
         with self._transaction() as conn:
@@ -2770,6 +2813,7 @@ class Database:
                 conn.execute("SELECT * FROM crawl_batches WHERE id=?", (batch_id,)).fetchone()
             ), [str(row["id"]) for row in task_rows]  # type: ignore[return-value]
 
+    # 恢复地址和批次状态需要多条原子更新，必须保留单一写事务。
     def recover_ordered_crawls(self) -> int:
         now = time.time()
         with self._transaction() as conn:
@@ -2808,6 +2852,7 @@ class Database:
             )
             return int(linked.rowcount) + int(pending.rowcount)
 
+    # 站点策略 upsert 属于写路径，必须保留单一写事务。
     def put_site_policy(self, site: str, policy: dict[str, Any]) -> dict[str, Any]:
         normalized = EditableSitePolicy.model_validate(policy).model_dump()
         now = time.time()
@@ -2836,6 +2881,7 @@ class Database:
                 for row in rows
             ]
 
+    # 站点策略删除属于写路径，必须保留单一写事务。
     def delete_site_policy(self, site: str) -> bool:
         with self._transaction() as conn:
             return bool(conn.execute("DELETE FROM site_policies WHERE site=?", (site,)).rowcount)
@@ -2847,6 +2893,7 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    # 未完成任务读取及任务、attempt、租约与事件更新必须共用写事务。
     def recover_incomplete(self) -> int:
         now = time.time()
         recovered = 0

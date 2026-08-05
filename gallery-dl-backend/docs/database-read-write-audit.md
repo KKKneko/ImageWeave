@@ -1,12 +1,12 @@
 # Database 读写路径审计
 
-本文档记录 T5 完成时 `gdl_backend.database.Database` 的公开方法读写属性。类型按公开方法的数据库行为划分：只查询为“读”，只修改为“写”，需要先读取状态再修改、存在幂等只读分支或写后返回查询结果为“读写混合”。
+本文档记录 T6 收尾后 `gdl_backend.database.Database` 的公开方法读写属性。类型按公开方法的数据库行为划分：只查询为“读”，只修改为“写”，需要先读取状态再修改、存在幂等只读分支或写后返回查询结果为“读写混合”。
 
-“本轮是否已转 `_read()`”仅表示公开方法的纯读主体是否已使用线程本地读连接。写方法和读写混合方法必须继续使用唯一写连接及 `_transaction()`；标为 T6 的纯读方法是有意保留，并非遗漏。
+“是否使用 `_read()`”表示公开纯读主体是否使用线程本地只读连接。纯读方法全部标记为“是”；写方法和读写混合方法标记为“否”，并继续使用唯一写连接及 `_transaction()`，具体原因逐行记录。
 
 ## 公开方法清单
 
-| 方法名 | 类型 | 本轮是否已转 `_read()` | 未转的原因 |
+| 方法名 | 类型 | 是否使用 `_read()` | 未使用原因 |
 | --- | --- | --- | --- |
 | `close` | 读写混合 | 否 | 连接生命周期操作；必须关闭唯一写连接和 registry 中的全部读连接，不是查询迁移对象。 |
 | `ping` | 读 | 是 | — |
@@ -15,7 +15,7 @@
 | `get_task_by_idempotency` | 读 | 是 | — |
 | `list_tasks` | 读 | 是 | — |
 | `queued_tasks` | 读 | 是 | — |
-| `queued_task_ids` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `queued_task_ids` | 读 | 是 | — |
 | `mark_task_credentials_unavailable` | 写 | 否 | 凭证状态与事件必须在单一写事务内原子提交。 |
 | `claim_task` | 写 | 否 | 条件更新与事件写入必须在单一写事务内完成。 |
 | `begin_attempt` | 读写混合 | 否 | 必须在同一写事务内读取任务状态并写入 attempt、任务状态与事件。 |
@@ -35,14 +35,14 @@
 | `get_events` | 读 | 是 | — |
 | `update_artifacts` | 写 | 否 | 产物计数更新属于单一写连接路径。 |
 | `create_crawl_batch` | 读写混合 | 否 | 幂等检查与批次、地址创建必须在同一写事务内完成。 |
-| `get_crawl_batch_by_idempotency` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `get_crawl_batch_by_idempotency` | 读 | 是 | — |
 | `get_crawl_batch` | 读 | 是 | — |
 | `list_crawl_batches` | 读 | 是 | — |
 | `get_crawl_review` | 读 | 是 | — |
 | `start_crawl_review` | 读写混合 | 否 | 批次终态校验与审核登记必须走写事务；提交后的详情读取间接使用已迁移的 `get_crawl_review()`。 |
 | `recover_crawl_reviews` | 写 | 否 | 重启恢复状态更新属于单一写连接路径。 |
 | `claim_next_crawl_review` | 读写混合 | 否 | 候选选择和条件 claim 必须在同一写事务内完成。 |
-| `next_crawl_review_automatic` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `next_crawl_review_automatic` | 读 | 是 | — |
 | `requeue_crawl_review` | 写 | 否 | 审核重新排队属于单一写连接路径。 |
 | `fail_crawl_review` | 写 | 否 | 审核失败状态与脱敏错误必须通过写事务保存。 |
 | `retry_crawl_review` | 读写混合 | 否 | 状态校验、旧清单删除和审核复位必须在同一写事务内完成。 |
@@ -51,22 +51,22 @@
 | `update_crawl_review_decisions` | 读写混合 | 否 | 审核状态、组和图片归属校验必须与选择更新原子完成。 |
 | `get_crawl_review_image` | 读 | 是 | — |
 | `begin_crawl_review_apply` | 读写混合 | 否 | 审核/批次状态与未决组检查必须和 applying 状态更新共用写事务。 |
-| `crawl_review_apply_images` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
-| `crawl_review_automatic_images` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `crawl_review_apply_images` | 读 | 是 | — |
+| `crawl_review_automatic_images` | 读 | 是 | — |
 | `finish_crawl_review_automatic` | 读写混合 | 否 | 自动处理计数与审核状态更新必须在同一写事务内；提交后详情读取已走 `_read()`。 |
 | `stage_crawl_review_image_move` | 写 | 否 | 文件移动阶段状态属于单一写连接路径。 |
 | `finish_crawl_review_image` | 写 | 否 | 图片处置结果与脱敏错误属于单一写连接路径。 |
 | `finish_crawl_review_apply` | 读写混合 | 否 | 处置计数与审核终态更新必须在同一写事务内；提交后详情读取已走 `_read()`。 |
 | `active_crawl_batch_ids` | 读 | 是 | — |
-| `next_crawl_address` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `next_crawl_address` | 读 | 是 | — |
 | `save_crawl_address_proxy_probe` | 读写混合 | 否 | 探测汇总与节点集合替换必须原子写入；提交后结果读取已走 `_read()`。 |
 | `get_crawl_address_proxy_probe` | 读 | 是 | — |
 | `begin_crawl_address_planning` | 读写混合 | 否 | 地址存在性读取、条件状态更新与批次激活必须共用写事务。 |
 | `task_crawl_batch_id` | 读 | 是 | — |
 | `crawl_batch_cancel_requested` | 读 | 是 | — |
 | `link_crawl_task` | 读写混合 | 否 | 链接/序号冲突读取、来源键写入与批次计数更新必须在同一写事务内完成。 |
-| `succeeded_danbooru_source_keys` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
-| `succeeded_danbooru_source_key_count` | 读 | 否 | T6 范围：纯读可转，本轮严格按 §5.3 暂不迁移。 |
+| `succeeded_danbooru_source_keys` | 读 | 是 | — |
+| `succeeded_danbooru_source_key_count` | 读 | 是 | — |
 | `set_crawl_address_pre_dedup_skipped_count` | 写 | 否 | 地址预去重计数更新属于单一写连接路径。 |
 | `finish_crawl_address_as_pre_deduplicated` | 读写混合 | 否 | 地址/批次状态校验、地址终态和批次计数刷新必须共用写事务。 |
 | `mark_crawl_address_running` | 读写混合 | 否 | 已链接任务计数、地址状态和批次计数校准必须共用写事务。 |
@@ -89,7 +89,7 @@
 
 ## 写事务内公开方法调用审计
 
-对 `Database` 中所有 `with self._transaction() as conn:` 代码块进行 AST 审计后，只发现一处调用 `self.<公开方法>()`：
+对 `Database` 中所有 `with self._transaction() as conn:` 代码块进行审计后，只发现一处调用 `self.<公开方法>()`：
 
 | 调用方 | 事务内公开调用 | 结论 |
 | --- | --- | --- |
@@ -101,6 +101,35 @@
 - `requeue_task()` 当前返回 `bool(cur.rowcount)`，事务内更新、lease 删除和事件写入均继续使用同一个 `conn`，没有调用任何公开读方法。
 - 除上述 `create_task()` 幂等命中外，没有其他写事务块调用公开方法。
 
-## T6 待迁纯读方法
+## 仍在事件循环上的同步读
 
-以下 8 个纯读方法有意留待 T6：`queued_task_ids`、`get_crawl_batch_by_idempotency`、`next_crawl_review_automatic`、`crawl_review_apply_images`、`crawl_review_automatic_images`、`next_crawl_address`、`succeeded_danbooru_source_keys`、`succeeded_danbooru_source_key_count`。
+以下清单按生产执行路径盘点同步执行的 `Database` 纯读调用；同步 helper 若由 `async def` 直接调用，也按事件循环路径计入。典型数据量描述单次调用的返回量或扫描范围，不是性能阈值。已经显式走 `asyncio.to_thread` 的调用不列入表中。
+
+| 模块 | 调用上下文 | 数据库读方法 | 典型数据量 |
+| --- | --- | --- | --- |
+| `ordered_crawl.py` | `status()`；由异步 `/readyz` 与调度诊断 handler 在事件循环上取快照 | `active_crawl_batch_ids` | 返回全部活跃批次 ID，通常为 0 至少量批次，随排队/运行/取消中批次数增长。 |
+| `ordered_crawl.py` | `run_once()` 每轮扫描活跃批次 | `active_crawl_batch_ids` | 返回全部活跃批次 ID；每个轮询周期 1 次。 |
+| `ordered_crawl.py` | `_tick_batch()` 加载轮询视图 | `get_crawl_batch` | 1 个批次，但会加载该批次全部地址、代理探测关联和审核汇总；通常数个至数十个地址，随批次地址数增长。 |
+| `ordered_crawl.py` | `_tick_batch()` 选择当前地址 | `next_crawl_address` | 至多 1 条地址记录。 |
+| `ordered_crawl.py` | `_tick_batch()` 取消分支枚举当前地址任务 | `crawl_address_tasks` | 当前地址全部已链接媒体任务；单地址可接近批次 `max_tasks`（默认 10,000，配置上限 100,000）。 |
+| `ordered_crawl.py` | `_activate_address()` 计算重新规划预算 | `crawl_address_task_count` | 1 个标量计数，扫描当前地址的任务链接。 |
+| `ordered_crawl.py` | `_activate_address()` 计算批次剩余额度 | `crawl_batch_task_count` | 1 个标量计数，扫描批次全部任务链接；默认规模上限 10,000。 |
+| `ordered_crawl.py` | `_activate_address()` 在探活后、规划后、入队后、状态切换失败及异常路径复核取消状态 | `get_crawl_batch` | 每次返回 1 个完整批次聚合视图；单次地址激活路径最多调用 5 次。 |
+| `ordered_crawl.py` | `_activate_address()` 每个媒体单元入队前检查取消标记 | `crawl_batch_cancel_requested` | 每次 1 个布尔标量；按媒体单元调用，默认最多约 10,000 次/批次。 |
+| `ordered_crawl.py` | `_plan_address()` 计算跨站预去重发现余量 | `succeeded_danbooru_source_key_count` | 1 个标量计数，扫描本批次已成功的 Danbooru 来源键。 |
+| `ordered_crawl.py` | `_plan_address()` 直接调用同步 `_filter_previously_downloaded_danbooru_sources()` | `succeeded_danbooru_source_keys` | 候选来源键按 500 个分块查询；常见可到批次媒体规模（默认 `max_tasks=10,000`）。 |
+| `scheduler.py` | `start()` 启动恢复前读取遗留进程 | `incomplete_processes` | 全部 `starting/running/cancelling` 任务；正常运行通常不超过全局并发默认值 20，崩溃恢复时可能包含遗留行。 |
+| `scheduler.py` | `_dispatch_loop()` 每轮补充待调度任务 | `queued_tasks` | 每次最多 200 条任务；一次唤醒最多 3 个 refill round。 |
+| `scheduler.py` | `_execute()` 直接调用同步 `_allowed_proxy_ids()` 获取地址探测范围 | `get_crawl_address_proxy_probe` | 1 条探测汇总及该地址全部允许节点 ID，通常为几十个以内。 |
+| `scheduler.py` | `cancel()` 在取消动作后读取返回详情 | `get_task` | 1 个任务、最新 attempt 与可选 lease。 |
+| `scheduler.py` | `_execute()` 在运行前、gallery-dl 返回后、无 attempt 收尾及 attempt 完成后检查状态 | `get_task` | 每次 1 个任务、最新 attempt 与可选 lease；单次执行路径最多 4 次。 |
+| `review.py` | `run_once()` 轮询严格自动处置队列 | `next_crawl_review_automatic` | 至多 1 条审核批次记录。 |
+| `review.py` | `run_once()` 写入 manifest 后读取审核状态 | `get_crawl_review` | 1 条审核记录，并聚合扫描该批次全部审核图片与组；规模随批次图片数增长。 |
+
+明确排除的现有线程路径：`scheduler.py` 的 `queued_task_ids()` 已通过 `asyncio.to_thread` 调用；`review.py` 的 `_apply_automatic_rejections()` 在两个生产分支均整体下线程，手动 `apply()` 也由 `app.py` 通过 `asyncio.to_thread` 调用，因此其中的 `crawl_review_automatic_images()`、`get_crawl_batch()` 与 `crawl_review_apply_images()` 不属于“仍在事件循环上”的同步读。
+
+## T6 收尾结论
+
+T5 留下的 8 个长尾纯读方法均已迁移到 `_read()`：`queued_task_ids`、`get_crawl_batch_by_idempotency`、`next_crawl_review_automatic`、`crawl_review_apply_images`、`crawl_review_automatic_images`、`next_crawl_address`、`succeeded_danbooru_source_keys`、`succeeded_danbooru_source_key_count`。
+
+最终审计覆盖全部 78 个公开方法，其中 31 个纯读方法全部使用 `_read()`；19 个纯写方法和 28 个读写混合/连接生命周期方法均在各自 `def` 紧邻上方保留一行中文原因注释。`tests/test_database.py` 的 `test_read_methods_do_not_take_write_lock` 使用 `inspect.getsource()` 检查全部纯读方法不引用 `self._lock`，模块级例外名单为 `frozenset` 且当前为空。

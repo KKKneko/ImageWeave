@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sqlite3
 import tempfile
 import threading
@@ -7,6 +8,45 @@ import unittest
 from pathlib import Path
 
 from gdl_backend.database import Database
+
+
+PURE_READ_METHODS = frozenset(
+    {
+        "ping",
+        "get_task",
+        "get_task_by_idempotency",
+        "list_tasks",
+        "queued_tasks",
+        "queued_task_ids",
+        "get_logs",
+        "get_events",
+        "get_crawl_batch_by_idempotency",
+        "get_crawl_batch",
+        "list_crawl_batches",
+        "get_crawl_review",
+        "next_crawl_review_automatic",
+        "list_crawl_review_groups",
+        "get_crawl_review_image",
+        "crawl_review_apply_images",
+        "crawl_review_automatic_images",
+        "active_crawl_batch_ids",
+        "next_crawl_address",
+        "get_crawl_address_proxy_probe",
+        "task_crawl_batch_id",
+        "crawl_batch_cancel_requested",
+        "succeeded_danbooru_source_keys",
+        "succeeded_danbooru_source_key_count",
+        "crawl_address_tasks",
+        "list_crawl_tasks",
+        "crawl_batch_task_count",
+        "crawl_address_task_count",
+        "get_site_policy",
+        "list_site_policies",
+        "incomplete_processes",
+    }
+)
+
+READ_METHOD_WRITE_LOCK_EXCEPTIONS = frozenset()
 
 
 def task_values(root: Path) -> dict:
@@ -47,6 +87,25 @@ def crawl_address_values(batch_id: str) -> list[dict]:
             "max_attempts": 1,
         }
     ]
+
+
+class DatabaseSourceAuditTests(unittest.TestCase):
+    def test_read_methods_do_not_take_write_lock(self):
+        self.assertLessEqual(
+            READ_METHOD_WRITE_LOCK_EXCEPTIONS,
+            PURE_READ_METHODS,
+            "写锁例外只能来自纯读方法清单",
+        )
+        for method_name in sorted(PURE_READ_METHODS):
+            with self.subTest(method=method_name):
+                source = inspect.getsource(getattr(Database, method_name))
+                if method_name in READ_METHOD_WRITE_LOCK_EXCEPTIONS:
+                    continue
+                self.assertNotIn(
+                    "self._lock",
+                    source,
+                    f"纯读方法 {method_name} 不得获取写锁",
+                )
 
 
 class DatabaseTests(unittest.TestCase):
