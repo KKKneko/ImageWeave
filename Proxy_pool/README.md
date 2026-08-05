@@ -66,5 +66,4 @@ python -m unittest discover -s tests -v
 ```
 
 旧宿主应用的 `webui/http_batch` 不在本目录中，依赖这些模块的集成测试会自动跳过。
-内嵌 Mihomo 的设计取舍和当前实现范围见
-[`docs/2026-07-12-embedded-mihomo-node-pool-design.md`](./docs/2026-07-12-embedded-mihomo-node-pool-design.md)。
+内嵌 Mihomo 当前由 `embedded_proxy_manager.py` 管理单个核心进程、多端口出口、预检与节点租约。

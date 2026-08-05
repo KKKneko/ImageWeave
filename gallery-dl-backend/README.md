@@ -35,8 +35,7 @@ X、Pixiv、EH 的托管授权需要桌面 Chrome/Chromium；纯后端、下载�
 - 支持任务取消、失败重试、重启恢复、文件清单和幂等提交；
 - 聚合批次结束后可独立启动 L0-L2 去重；严格自动组先淘汰，剩余图片进入分组人工审核。
 
-具体进程边界、状态机、搜索证据规则和代理选择算法见
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)。
+搜索证据、任务状态与代理租约均以后端持久化数据为准。
 
 ## CPU 去重资源 profile
 
@@ -265,9 +264,7 @@ Base64/Data URL 或 Blob URL。
 Object URL 不进入中央 Store 或 LocalStorage，图片也不会上传。IndexedDB 不可用或配额写入失败时
 保留旧壁纸并给出安全提示；偏好指向的记录缺失或损坏时清理无效记录并回退默认 `graphite`，这些
 故障不阻断桌面壳层启动。主题颜色不进入 IndexedDB、中央 Store、dataset、业务 API 或上传路径；
-只有通过严格六位 HEX 整对投影后的两个字段随完整偏好写入 LocalStorage；对比度不参与合法性判断。桌面与主题设计/验收分别见
-[`../docs/webui-desktop-personalization.md`](../docs/webui-desktop-personalization.md) 与
-[`../docs/webui-interface-theme-personalization.md`](../docs/webui-interface-theme-personalization.md)。
+只有通过严格六位 HEX 整对投影后的两个字段随完整偏好写入 LocalStorage；对比度不参与合法性判断。
 
 `TASKMGR.EXE` 仅对活动批次执行一个 1.5 秒、生命周期受控且不重叠的轮询，终态、404、最小化、
 关闭或切出应用即停止；写操作加锁并在完成后读取权威快照。`REVIEW.EXE` 只在分析处理中轮询，翻页、
@@ -295,8 +292,8 @@ X、Pixiv 和 EH 共用项目目录中的持久 Chrome Profile，但每次授权
 才会标记为失效；重新授权成功后，尚未运行的同站任务会继续调度。
 
 删除单站授权只删除该站导出的 Cookie 或 Token；删除共享浏览器 Profile 会停止授权会话并
-清理浏览器状态，但不会自动删除已经导出的站点凭证。权限、缓存交换和失效恢复细节见
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#进程边界)。
+清理浏览器状态，但不会自动删除已经导出的站点凭证。授权材料与缓存仅写入权限受限的项目管理目录；
+失效凭证需重新授权后才能恢复后续同站任务。
 
 `VAULT.CPL` 使用相同路由的 `?view=vault` 响应 profile。默认 `legacy` 响应保持兼容；`vault`
 投影只保留受控站点/会话 ID、布尔能力、计数与时间，移除 Pixiv 完整授权 URL、原始会话错误、
@@ -394,8 +391,7 @@ DELETE /api/v1/sites/policies/{site}
 - Pawchive 候选来自站内创作者目录（名称包含匹配，按收藏数排序），
   已过滤本站从未导入的 kemono 同步空壳条目。
 
-详细匹配与过滤规则见
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#跨来源发现与选择)。
+客户端应区分已验证地址、弱证据与站点候选，并由用户确认后再提交。
 
 ### 顺序批次
 

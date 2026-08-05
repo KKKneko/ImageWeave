@@ -18,8 +18,7 @@ ImageWeave 是一套面向插画与图库采集的本地工作台。它把跨站
 正式 WebUI 地址为 <http://127.0.0.1:8787/ui/>。
 
 桌面支持同时打开多个应用窗口并列工作，可通过任务栏聚焦、最小化或恢复窗口，并在本机保存布局；
-窄屏设备会自动降级为单个聚焦窗口最大化显示。状态与生命周期约定见
-[WebUI 多窗口架构](./docs/webui-multi-window.md)。
+窄屏设备会自动降级为单个聚焦窗口最大化显示。
 
 | 应用 | 功能 |
 | --- | --- |
@@ -506,10 +505,4 @@ curl http://127.0.0.1:8787/readyz
 ## 文档
 
 - [后端、API 与工作流](./gallery-dl-backend/README.md)
-- [架构与状态机](./gallery-dl-backend/docs/ARCHITECTURE.md)
-- [WebUI 重写与迁移记录](./gallery-dl-backend/docs/WEBUI_REWRITE.md)
-- [WebUI 桌面个性化实现与验收](./docs/webui-desktop-personalization.md)
-- [WebUI 界面主题设计与聚焦验收](./docs/webui-interface-theme-personalization.md)
-- [Mihomo 安装说明](./gallery-dl-backend/docs/MIHOMO.md)
-- [Linux 部署路线与修复记录](./gallery-dl-backend/docs/DEPLOYMENT_ROADMAP.md)
 - [第三方组件与许可证](./gallery-dl-backend/THIRD_PARTY_NOTICES.md)

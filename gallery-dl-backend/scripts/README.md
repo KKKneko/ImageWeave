@@ -9,7 +9,8 @@
 | `install_mihomo.sh` | Linux |
 | `install_mihomo.ps1` | Windows PowerShell |
 
-版本、校验值和自定义安装参数见 [`../docs/MIHOMO.md`](../docs/MIHOMO.md)。
+两个安装器都在脚本内固定 Mihomo 版本与各架构 SHA-256。Linux 参数可运行
+`bash scripts/install_mihomo.sh --help` 查看；PowerShell 支持 `-InstallDir` 与 `-Force`。
 
 ## EH 联网烟雾测试
 
