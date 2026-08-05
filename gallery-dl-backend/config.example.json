@@ -58,6 +58,7 @@
   },
   "scheduler": {
     "max_concurrent_tasks": 20,
+    "max_concurrent_batches": 4,
     "poll_interval_seconds": 0.5,
     "shutdown_grace_seconds": 15,
     "max_logs_per_task": 5000,

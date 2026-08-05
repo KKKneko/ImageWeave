@@ -199,6 +199,7 @@ class ServiceContainer:
             self.proxy,
             self.policy_for,
             poll_interval=settings.scheduler.poll_interval_seconds,
+            max_concurrent_batches=settings.scheduler.max_concurrent_batches,
         )
         self.reviews = DedupReviewManager(
             self.db,

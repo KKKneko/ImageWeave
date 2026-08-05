@@ -1508,6 +1508,27 @@ class Database:
             ).fetchone()
         return self.get_crawl_batch(str(row["id"])) if row else None
 
+    def crawl_batch_tick_view(self, batch_id: str) -> dict[str, Any] | None:
+        """返回顺序批次轮询所需的最小状态，不加载地址、探活或审核聚合。"""
+        with self._read() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, cancel_requested, max_tasks, concurrency, output_dir
+                FROM crawl_batches WHERE id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "status": str(row["status"]),
+            "cancel_requested": bool(row["cancel_requested"]),
+            "max_tasks": int(row["max_tasks"]),
+            "concurrency": int(row["concurrency"]),
+            "output_dir": str(row["output_dir"]),
+        }
+
     def get_crawl_batch(self, batch_id: str) -> dict[str, Any] | None:
         with self._read() as conn:
             row = conn.execute(

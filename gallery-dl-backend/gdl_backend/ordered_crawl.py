@@ -8,7 +8,7 @@ from typing import Awaitable, Callable
 from urllib.parse import urlsplit
 
 from .crawl import CrawlPlanError, CrawlPlanner, CrawlUnit
-from .database import Database
+from .database import Database, TERMINAL_BATCH_STATUSES
 from .discovery import DiscoveryError, DiscoveryService
 from .proxy import ProxyPoolAdapter
 from .redaction import redact_text
@@ -54,6 +54,7 @@ class OrderedCrawlManager:
         policy_for: PolicyProvider,
         *,
         poll_interval: float = 0.25,
+        max_concurrent_batches: int = 4,
     ) -> None:
         self.db = database
         self.discovery = discovery
@@ -62,8 +63,12 @@ class OrderedCrawlManager:
         self.proxy = proxy
         self.policy_for = policy_for
         self.poll_interval = max(0.05, float(poll_interval))
+        self.max_concurrent_batches = max(1, int(max_concurrent_batches))
         self._enqueue: EnqueueBatch | None = None
         self._loop_task: asyncio.Task | None = None
+        self._batch_tasks: dict[str, asyncio.Task] = {}
+        self._batch_wakes: dict[str, asyncio.Event] = {}
+        self._site_planning_locks: dict[str, asyncio.Lock] = {}
         self._wake = asyncio.Event()
         self._stopping = False
 
@@ -72,6 +77,8 @@ class OrderedCrawlManager:
 
     def notify(self) -> None:
         self._wake.set()
+        for wake in list(self._batch_wakes.values()):
+            wake.set()
 
     async def start(self) -> None:
         if self._loop_task is not None:
@@ -80,32 +87,72 @@ class OrderedCrawlManager:
             raise RuntimeError("顺序爬取管理器尚未绑定任务入队器")
         self.db.recover_ordered_crawls()
         self._stopping = False
-        self._loop_task = asyncio.create_task(self._loop(), name="ordered-crawl-manager")
+        self._loop_task = asyncio.create_task(
+            self._supervisor_loop(),
+            name="ordered-crawl-supervisor",
+        )
         self._wake.set()
 
     async def stop(self) -> None:
         self._stopping = True
         self._wake.set()
-        if self._loop_task is not None:
-            self._loop_task.cancel()
-            await asyncio.gather(self._loop_task, return_exceptions=True)
-            self._loop_task = None
+        supervisor = self._loop_task
+        if supervisor is not None:
+            supervisor.cancel()
+        batch_tasks = list(self._batch_tasks.values())
+        for task in batch_tasks:
+            task.cancel()
+        await asyncio.gather(
+            *([supervisor] if supervisor is not None else []),
+            *batch_tasks,
+            return_exceptions=True,
+        )
+        self._loop_task = None
+        self._batch_tasks.clear()
+        self._batch_wakes.clear()
+        self._site_planning_locks.clear()
 
     def status(self) -> dict:
         return {
             "running": self._loop_task is not None and not self._stopping,
             "active_batches": len(self.db.active_crawl_batch_ids()),
+            "running_batch_loops": len(self._batch_tasks),
+            "max_concurrent_batches": self.max_concurrent_batches,
+            "site_planning_locked": sorted(
+                site
+                for site, lock in self._site_planning_locks.items()
+                if lock.locked()
+            ),
             "execution_order": "source_then_address",
             "address_parallelism": "media_tasks",
         }
 
-    async def _loop(self) -> None:
+    async def _supervisor_loop(self) -> None:
         while not self._stopping:
             try:
                 self._wake.clear()
-                await self.run_once()
+                batch_ids = await asyncio.to_thread(
+                    self.db.active_crawl_batch_ids
+                )
+                for batch_id in batch_ids:
+                    if self._stopping:
+                        break
+                    if batch_id in self._batch_tasks:
+                        continue
+                    if len(self._batch_tasks) >= self.max_concurrent_batches:
+                        break
+                    wake = asyncio.Event()
+                    self._batch_wakes[batch_id] = wake
+                    task = asyncio.create_task(
+                        self._batch_loop(batch_id),
+                        name=f"ordered-crawl-{batch_id}",
+                    )
+                    self._batch_tasks[batch_id] = task
                 try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=self.poll_interval)
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        timeout=self.poll_interval,
+                    )
                 except asyncio.TimeoutError:
                     pass
             except asyncio.CancelledError:
@@ -113,32 +160,76 @@ class OrderedCrawlManager:
             except Exception:
                 await asyncio.sleep(self.poll_interval)
 
+    async def _batch_loop(self, batch_id: str) -> None:
+        current_task = asyncio.current_task()
+        wake = self._batch_wakes[batch_id]
+        try:
+            while not self._stopping:
+                wake.clear()
+                try:
+                    if not await self._tick_batch(batch_id):
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        wake.wait(),
+                        timeout=self.poll_interval,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if self._batch_tasks.get(batch_id) is current_task:
+                self._batch_tasks.pop(batch_id, None)
+                self._batch_wakes.pop(batch_id, None)
+            if not self._stopping:
+                self._wake.set()
+
     async def run_once(self) -> None:
-        for batch_id in self.db.active_crawl_batch_ids():
+        """兼容测试和调用方的一次推进入口；生产监督循环不经由此方法。"""
+        batch_ids = await asyncio.to_thread(self.db.active_crawl_batch_ids)
+        for batch_id in batch_ids:
             await self._tick_batch(batch_id)
 
-    async def _tick_batch(self, batch_id: str) -> None:
-        batch = self.db.get_crawl_batch(batch_id)
-        if batch is None:
-            return
-        address = self.db.next_crawl_address(batch_id)
+    async def _read_batch_tick_view(self, batch_id: str) -> dict | None:
+        return await asyncio.to_thread(self.db.crawl_batch_tick_view, batch_id)
+
+    @staticmethod
+    def _batch_no_longer_plannable(batch: dict | None) -> bool:
+        return bool(
+            batch is None
+            or batch["cancel_requested"]
+            or batch["status"] in TERMINAL_BATCH_STATUSES
+        )
+
+    async def _tick_batch(self, batch_id: str) -> bool:
+        batch = await self._read_batch_tick_view(batch_id)
+        if batch is None or batch["status"] in TERMINAL_BATCH_STATUSES:
+            return False
+        address = await asyncio.to_thread(self.db.next_crawl_address, batch_id)
         if batch["cancel_requested"]:
             if address and address["status"] == "running":
-                for task in self.db.crawl_address_tasks(address["id"]):
+                tasks = await asyncio.to_thread(
+                    self.db.crawl_address_tasks,
+                    address["id"],
+                )
+                for task in tasks:
                     if task["status"] not in {"succeeded", "failed", "cancelled"}:
                         await self.scheduler.cancel(task["id"])
                 self.db.finish_crawl_address_if_terminal(address["id"])
-            self.db.finish_crawl_batch_if_ready(batch_id)
-            return
+            return not self.db.finish_crawl_batch_if_ready(batch_id)
         if address is None:
-            self.db.finish_crawl_batch_if_ready(batch_id)
-            return
+            return not self.db.finish_crawl_batch_if_ready(batch_id)
         if address["status"] == "pending":
             await self._activate_address(batch, address)
-            return
+            return True
         if address["status"] == "running":
             if self.db.finish_crawl_address_if_terminal(address["id"]):
-                self.db.finish_crawl_batch_if_ready(batch_id)
+                return not self.db.finish_crawl_batch_if_ready(batch_id)
+        return True
 
     async def _activate_address(self, batch: dict, address: dict) -> None:
         if self._enqueue is None:
@@ -174,19 +265,25 @@ class OrderedCrawlManager:
                     "crawl_plan_too_large",
                     f"批次媒体任务达到 max_tasks={batch['max_tasks']}",
                 )
-            policy = await self._probe_address_policy(
-                address,
-                self.policy_for(address["site"]),
-            )
-            latest = self.db.get_crawl_batch(batch["id"])
-            if latest is None or latest["cancel_requested"]:
-                return
-            units, skipped_count = await self._plan_address(
-                address,
-                batch_id=batch["id"],
-                policy=policy,
-                max_tasks=remaining,
-            )
+            base_policy = self.policy_for(address["site"])
+            site = str(address["site"])
+            planning_lock = self._site_planning_locks.get(site)
+            if planning_lock is None:
+                planning_lock = asyncio.Lock()
+                self._site_planning_locks[site] = planning_lock
+            async with planning_lock:
+                policy = await self._probe_address_policy(address, base_policy)
+                # 探活与发现之间只做一次轻量取消视图检查；同站临界区仍连续，
+                # 且会在任何去重或分块入队开始前释放。
+                latest = await self._read_batch_tick_view(batch["id"])
+                if self._batch_no_longer_plannable(latest):
+                    return
+                units, skipped_count = await self._plan_address(
+                    address,
+                    batch_id=batch["id"],
+                    policy=policy,
+                    max_tasks=remaining,
+                )
             self.db.set_crawl_address_pre_dedup_skipped_count(
                 address["id"],
                 skipped_count,
@@ -207,8 +304,8 @@ class OrderedCrawlManager:
                     f"该地址媒体数超过批次剩余额度 {remaining}",
                 )
 
-            latest = self.db.get_crawl_batch(batch["id"])
-            if latest is None or latest["cancel_requested"]:
+            latest = await self._read_batch_tick_view(batch["id"])
+            if self._batch_no_longer_plannable(latest):
                 return
             address_output = (
                 Path(batch["output_dir"])
@@ -217,7 +314,10 @@ class OrderedCrawlManager:
             )
             for chunk_start in range(0, len(deduplicated), _ENQUEUE_CHUNK_SIZE):
                 # 热路径每块只读取一次取消标记，避免按媒体单元重复查询。
-                cancelled = self.db.crawl_batch_cancel_requested(batch["id"])
+                cancelled = await asyncio.to_thread(
+                    self.db.crawl_batch_cancel_requested,
+                    batch["id"],
+                )
                 if cancelled is None or cancelled:
                     await cancel_linked()
                     return
@@ -280,13 +380,13 @@ class OrderedCrawlManager:
                 if len(chunk_results) != len(bodies):
                     raise RuntimeError("批量任务入队返回数量不匹配")
                 await asyncio.sleep(0)
-            latest = self.db.get_crawl_batch(batch["id"])
-            if latest is None or latest["cancel_requested"]:
+            latest = await self._read_batch_tick_view(batch["id"])
+            if self._batch_no_longer_plannable(latest):
                 await cancel_linked()
                 return
             if not self.db.mark_crawl_address_running(address["id"]):
-                latest = self.db.get_crawl_batch(batch["id"])
-                if latest is not None and not latest["cancel_requested"]:
+                latest = await self._read_batch_tick_view(batch["id"])
+                if not self._batch_no_longer_plannable(latest):
                     raise RuntimeError("媒体任务已创建，但地址状态切换失败")
             self.scheduler.notify()
         except asyncio.CancelledError:
@@ -309,8 +409,8 @@ class OrderedCrawlManager:
             raise
         except Exception as exc:
             await cancel_linked()
-            latest = self.db.get_crawl_batch(batch["id"])
-            if latest is not None and not latest["cancel_requested"]:
+            latest = await self._read_batch_tick_view(batch["id"])
+            if not self._batch_no_longer_plannable(latest):
                 error = redact_text(exc, limit=2000)
                 if linked_tasks and self.db.mark_crawl_address_running(
                     address["id"],

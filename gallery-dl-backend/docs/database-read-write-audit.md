@@ -37,6 +37,7 @@
 | `update_artifacts` | 写 | 否 | 产物计数更新属于单一写连接路径。 |
 | `create_crawl_batch` | 读写混合 | 否 | 幂等检查与批次、地址创建必须在同一写事务内完成。 |
 | `get_crawl_batch_by_idempotency` | 读 | 是 | — |
+| `crawl_batch_tick_view` | 读 | 是 | — |
 | `get_crawl_batch` | 读 | 是 | — |
 | `list_crawl_batches` | 读 | 是 | — |
 | `get_crawl_review` | 读 | 是 | — |
@@ -109,14 +110,8 @@
 | 模块 | 调用上下文 | 数据库读方法 | 典型数据量 |
 | --- | --- | --- | --- |
 | `ordered_crawl.py` | `status()`；由异步 `/readyz` 与调度诊断 handler 在事件循环上取快照 | `active_crawl_batch_ids` | 返回全部活跃批次 ID，通常为 0 至少量批次，随排队/运行/取消中批次数增长。 |
-| `ordered_crawl.py` | `run_once()` 每轮扫描活跃批次 | `active_crawl_batch_ids` | 返回全部活跃批次 ID；每个轮询周期 1 次。 |
-| `ordered_crawl.py` | `_tick_batch()` 加载轮询视图 | `get_crawl_batch` | 1 个批次，但会加载该批次全部地址、代理探测关联和审核汇总；通常数个至数十个地址，随批次地址数增长。 |
-| `ordered_crawl.py` | `_tick_batch()` 选择当前地址 | `next_crawl_address` | 至多 1 条地址记录。 |
-| `ordered_crawl.py` | `_tick_batch()` 取消分支枚举当前地址任务 | `crawl_address_tasks` | 当前地址全部已链接媒体任务；单地址可接近批次 `max_tasks`（默认 10,000，配置上限 100,000）。 |
 | `ordered_crawl.py` | `_activate_address()` 计算重新规划预算 | `crawl_address_task_count` | 1 个标量计数，扫描当前地址的任务链接。 |
 | `ordered_crawl.py` | `_activate_address()` 计算批次剩余额度 | `crawl_batch_task_count` | 1 个标量计数，扫描批次全部任务链接；默认规模上限 10,000。 |
-| `ordered_crawl.py` | `_activate_address()` 在探活后、规划后、入队后、状态切换失败及异常路径复核取消状态 | `get_crawl_batch` | 每次返回 1 个完整批次聚合视图；单次地址激活路径最多调用 5 次。 |
-| `ordered_crawl.py` | `_activate_address()` 每个媒体分块入队前检查取消标记 | `crawl_batch_cancel_requested` | 每次 1 个布尔标量；块大小固定为 50，默认最多约 200 次/批次。 |
 | `ordered_crawl.py` | `_plan_address()` 计算跨站预去重发现余量 | `succeeded_danbooru_source_key_count` | 1 个标量计数，扫描本批次已成功的 Danbooru 来源键。 |
 | `ordered_crawl.py` | `_plan_address()` 直接调用同步 `_filter_previously_downloaded_danbooru_sources()` | `succeeded_danbooru_source_keys` | 候选来源键按 500 个分块查询；常见可到批次媒体规模（默认 `max_tasks=10,000`）。 |
 | `scheduler.py` | `start()` 启动恢复前读取遗留进程 | `incomplete_processes` | 全部 `starting/running/cancelling` 任务；正常运行通常不超过全局并发默认值 20，崩溃恢复时可能包含遗留行。 |
@@ -127,10 +122,10 @@
 | `review.py` | `run_once()` 轮询严格自动处置队列 | `next_crawl_review_automatic` | 至多 1 条审核批次记录。 |
 | `review.py` | `run_once()` 写入 manifest 后读取审核状态 | `get_crawl_review` | 1 条审核记录，并聚合扫描该批次全部审核图片与组；规模随批次图片数增长。 |
 
-明确排除的现有线程路径：`scheduler.py` 的 `queued_task_ids()` 已通过 `asyncio.to_thread` 调用；`review.py` 的 `_apply_automatic_rejections()` 在两个生产分支均整体下线程，手动 `apply()` 也由 `app.py` 通过 `asyncio.to_thread` 调用，因此其中的 `crawl_review_automatic_images()`、`get_crawl_batch()` 与 `crawl_review_apply_images()` 不属于“仍在事件循环上”的同步读。
+明确排除的现有线程路径：`ordered_crawl.py` 的监督循环与兼容 `run_once()` 均通过 `asyncio.to_thread` 调用 `active_crawl_batch_ids()`；`_tick_batch()` 的 `crawl_batch_tick_view()`、`next_crawl_address()`、取消分支 `crawl_address_tasks()`，以及 `_activate_address()` 的全部 `crawl_batch_tick_view()` 和每块一次 `crawl_batch_cancel_requested()` 也都在线程中执行。轮询不再调用会聚合全部地址、探活与审核信息的 `get_crawl_batch()`。`scheduler.py` 的 `queued_task_ids()` 已通过 `asyncio.to_thread` 调用；`review.py` 的 `_apply_automatic_rejections()` 在两个生产分支均整体下线程，手动 `apply()` 也由 `app.py` 通过 `asyncio.to_thread` 调用，因此其中的 `crawl_review_automatic_images()`、`get_crawl_batch()` 与 `crawl_review_apply_images()` 不属于“仍在事件循环上的同步读”。
 
 ## T6 收尾结论
 
 T5 留下的 8 个长尾纯读方法均已迁移到 `_read()`：`queued_task_ids`、`get_crawl_batch_by_idempotency`、`next_crawl_review_automatic`、`crawl_review_apply_images`、`crawl_review_automatic_images`、`next_crawl_address`、`succeeded_danbooru_source_keys`、`succeeded_danbooru_source_key_count`。
 
-最终审计覆盖全部 79 个公开方法，其中 31 个纯读方法全部使用 `_read()`；19 个纯写方法和 29 个读写混合/连接生命周期方法均在各自 `def` 紧邻上方保留一行中文原因注释。`tests/test_database.py` 的 `test_read_methods_do_not_take_write_lock` 使用 `inspect.getsource()` 检查全部纯读方法不引用 `self._lock`，模块级例外名单为 `frozenset` 且当前为空。
+最终审计覆盖全部 80 个公开方法，其中 32 个纯读方法全部使用 `_read()`；19 个纯写方法和 29 个读写混合/连接生命周期方法均在各自 `def` 紧邻上方保留一行中文原因注释。`tests/test_database.py` 的 `test_read_methods_do_not_take_write_lock` 使用 `inspect.getsource()` 检查全部纯读方法不引用 `self._lock`，模块级例外名单为 `frozenset` 且当前为空。

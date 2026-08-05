@@ -232,6 +232,7 @@ class ProxySettings:
 @dataclass(slots=True)
 class SchedulerSettings:
     max_concurrent_tasks: int = 20
+    max_concurrent_batches: int = 4
     poll_interval_seconds: float = 0.5
     shutdown_grace_seconds: float = 15.0
     max_logs_per_task: int = 5000
@@ -394,6 +395,9 @@ class AppSettings:
         )
         scheduler = SchedulerSettings(
             max_concurrent_tasks=max(1, int(scheduler_data.get("max_concurrent_tasks", 20))),
+            max_concurrent_batches=int(
+                scheduler_data.get("max_concurrent_batches", 4)
+            ),
             poll_interval_seconds=max(0.1, float(scheduler_data.get("poll_interval_seconds", 0.5))),
             shutdown_grace_seconds=max(1.0, float(scheduler_data.get("shutdown_grace_seconds", 15.0))),
             max_logs_per_task=max(100, int(scheduler_data.get("max_logs_per_task", 5000))),
@@ -510,6 +514,8 @@ class AppSettings:
             raise ValueError("proxy.transport_core_base_port 必须位于 1024..65000")
         if self.proxy.transport_core_start_timeout_seconds <= 0:
             raise ValueError("proxy.transport_core_start_timeout_seconds 必须大于 0")
+        if not 1 <= int(self.scheduler.max_concurrent_batches) <= 16:
+            raise ValueError("scheduler.max_concurrent_batches 必须位于 1..16")
         if self.dedup.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("dedup.device 必须是 auto、cpu 或 cuda")
         resource_limits = {

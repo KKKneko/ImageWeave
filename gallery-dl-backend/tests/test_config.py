@@ -132,6 +132,47 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.proxy.transport_core_binary, (root / "bin" / "mihomo").resolve())
         self.assertEqual(settings.proxy.transport_core_sha256, "1" * 64)
 
+    def test_max_concurrent_batches_defaults_to_four_and_is_public(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_dir": "runtime",
+                        "database_path": "runtime/backend.sqlite3",
+                        "default_output_root": "runtime/downloads",
+                        "scheduler": {"max_concurrent_batches": 7},
+                        "dedup": {"enabled": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            configured = AppSettings.load(config_path)
+            defaults = AppSettings.load(root / "missing-config.json")
+
+        self.assertEqual(defaults.scheduler.max_concurrent_batches, 4)
+        self.assertEqual(
+            defaults.public_dict()["scheduler"]["max_concurrent_batches"],
+            4,
+        )
+        self.assertEqual(configured.scheduler.max_concurrent_batches, 7)
+        self.assertEqual(
+            configured.public_dict()["scheduler"]["max_concurrent_batches"],
+            7,
+        )
+
+    def test_max_concurrent_batches_rejects_values_outside_one_to_sixteen(self):
+        for value in (0, 17):
+            with self.subTest(value=value):
+                settings = AppSettings()
+                settings.scheduler.max_concurrent_batches = value
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"scheduler\.max_concurrent_batches.*1\.\.16",
+                ):
+                    settings.validate()
+
     def test_retry_backoff_cap_default_is_five_minutes(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = AppSettings.load(Path(temporary) / "missing-config.json")

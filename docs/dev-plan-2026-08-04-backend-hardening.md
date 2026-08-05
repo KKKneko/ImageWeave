@@ -962,17 +962,17 @@ LEFT JOIN 代理探活 + review + 在 Python 侧重新分组。批次并行后�
 
 ### 验收标准
 
-- [ ] H1 `scheduler.max_concurrent_batches` 默认 4，校验 1..16。
-- [ ] H2 每个活跃批次一个独立 `asyncio.Task`，监督循环只负责投放与回收。
-- [ ] H3 同一 site 的 `_probe_address_policy` + `_plan_address` 串行；不同 site 并行。
-- [ ] H4 站点锁不覆盖入队循环。
-- [ ] H5 单批次异常不影响其他批次与监督循环。
-- [ ] H6 `stop()` 完整 cancel 并 await 所有批次 Task；`CancelledError` 分支行为未变。
-- [ ] H7 `notify()` 唤醒监督循环与全部批次循环。
-- [ ] H8 轮询路径已改用 `crawl_batch_tick_view`，`get_crawl_batch` 仅用于 HTTP。
-- [ ] H9 `status()` 保留原有键并新增 3 个并行可观测键。
-- [ ] H10 测试 4（站点下载并发上限）与测试 2（同站发现串行）必须通过。
-- [ ] H11 上述测试要求的行为契约已被覆盖（数量不作硬性要求），其中同站发现串行与
+- [x] H1 `scheduler.max_concurrent_batches` 默认 4，校验 1..16。
+- [x] H2 每个活跃批次一个独立 `asyncio.Task`，监督循环只负责投放与回收。
+- [x] H3 同一 site 的 `_probe_address_policy` + `_plan_address` 串行；不同 site 并行。
+- [x] H4 站点锁不覆盖入队循环。
+- [x] H5 单批次异常不影响其他批次与监督循环。
+- [x] H6 `stop()` 完整 cancel 并 await 所有批次 Task；`CancelledError` 分支行为未变。
+- [x] H7 `notify()` 唤醒监督循环与全部批次循环。
+- [x] H8 轮询路径已改用 `crawl_batch_tick_view`，`get_crawl_batch` 仅用于 HTTP。
+- [x] H9 `status()` 保留原有键并新增 3 个并行可观测键。
+- [x] H10 测试 4（站点下载并发上限）与测试 2（同站发现串行）必须通过。
+- [x] H11 上述测试要求的行为契约已被覆盖（数量不作硬性要求），其中同站发现串行与
       站点下载并发上限两条不可省略；新增测试全绿，288 个基线测试全绿。
 
 ---

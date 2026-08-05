@@ -22,6 +22,7 @@ PURE_READ_METHODS = frozenset(
         "get_logs",
         "get_events",
         "get_crawl_batch_by_idempotency",
+        "crawl_batch_tick_view",
         "get_crawl_batch",
         "list_crawl_batches",
         "get_crawl_review",
@@ -596,6 +597,31 @@ class DatabaseTests(unittest.TestCase):
             "SELECT attempt_id FROM leases WHERE task_id=?", ("task-1",)
         ).fetchone()
         self.assertIsNone(remaining)
+
+    def test_crawl_batch_tick_view_returns_only_poll_fields(self):
+        self.assertIsNone(self.db.crawl_batch_tick_view("missing"))
+        batch_id, created = self.db.create_crawl_batch(
+            {
+                "id": "batch-tick-view",
+                "output_dir": str(self.root / "batch-tick-view"),
+                "concurrency": 3,
+                "max_tasks": 123,
+            },
+            crawl_address_values("batch-tick-view"),
+        )
+        self.assertTrue(created)
+
+        self.assertEqual(
+            self.db.crawl_batch_tick_view(batch_id),
+            {
+                "id": "batch-tick-view",
+                "status": "queued",
+                "cancel_requested": False,
+                "max_tasks": 123,
+                "concurrency": 3,
+                "output_dir": str(self.root / "batch-tick-view"),
+            },
+        )
 
     def test_ordered_crawl_batch_persists_order_links_and_idempotency(self):
         addresses = [
