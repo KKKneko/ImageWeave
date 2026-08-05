@@ -93,9 +93,6 @@ cd ImageWeave
 ```bash
 git submodule update --init --recursive
 ```
-
-`gallery-dl-codeberg/` 是上游 gallery-dl submodule，不应直接混入项目私有修改。
-
 ## Linux 部署
 
 以下命令均在仓库根目录执行。
