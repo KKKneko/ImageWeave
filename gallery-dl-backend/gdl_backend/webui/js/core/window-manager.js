@@ -169,8 +169,8 @@ export function createWindowManager({
     const interaction = instance.interaction;
     if (!interaction) return false;
     if (event && event.pointerId !== interaction.pointerId) return false;
+    // 先清空交互对象，releasePointerCapture 紧随触发的 lostpointercapture 才会幂等退出。
     instance.interaction = null;
-    instance.element.removeAttribute("data-window-interacting");
     try {
       if (interaction.control.hasPointerCapture?.(interaction.pointerId)) {
         interaction.control.releasePointerCapture(interaction.pointerId);
@@ -180,18 +180,23 @@ export function createWindowManager({
     }
 
     const record = recordFor(instance.appId);
-    if (
-      commit
-      && record
-      && record.windowState !== "minimized"
-      && !isEffectivelyMaximized(record)
-      && !sameRect(interaction.rect, record.rect)
-    ) {
-      actions.moveWindow(instance.appId, interaction.rect);
-    } else if (record && !destroying) {
-      applyRect(instance.element, displayedRect(record));
+    try {
+      if (
+        commit
+        && record
+        && record.windowState !== "minimized"
+        && !isEffectivelyMaximized(record)
+        && !sameRect(interaction.rect, record.rect)
+      ) {
+        // 保持交互样式直至同步渲染完成，避免最终矩形参与恢复后的 transition。
+        actions.moveWindow(instance.appId, interaction.rect);
+      } else if (record && !destroying) {
+        applyRect(instance.element, displayedRect(record));
+      }
+    } finally {
+      instance.element.removeAttribute("data-window-interacting");
+      actions.endWindowInteraction?.();
     }
-    actions.endWindowInteraction?.();
     return true;
   };
 

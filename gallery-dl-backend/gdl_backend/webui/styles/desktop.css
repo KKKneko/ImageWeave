@@ -335,7 +335,6 @@
 }
 
 .application-window[data-window-interacting] {
-  animation: none;
   transition: none;
 }
 

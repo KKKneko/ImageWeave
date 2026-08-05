@@ -159,7 +159,10 @@ import {
   nextRectForResize,
 } from "../gdl_backend/webui/js/core/window-geometry.js";
 import { describeApplicationLaunchers } from "../gdl_backend/webui/js/core/desktop.js";
-import { deriveWindowViews } from "../gdl_backend/webui/js/core/window-manager.js";
+import {
+  createWindowManager,
+  deriveWindowViews,
+} from "../gdl_backend/webui/js/core/window-manager.js";
 import {
   createStorageService,
   isValidBatchId,
@@ -282,6 +285,302 @@ class FakeMediaQueryList {
     this.matches = matches;
     for (const listener of [...this.listeners]) listener({ matches });
   }
+}
+
+class FakeDomNode {
+  constructor(nodeName = "") {
+    this.nodeName = nodeName;
+    this.parentNode = null;
+    this.children = [];
+    this.listeners = new Map();
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  emit(type, init = {}) {
+    const event = {
+      type,
+      button: 0,
+      isPrimary: true,
+      pointerId: 1,
+      clientX: 0,
+      clientY: 0,
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      ...init,
+    };
+    if (!("target" in init)) event.target = this;
+    event.currentTarget = this;
+    for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
+    return event;
+  }
+
+  append(...items) {
+    for (const item of items) {
+      if (item instanceof FakeDomDocumentFragment) {
+        const fragmentChildren = [...item.children];
+        item.children.length = 0;
+        for (const child of fragmentChildren) this.append(child);
+        continue;
+      }
+      const child = item instanceof FakeDomNode ? item : new FakeDomTextNode(String(item));
+      child.remove();
+      child.parentNode = this;
+      this.children.push(child);
+    }
+  }
+
+  replaceChildren(...items) {
+    for (const child of this.children) child.parentNode = null;
+    this.children.length = 0;
+    this.append(...items);
+  }
+
+  remove() {
+    if (!this.parentNode) return;
+    const index = this.parentNode.children.indexOf(this);
+    if (index >= 0) this.parentNode.children.splice(index, 1);
+    this.parentNode = null;
+  }
+
+  contains(candidate) {
+    if (candidate === this) return true;
+    return this.children.some((child) => child.contains(candidate));
+  }
+
+  querySelector(selector) {
+    for (const child of this.children) {
+      if (child instanceof FakeDomElement && child.matches(selector)) return child;
+      const nested = child.querySelector(selector);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  get firstElementChild() {
+    return this.children.find((child) => child instanceof FakeDomElement) || null;
+  }
+}
+
+class FakeDomTextNode extends FakeDomNode {
+  constructor(textContent) {
+    super("#text");
+    this.textContent = textContent;
+  }
+}
+
+class FakeDomDocumentFragment extends FakeDomNode {
+  constructor() {
+    super("#document-fragment");
+  }
+}
+
+function datasetNameForAttribute(name) {
+  return name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+class FakeDomElement extends FakeDomNode {
+  constructor(tagName = "div") {
+    super(tagName.toUpperCase());
+    this.tagName = tagName.toUpperCase();
+    this.attributes = new Map();
+    this.dataset = {};
+    this.className = "";
+    this.textContent = "";
+    this.title = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.tabIndex = 0;
+    this.pointerCaptures = new Set();
+    const styleValues = {};
+    this.style = new Proxy(styleValues, {
+      set: (target, property, value) => {
+        target[property] = String(value);
+        this.onStyleWrite?.(String(property), String(value));
+        return true;
+      },
+    });
+  }
+
+  setAttribute(name, value) {
+    const normalized = String(value);
+    this.attributes.set(name, normalized);
+    if (name === "hidden") this.hidden = true;
+    if (name.startsWith("data-")) this.dataset[datasetNameForAttribute(name)] = normalized;
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  hasAttribute(name) {
+    return this.attributes.has(name);
+  }
+
+  removeAttribute(name) {
+    const existed = this.attributes.delete(name);
+    if (name === "hidden") this.hidden = false;
+    if (name.startsWith("data-")) delete this.dataset[datasetNameForAttribute(name)];
+    if (existed) this.onAttributeRemove?.(name);
+  }
+
+  toggleAttribute(name, force) {
+    const enabled = force === undefined ? !this.hasAttribute(name) : force === true;
+    if (enabled) this.setAttribute(name, "");
+    else this.removeAttribute(name);
+    return enabled;
+  }
+
+  matches(selector) {
+    if (selector === "button") return this.tagName === "BUTTON";
+    const match = /^\[([a-z0-9-]+)(?:="([^"]*)")?\]$/i.exec(selector);
+    if (!match) return false;
+    if (!this.hasAttribute(match[1])) return false;
+    return match[2] === undefined || this.getAttribute(match[1]) === match[2];
+  }
+
+  closest(selector) {
+    let current = this;
+    while (current instanceof FakeDomElement) {
+      if (current.matches(selector)) return current;
+      current = current.parentNode;
+    }
+    return null;
+  }
+
+  focus() {
+    this.focused = true;
+  }
+
+  setPointerCapture(pointerId) {
+    this.pointerCaptures.add(pointerId);
+  }
+
+  hasPointerCapture(pointerId) {
+    return this.pointerCaptures.has(pointerId);
+  }
+
+  releasePointerCapture(pointerId) {
+    if (!this.pointerCaptures.delete(pointerId)) return;
+    this.emit("lostpointercapture", { pointerId });
+  }
+
+  set innerHTML(value) {
+    this._innerHTML = String(value);
+    this.replaceChildren();
+    if (this._innerHTML.includes("<svg")) this.append(new FakeDomSvgElement("svg"));
+  }
+
+  get innerHTML() {
+    return this._innerHTML || "";
+  }
+}
+
+class FakeDomHtmlElement extends FakeDomElement {}
+class FakeDomHtmlButtonElement extends FakeDomHtmlElement {}
+class FakeDomSvgElement extends FakeDomElement {}
+
+class FakeDomDocument extends FakeDomNode {
+  constructor() {
+    super("#document");
+    this.documentElement = new FakeDomHtmlElement("html");
+    this.documentElement.clientWidth = 1_200;
+    this.documentElement.clientHeight = 800;
+  }
+
+  createElement(tagName) {
+    return tagName.toLowerCase() === "button"
+      ? new FakeDomHtmlButtonElement(tagName)
+      : new FakeDomHtmlElement(tagName);
+  }
+}
+
+function createFakeWindowFragment() {
+  const fragment = new FakeDomDocumentFragment();
+  const windowElement = new FakeDomHtmlElement("section");
+  windowElement.setAttribute("data-application-window", "");
+  const titlebar = new FakeDomHtmlElement("header");
+  titlebar.setAttribute("data-window-titlebar", "");
+  const title = new FakeDomHtmlElement("strong");
+  title.setAttribute("data-window-title", "");
+  titlebar.append(title);
+  for (const name of ["minimize", "maximize", "close"]) {
+    const button = new FakeDomHtmlButtonElement("button");
+    button.setAttribute(`data-window-${name}`, "");
+    titlebar.append(button);
+  }
+  const body = new FakeDomHtmlElement("main");
+  body.setAttribute("data-window-body", "");
+  windowElement.append(titlebar, body);
+  for (const direction of ["right", "bottom", "corner"]) {
+    const handle = new FakeDomHtmlButtonElement("button");
+    handle.setAttribute("data-window-resize", direction);
+    windowElement.append(handle);
+  }
+  fragment.append(windowElement);
+  return fragment;
+}
+
+function installWindowManagerDomFixture() {
+  const previous = new Map();
+  const install = (name, value) => {
+    previous.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      writable: true,
+      value,
+    });
+  };
+
+  const documentObject = new FakeDomDocument();
+  const mobileViewport = new FakeMediaQueryList(false);
+  const windowObject = new FakeDomNode("window");
+  windowObject.innerWidth = 1_200;
+  windowObject.innerHeight = 800;
+  windowObject.matchMedia = () => mobileViewport;
+  const windowLayer = new FakeDomHtmlElement("div");
+  const taskList = new FakeDomHtmlElement("div");
+  const windowTemplate = {
+    content: {
+      cloneNode() {
+        return createFakeWindowFragment();
+      },
+    },
+  };
+
+  install("Node", FakeDomNode);
+  install("Element", FakeDomElement);
+  install("HTMLElement", FakeDomHtmlElement);
+  install("HTMLButtonElement", FakeDomHtmlButtonElement);
+  install("SVGElement", FakeDomSvgElement);
+  install("document", documentObject);
+  install("window", windowObject);
+  install("getComputedStyle", () => ({
+    getPropertyValue(name) {
+      return name === "--imageweave-taskbar-height" ? "40px" : "";
+    },
+  }));
+
+  return Object.freeze({
+    windowLayer,
+    taskList,
+    windowTemplate,
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete globalThis[name];
+      }
+    },
+  });
 }
 
 class FakeRootElement {
@@ -1162,6 +1461,179 @@ test("maximized 只改变窗口状态，恢复后保留最大化前 rect", () =>
   assert.deepEqual(store.getState().ui.windows[0].rect, rect);
   store.dispatch(actionCreators.windowStateChanged("crawl", "normal"));
   assert.deepEqual(store.getState().ui.windows[0], windowRecord("crawl", "normal", rect));
+});
+
+test("窗口指针收尾在交互样式内同步最终矩形且重复结束幂等", () => {
+  const fixture = installWindowManagerDomFixture();
+  const initialRect = windowRect();
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [windowRecord("crawl", "normal", initialRect)],
+    }),
+    reportError: () => {},
+  });
+  const moveCalls = [];
+  let beginCount = 0;
+  let endCount = 0;
+  let completionEvents = null;
+  let windowElement = null;
+  let manager = null;
+  const actions = {
+    beginWindowInteraction() {
+      beginCount += 1;
+      return true;
+    },
+    endWindowInteraction() {
+      endCount += 1;
+      completionEvents?.push([
+        "end",
+        windowElement.hasAttribute("data-window-interacting"),
+      ]);
+      return true;
+    },
+    moveWindow(appId, rect) {
+      const snapshot = { ...rect };
+      moveCalls.push([appId, snapshot]);
+      completionEvents?.push([
+        "move-before",
+        windowElement.hasAttribute("data-window-interacting"),
+      ]);
+      store.dispatch(actionCreators.windowMoved(appId, snapshot));
+      completionEvents?.push([
+        "move-after",
+        windowElement.hasAttribute("data-window-interacting"),
+        {
+          left: windowElement.style.left,
+          top: windowElement.style.top,
+          width: windowElement.style.width,
+          height: windowElement.style.height,
+        },
+      ]);
+      return true;
+    },
+    focusWindow() { return false; },
+    minimizeWindow() { return false; },
+    restoreWindow() { return false; },
+    closeWindow() { return false; },
+    toggleWindowMaximized() { return false; },
+  };
+
+  const finishAndAssert = (control, eventType, pointerId, finalRect) => {
+    completionEvents = [];
+    windowElement.onStyleWrite = (property) => {
+      if (!["left", "top", "width", "height"].includes(property)) return;
+      completionEvents.push([
+        `sync-${property}`,
+        windowElement.hasAttribute("data-window-interacting"),
+      ]);
+    };
+    windowElement.onAttributeRemove = (name) => {
+      if (name === "data-window-interacting") completionEvents.push(["remove-style"]);
+    };
+
+    control.emit(eventType, { pointerId });
+    // 浏览器可在 pointerup/pointercancel 后继续派发 lostpointercapture。
+    control.emit("lostpointercapture", { pointerId });
+
+    const moveBefore = completionEvents.findIndex(([event]) => event === "move-before");
+    const moveAfter = completionEvents.findIndex(([event]) => event === "move-after");
+    const removeStyle = completionEvents.findIndex(([event]) => event === "remove-style");
+    assert.equal(moveBefore >= 0, true);
+    assert.equal(moveAfter > moveBefore, true);
+    assert.equal(removeStyle > moveAfter, true, "最终 store/DOM 同步必须先于交互样式解除");
+    assert.equal(completionEvents[moveBefore][1], true);
+    assert.equal(completionEvents[moveAfter][1], true);
+    assert.deepEqual(completionEvents[moveAfter][2], {
+      left: `${finalRect.x}px`,
+      top: `${finalRect.y}px`,
+      width: `${finalRect.w}px`,
+      height: `${finalRect.h}px`,
+    });
+    const syncEvents = completionEvents.filter(([event]) => event.startsWith("sync-"));
+    assert.equal(syncEvents.length, 4);
+    assert.equal(syncEvents.every(([, interacting]) => interacting === true), true);
+    assert.deepEqual(completionEvents.at(-1), ["end", false]);
+    assert.equal(windowElement.hasAttribute("data-window-interacting"), false);
+    assert.deepEqual(selectors.windowStack(store.getState())[0].rect, finalRect);
+    assert.deepEqual({
+      left: windowElement.style.left,
+      top: windowElement.style.top,
+      width: windowElement.style.width,
+      height: windowElement.style.height,
+    }, {
+      left: `${finalRect.x}px`,
+      top: `${finalRect.y}px`,
+      width: `${finalRect.w}px`,
+      height: `${finalRect.h}px`,
+    });
+    windowElement.onStyleWrite = null;
+    windowElement.onAttributeRemove = null;
+    completionEvents = null;
+  };
+
+  try {
+    manager = createWindowManager({
+      windowLayer: fixture.windowLayer,
+      windowTemplate: fixture.windowTemplate,
+      taskList: fixture.taskList,
+      store,
+      actions,
+    });
+    windowElement = fixture.windowLayer.querySelector("[data-application-window]");
+    const titlebar = windowElement.querySelector("[data-window-titlebar]");
+
+    titlebar.emit("pointerdown", {
+      pointerId: 7,
+      clientX: 100,
+      clientY: 100,
+    });
+    assert.equal(windowElement.getAttribute("data-window-interacting"), "drag");
+    titlebar.emit("pointermove", { pointerId: 7, clientX: 125, clientY: 117 });
+    titlebar.emit("pointermove", { pointerId: 7, clientX: 130, clientY: 120 });
+    const draggedRect = { x: 78, y: 56, w: 720, h: 480 };
+    assert.equal(moveCalls.length, 0, "高频 pointermove 不得提交 store");
+    assert.deepEqual(selectors.windowStack(store.getState())[0].rect, initialRect);
+    assert.equal(windowElement.style.left, `${draggedRect.x}px`);
+    assert.equal(windowElement.style.top, `${draggedRect.y}px`);
+    finishAndAssert(titlebar, "pointerup", 7, draggedRect);
+    assert.equal(moveCalls.length, 1, "pointerup 与 lostpointercapture 只能提交一次");
+
+    const resize = windowElement.querySelector('[data-window-resize="corner"]');
+    resize.emit("pointerdown", {
+      pointerId: 11,
+      clientX: 300,
+      clientY: 300,
+    });
+    assert.equal(windowElement.getAttribute("data-window-interacting"), "resize");
+    resize.emit("pointermove", { pointerId: 11, clientX: 340, clientY: 330 });
+    const resizedRect = { x: 78, y: 56, w: 760, h: 510 };
+    assert.equal(moveCalls.length, 1, "缩放 pointermove 同样不得提交 store");
+    assert.deepEqual(selectors.windowStack(store.getState())[0].rect, draggedRect);
+    finishAndAssert(resize, "pointercancel", 11, resizedRect);
+    assert.equal(moveCalls.length, 2, "pointercancel 与 lostpointercapture 只能提交一次");
+
+    titlebar.emit("pointerdown", {
+      pointerId: 13,
+      clientX: 50,
+      clientY: 50,
+    });
+    titlebar.emit("pointermove", { pointerId: 13, clientX: 40, clientY: 55 });
+    const captureLostRect = { x: 68, y: 61, w: 760, h: 510 };
+    assert.equal(moveCalls.length, 2, "lostpointercapture 前仍不得提前提交");
+    assert.deepEqual(selectors.windowStack(store.getState())[0].rect, resizedRect);
+    finishAndAssert(titlebar, "lostpointercapture", 13, captureLostRect);
+    assert.equal(moveCalls.length, 3, "lostpointercapture 重入只能提交一次");
+
+    assert.deepEqual(moveCalls, [
+      ["crawl", draggedRect],
+      ["crawl", resizedRect],
+      ["crawl", captureLostRect],
+    ]);
+    assert.deepEqual([beginCount, endCount], [3, 3]);
+  } finally {
+    manager?.destroy();
+    fixture.restore();
+  }
 });
 
 test("布局防抖在交互期间不写 storage，destroy 会落定最终 rect", () => {

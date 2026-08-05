@@ -598,6 +598,55 @@ class WebUiModuleTests(unittest.TestCase):
             encoding="utf-8"
         )
 
+        def css_block(source: str, selector: str) -> str:
+            match = re.search(
+                rf"(?m)^\s*{re.escape(selector)}\s*\{{",
+                source,
+            )
+            self.assertIsNotNone(match, selector)
+            opening = source.index("{", match.start())
+            closing = source.index("}", opening)
+            return source[opening + 1 : closing]
+
+        # 入场动画只由窗口基础规则声明；交互属性只切换 transition，
+        # 否则从 animation:none 恢复名称会把已结束的入场动画重新启动。
+        application_window = css_block(desktop_css, ".application-window")
+        interacting_window = css_block(
+            desktop_css,
+            ".application-window[data-window-interacting]",
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^\s*animation\s*:\s*([^;]+);", application_window),
+            ["imageweave-window-appear 120ms ease-out"],
+        )
+        self.assertIn("transition: none", interacting_window)
+        self.assertNotRegex(
+            interacting_window,
+            r"(?m)^\s*animation(?:-[\w-]+)?\s*:",
+        )
+        self.assertEqual(
+            desktop_css.count(
+                "animation: imageweave-window-appear 120ms ease-out"
+            ),
+            1,
+        )
+        self.assertEqual(
+            desktop_css.count("@keyframes imageweave-window-appear"),
+            1,
+        )
+        motion_off = css_block(
+            desktop_css,
+            ':root[data-motion="off"] .application-window',
+        )
+        self.assertIn("animation: none", motion_off)
+        self.assertIn("transition: none", motion_off)
+        reduced_motion = desktop_css.split(
+            "@media (prefers-reduced-motion: reduce)", 1
+        )[1].split("@media (forced-colors: active)", 1)[0]
+        reduced_window = css_block(reduced_motion, ".application-window")
+        self.assertIn("animation: none", reduced_window)
+        self.assertIn("transition: none", reduced_window)
+
         self.assertIn("<template data-window-template>", index)
         self.assertIn("data-window-layer", index)
         self.assertEqual(index.count('data-application-window'), 1)
