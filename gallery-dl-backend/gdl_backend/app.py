@@ -267,7 +267,8 @@ class ServiceContainer:
         while True:
             try:
                 await asyncio.sleep(interval)
-                if self.proxy.status().get("running"):
+                status = await asyncio.to_thread(self.proxy.status)
+                if status.get("running"):
                     await asyncio.to_thread(self.proxy.probe)
             except asyncio.CancelledError:
                 break
@@ -563,13 +564,20 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz():
-        payload = readiness_snapshot(
-            settings,
-            database_ok=service.db.ping(),
-            live_proxy_status=service.proxy.status(),
-            scheduler=service.scheduler.active_summary(),
-            ordered_crawls=service.ordered_crawls.status(),
-        )
+        # 事件循环拥有的可变状态必须在循环上取快照，不能带进工作线程。
+        scheduler_summary = service.scheduler.active_summary()
+        ordered_summary = service.ordered_crawls.status()
+
+        def snapshot() -> dict[str, Any]:
+            return readiness_snapshot(
+                settings,
+                database_ok=service.db.ping(),
+                live_proxy_status=service.proxy.status(),
+                scheduler=scheduler_summary,
+                ordered_crawls=ordered_summary,
+            )
+
+        payload = await asyncio.to_thread(snapshot)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
     @api.get("/config")

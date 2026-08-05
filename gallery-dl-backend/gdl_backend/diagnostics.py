@@ -26,6 +26,8 @@ DINO_REPOSITORY = Path(
 _OK_STATUSES = {"ok", "disabled"}
 _DEDUP_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, dict[str, Any]]]] = {}
 _DEDUP_CACHE_LOCK = threading.Lock()
+_DEDUP_CACHE_FRESH_SECONDS = 120.0
+_DEDUP_REFRESH_INFLIGHT: set[str] = set()
 
 
 def _component(
@@ -154,28 +156,19 @@ print(json.dumps(result, separators=(",", ":")))
 """
 
 
-def dedup_components(
-    settings: AppSettings,
-    *,
-    use_cache: bool = True,
-) -> dict[str, dict[str, Any]]:
-    if not settings.dedup.enabled:
-        disabled = _component("disabled", "去重功能未启用", required=False)
-        return {
-            "dedup": disabled,
-            "dedup_python": dict(disabled),
-            "torch": dict(disabled),
-            "sscd_model": dict(disabled),
-            "dino_model": dict(disabled),
-        }
+def _disabled_dedup_components() -> dict[str, dict[str, Any]]:
+    disabled = _component("disabled", "去重功能未启用", required=False)
+    return {
+        "dedup": disabled,
+        "dedup_python": dict(disabled),
+        "torch": dict(disabled),
+        "sscd_model": dict(disabled),
+        "dino_model": dict(disabled),
+    }
 
+
+def _probe_dedup_components(settings: AppSettings) -> dict[str, dict[str, Any]]:
     python = settings.dedup.python_executable
-    key = _dedup_cache_key(settings)
-    if use_cache:
-        with _DEDUP_CACHE_LOCK:
-            cached = _DEDUP_CACHE.get(key)
-        if cached is not None and time.monotonic() - cached[0] < 30.0:
-            return {name: dict(value) for name, value in cached[1].items()}
 
     if not python.is_file() or (os.name != "nt" and not os.access(python, os.X_OK)):
         blocked = _component("error", "去重 Python 不可用")
@@ -304,9 +297,90 @@ def dedup_components(
             "dino_model": dino_component,
         }
 
+    return result
+
+
+def _store_dedup_cache(
+    key: tuple[Any, ...],
+    result: dict[str, dict[str, Any]],
+) -> None:
     with _DEDUP_CACHE_LOCK:
         _DEDUP_CACHE.clear()
         _DEDUP_CACHE[key] = (time.monotonic(), result)
+
+
+def _refresh_dedup_components(
+    settings: AppSettings,
+    key: tuple[Any, ...],
+    refresh_key: str,
+) -> None:
+    try:
+        result = _probe_dedup_components(settings)
+        _store_dedup_cache(key, result)
+    except Exception:
+        # 后台刷新失败时继续保留旧值，且不输出可能含本机路径的异常。
+        pass
+    finally:
+        with _DEDUP_CACHE_LOCK:
+            _DEDUP_REFRESH_INFLIGHT.discard(refresh_key)
+
+
+def dedup_components(
+    settings: AppSettings,
+    *,
+    use_cache: bool = True,
+) -> dict[str, dict[str, Any]]:
+    if not settings.dedup.enabled:
+        return _disabled_dedup_components()
+
+    key = _dedup_cache_key(settings)
+    if not use_cache:
+        # doctor 路径始终同步执行真实探测，不参与后台单飞状态。
+        result = _probe_dedup_components(settings)
+        _store_dedup_cache(key, result)
+        return {name: dict(value) for name, value in result.items()}
+
+    now = time.monotonic()
+    cached_result: dict[str, dict[str, Any]] | None = None
+    cached_age = 0.0
+    should_refresh = False
+    refresh_key = repr(key)
+    with _DEDUP_CACHE_LOCK:
+        cached = _DEDUP_CACHE.get(key)
+        if cached is not None:
+            cached_age = max(0.0, now - cached[0])
+            cached_result = cached[1]
+            if (
+                cached_age >= _DEDUP_CACHE_FRESH_SECONDS
+                and refresh_key not in _DEDUP_REFRESH_INFLIGHT
+            ):
+                _DEDUP_REFRESH_INFLIGHT.add(refresh_key)
+                should_refresh = True
+
+    if cached_result is not None and cached_age < _DEDUP_CACHE_FRESH_SECONDS:
+        return {name: dict(value) for name, value in cached_result.items()}
+
+    if cached_result is not None:
+        if should_refresh:
+            refresh_thread = threading.Thread(
+                target=_refresh_dedup_components,
+                args=(settings, key, refresh_key),
+                name="dedup-diagnostics-refresh",
+                daemon=True,
+            )
+            try:
+                refresh_thread.start()
+            except RuntimeError:
+                with _DEDUP_CACHE_LOCK:
+                    _DEDUP_REFRESH_INFLIGHT.discard(refresh_key)
+        age_seconds = round(cached_age, 1)
+        return {
+            name: {**dict(value), "stale": True, "age_seconds": age_seconds}
+            for name, value in cached_result.items()
+        }
+
+    result = _probe_dedup_components(settings)
+    _store_dedup_cache(key, result)
     return {name: dict(value) for name, value in result.items()}
 
 

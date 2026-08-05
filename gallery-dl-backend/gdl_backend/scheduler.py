@@ -149,10 +149,11 @@ class TaskScheduler:
         return task
 
     def active_summary(self) -> dict[str, Any]:
-        sites = Counter(site for _, site in self._active.values())
+        active = list(self._active.values())
+        sites = Counter(site for _, site in active)
         return {
             "running": not self._stopping and self._loop_task is not None,
-            "active": len(self._active),
+            "active": len(active),
             "max_concurrent": self.settings.max_concurrent_tasks,
             "sites": dict(sites),
         }
