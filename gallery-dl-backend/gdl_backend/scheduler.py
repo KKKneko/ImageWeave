@@ -11,6 +11,7 @@ from .classifier import FailureDecision, classify_result
 from .config import SchedulerSettings
 from .database import Database, TERMINAL_STATUSES
 from .gallery import GalleryRunner
+from .log_writer import TaskLogWriter
 from .process_control import terminate_stale_process
 from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
 from .redaction import redact_text
@@ -27,6 +28,7 @@ class TaskScheduler:
         gallery: GalleryRunner,
         proxy: ProxyPoolAdapter,
         settings: SchedulerSettings,
+        log_writer: TaskLogWriter,
         *,
         credential_validator: Callable[[str, str | None], bool] | None = None,
         auth_failure_callback: Callable[[str, str | None, str], Awaitable[bool]] | None = None,
@@ -35,6 +37,7 @@ class TaskScheduler:
         self.gallery = gallery
         self.proxy = proxy
         self.settings = settings
+        self.log_writer = log_writer
         self.credential_validator = credential_validator
         self.auth_failure_callback = auth_failure_callback
         self._loop_task: asyncio.Task | None = None
@@ -46,6 +49,7 @@ class TaskScheduler:
     async def start(self) -> None:
         if self._loop_task is not None:
             return
+        await self.log_writer.start()
         self._stopping = False
         stale = self.db.incomplete_processes()
         for item in stale:
@@ -78,6 +82,7 @@ class TaskScheduler:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         self._active.clear()
+        await self.log_writer.stop()
 
     def notify(self) -> None:
         self._wake.set()
@@ -274,7 +279,7 @@ class TaskScheduler:
             task = attempt["task"]
             policy = self._policy(task)
             async def log(stream: str, line: str) -> None:
-                self.db.append_log(task_id, attempt_id, stream, line)
+                self.log_writer.push(task_id, attempt_id, stream, line)
                 if stream == "stdout" and task is not None:
                     artifact = self._artifact_from_output(line, task["output_dir"])
                     if artifact is not None and artifact not in task_artifacts:
@@ -291,7 +296,8 @@ class TaskScheduler:
                             now = time.monotonic()
                             if now - artifact_progress["last_write"] >= 1.0:
                                 artifact_progress["last_write"] = now
-                                self.db.update_artifacts(
+                                await asyncio.to_thread(
+                                    self.db.update_artifacts,
                                     task_id,
                                     artifact_progress["count"],
                                     artifact_progress["bytes"],
@@ -429,7 +435,12 @@ class TaskScheduler:
                     )
             except Exception as exc:
                 if attempt_id:
-                    self.db.append_log(task_id, attempt_id, "backend", f"释放代理租约异常：{redact_text(exc, limit=500)}")
+                    self.log_writer.push(
+                        task_id,
+                        attempt_id,
+                        "backend",
+                        f"释放代理租约异常：{redact_text(exc, limit=500)}",
+                    )
             finally:
                 if attempt_id:
                     self.db.clear_lease(task_id, attempt_id)
@@ -446,7 +457,7 @@ class TaskScheduler:
                     auth_failure_context or decision.message,
                 )
                 if invalidated and attempt_id:
-                    self.db.append_log(
+                    self.log_writer.push(
                         task_id,
                         attempt_id,
                         "backend",
@@ -454,7 +465,7 @@ class TaskScheduler:
                     )
             except Exception as exc:
                 if attempt_id:
-                    self.db.append_log(
+                    self.log_writer.push(
                         task_id,
                         attempt_id,
                         "backend",
@@ -473,6 +484,7 @@ class TaskScheduler:
                     error_message=decision.message,
                 )
             return
+        await self.log_writer.flush()
         self.db.finish_attempt(
             attempt_id,
             exit_code=exit_code,

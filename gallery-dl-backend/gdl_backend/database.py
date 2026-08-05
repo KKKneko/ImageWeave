@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import sqlite3
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .file_security import ensure_private_directory, secure_sqlite_files
 from .redaction import redact_data, redact_text
@@ -31,6 +30,7 @@ class Database:
         ensure_private_directory(self.path.parent, repair_existing=False)
         secure_sqlite_files(self.path)
         self.max_logs_per_task = max(100, int(max_logs_per_task))
+        self._since_prune: dict[str, int] = {}
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.path),
@@ -1164,28 +1164,58 @@ class Database:
                     (task_id, attempt_id),
                 )
 
-    def append_log(self, task_id: str, attempt_id: str | None, stream: str, line: str) -> int:
-        safe = redact_text(line, limit=8000)
-        with self._transaction() as conn:
-            cur = conn.execute(
-                "INSERT INTO task_logs(task_id, attempt_id, ts, stream, line) VALUES (?, ?, ?, ?, ?)",
-                (task_id, attempt_id, time.time(), stream, safe),
-            )
-            log_id = int(cur.lastrowid)
-            # Prune probabilistically rather than on `log_id % 100`: log_id is a global
-            # AUTOINCREMENT, so two tasks writing in lockstep can leave one always on odd
-            # ids that never hit the modulo, growing its logs past max_logs_per_task.
-            # A per-insert 1% chance keeps every task bounded regardless of interleaving.
-            if random.random() < 0.01:
-                conn.execute(
-                    """
-                    DELETE FROM task_logs WHERE task_id=? AND id NOT IN (
-                        SELECT id FROM task_logs WHERE task_id=? ORDER BY id DESC LIMIT ?
-                    )
-                    """,
-                    (task_id, task_id, self.max_logs_per_task),
+    def append_logs_bulk(
+        self,
+        rows: Iterable[tuple[str, str | None, float, str, str]],
+    ) -> int | None:
+        prepared = [
+            (task_id, attempt_id, ts, stream, redact_text(line, limit=8000))
+            for task_id, attempt_id, ts, stream, line in rows
+        ]
+        if not prepared:
+            return None
+
+        increments: dict[str, int] = {}
+        for task_id, _attempt_id, _ts, _stream, _line in prepared:
+            increments[task_id] = increments.get(task_id, 0) + 1
+        prune_threshold = self.max_logs_per_task // 4
+
+        # 计数与事务共用数据库锁；只有提交成功后才发布新计数。
+        with self._lock:
+            next_counts = {
+                task_id: self._since_prune.get(task_id, 0) + count
+                for task_id, count in increments.items()
+            }
+            prune_task_ids = [
+                task_id
+                for task_id, count in next_counts.items()
+                if count > prune_threshold
+            ]
+            with self._transaction() as conn:
+                conn.executemany(
+                    "INSERT INTO task_logs(task_id, attempt_id, ts, stream, line) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    prepared,
                 )
-            return log_id
+                last_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+                for task_id in prune_task_ids:
+                    conn.execute(
+                        """
+                        DELETE FROM task_logs WHERE task_id=? AND id NOT IN (
+                            SELECT id FROM task_logs WHERE task_id=? ORDER BY id DESC LIMIT ?
+                        )
+                        """,
+                        (task_id, task_id, self.max_logs_per_task),
+                    )
+            for task_id, count in next_counts.items():
+                self._since_prune[task_id] = 0 if task_id in prune_task_ids else count
+        return int(last_row[0]) if last_row is not None else None
+
+    def append_log(self, task_id: str, attempt_id: str | None, stream: str, line: str) -> int:
+        log_id = self.append_logs_bulk(
+            [(task_id, attempt_id, time.time(), stream, line)]
+        )
+        return int(log_id or 0)
 
     def get_logs(self, task_id: str, *, since: int = 0, tail: int | None = None, limit: int = 1000) -> list[dict[str, Any]]:
         with self._lock:

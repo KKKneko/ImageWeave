@@ -8,6 +8,7 @@ from pathlib import Path
 
 from gdl_backend.database import Database
 from gdl_backend.gallery import GalleryRunResult
+from gdl_backend.log_writer import TaskLogWriter
 from gdl_backend.proxy import ProxyLease, ProxyPoolUnavailable
 from gdl_backend.scheduler import TaskScheduler
 from gdl_backend.schemas import EHDownloadOptions, SitePolicy, TaskPolicy
@@ -139,8 +140,10 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.settings = make_settings(self.root)
         self.db = Database(self.settings.database_path)
+        self.log_writer = TaskLogWriter(self.db)
 
     async def asyncTearDown(self):
+        await self.log_writer.stop()
         self.db.close()
         self.temp.cleanup()
 
@@ -156,7 +159,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_success(self):
         self.db.create_task(values(self.root, proxy_mode="direct", attempts=1))
         gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -181,7 +184,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.db.create_task(task_values)
         gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -215,7 +218,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))
         gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
         proxy = FakeProxy(with_nodes=True)
-        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -260,7 +263,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         gallery = FakeGallery([GalleryRunResult(0, "done", False, "m", 101)])
         proxy = FakeProxy(with_nodes=True)
-        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -271,7 +274,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_prefer_falls_back_to_direct_when_pool_is_empty(self):
         self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))
         gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -292,7 +295,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.db.create_task(task_values)
                 gallery = FakeGallery([GalleryRunResult(0, "unused", False, "m", 101)])
                 proxy = UnavailableProxy()
-                scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+                scheduler = TaskScheduler(
+                    self.db,
+                    gallery,
+                    proxy,
+                    self.settings.scheduler,
+                    self.log_writer,
+                )
                 await scheduler.start()
                 task = await self.wait_terminal(task_id)
                 await scheduler.stop()
@@ -313,6 +322,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             AcquireFailingProxy(),
             self.settings.scheduler,
+            self.log_writer,
         )
 
         await scheduler._execute("task-1")
@@ -339,6 +349,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             UnavailableProxy(),
             self.settings.scheduler,
+            self.log_writer,
         )
 
         await scheduler._execute("task-1")
@@ -359,7 +370,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         proxy = FakeProxy(with_nodes=True)
-        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -372,7 +383,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.db.create_task(values(self.root, proxy_mode="direct", attempts=1))
         self.assertTrue(self.db.claim_task("task-1"))
         self.db.request_cancel("task-1")
-        scheduler = TaskScheduler(self.db, FakeGallery([]), FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(
+            self.db,
+            FakeGallery([]),
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
         await scheduler._execute("task-1")
         self.assertEqual(self.db.get_task("task-1")["status"], "cancelled")
 
@@ -380,7 +397,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.db.create_task(values(self.root, proxy_mode="required", attempts=1))
         gallery = FakeGallery([GalleryRunResult(0, "done", False, "m", 101)])
         proxy = ReleaseFailingProxy(with_nodes=True)
-        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler, self.log_writer)
         await scheduler.start()
         task = await self.wait_terminal("task-1")
         await scheduler.stop()
@@ -395,6 +412,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             CredentialProxy(with_nodes=True),
             self.settings.scheduler,
+            self.log_writer,
         )
         await scheduler.start()
         task = await self.wait_terminal("task-1")
@@ -431,6 +449,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             FakeGallery([]),
             FakeProxy(),
             self.settings.scheduler,
+            self.log_writer,
             credential_validator=validate,
         )
         await scheduler.start()
@@ -480,6 +499,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             FakeProxy(),
             self.settings.scheduler,
+            self.log_writer,
             credential_validator=validate,
         )
         await scheduler.start()
@@ -555,6 +575,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             FakeGallery([]),
             FakeProxy(),
             self.settings.scheduler,
+            self.log_writer,
         )
 
         async def hold_execution(task_id: str):
@@ -598,6 +619,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             FakeProxy(),
             self.settings.scheduler,
+            self.log_writer,
             credential_validator=validate,
         )
         await scheduler.start()
@@ -625,11 +647,76 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             )],
             stdout_paths=[artifact],
         )
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
         await scheduler._execute("task-1")
         task = self.db.get_task("task-1")
         self.assertEqual(task["status"], "queued")
         self.assertEqual(task["last_error_class"], "extraction_partial")
+
+    async def test_artifacts_still_tracked_with_buffered_logs(self):
+        out_dir = self.root / "out"
+        out_dir.mkdir()
+        artifacts = [out_dir / f"image_{index:03d}.jpg" for index in range(3)]
+        for index, artifact in enumerate(artifacts):
+            artifact.write_bytes(f"image-{index}".encode())
+        self.db.create_task(values(self.root, proxy_mode="direct", attempts=2))
+        self.assertTrue(self.db.claim_task("task-1"))
+        gallery = ArtifactGallery(
+            [
+                GalleryRunResult(
+                    4,
+                    "gallery_dl.exception.ExtractionError: one file was unavailable",
+                    False,
+                    "m",
+                    101,
+                )
+            ],
+            stdout_paths=artifacts,
+        )
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
+
+        await scheduler._execute("task-1")
+
+        task = self.db.get_task("task-1")
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["last_error_class"], "extraction_partial")
+        self.assertEqual(task["latest_attempt"]["error_class"], "extraction_partial")
+        self.assertEqual(task["artifact_count"], len(artifacts))
+
+    async def test_logs_complete_when_task_reaches_terminal(self):
+        final_line = "final buffered log line"
+        self.db.create_task(values(self.root, proxy_mode="direct", attempts=1))
+        gallery = FakeGallery(
+            [GalleryRunResult(0, final_line, False, "m", 101)]
+        )
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
+        await scheduler.start()
+
+        task = await self.wait_terminal("task-1")
+        logs_at_terminal = self.db.get_logs("task-1")
+        await scheduler.stop()
+
+        self.assertEqual(task["status"], "succeeded")
+        self.assertTrue(logs_at_terminal)
+        self.assertEqual(logs_at_terminal[-1]["line"], final_line)
 
     async def test_extraction_error_without_artifacts_is_not_requeued(self):
         # bit 4 with zero downloaded files = pure extraction failure -> terminal,
@@ -643,7 +730,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 False, "m", 101,
             )]
         )
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
         await scheduler._execute("task-1")
         task = self.db.get_task("task-1")
         self.assertEqual(task["status"], "failed")
@@ -668,6 +761,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             gallery,
             FakeProxy(),
             self.settings.scheduler,
+            self.log_writer,
             auth_failure_callback=invalidate,
         )
         await scheduler.start()
@@ -704,7 +798,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self._set_task_columns("task-1", attempt_count=20)
         self.assertTrue(self.db.claim_task("task-1"))
         gallery = FakeGallery([GalleryRunResult(128, "download failed", False, "m", 101)])
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
 
         before = time.time()
         await scheduler._execute("task-1")
@@ -739,7 +839,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(self.db.claim_task("task-1"))
         gallery = FakeGallery([GalleryRunResult(128, "download failed", False, "m", 101)])
-        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            self.log_writer,
+        )
 
         before = time.time()
         await scheduler._execute("task-1")

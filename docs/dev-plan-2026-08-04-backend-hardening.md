@@ -587,15 +587,15 @@ async def log(stream: str, line: str) -> None:
 
 ### 验收标准
 
-- [ ] D1 `scheduler` 的 `log()` 回调不再直接调用任何 `Database` 写方法。
-- [ ] D2 `task_artifacts.add(...)` 仍在回调里同步执行。
-- [ ] D3 flush 触发条件为 200ms 或 64 行，两者取先到（决策 D4）。
-- [ ] D4 缓冲溢出会产生一条可见的丢弃提示行，不静默丢数据。
-- [ ] D5 日志修剪改为确定式计数触发，不再用 `random.random()`。
-- [ ] D6 `finish_attempt` 之前有一次 `flush()`。
-- [ ] D7 flush 失败不会使任务失败也不会终止写入循环。
-- [ ] D8 `scheduler.stop()` 会 flush 并关闭 writer。
-- [ ] D9 上述测试要求的行为契约已被覆盖（数量不作硬性要求），其中
+- [x] D1 `scheduler` 的 `log()` 回调不再直接调用任何 `Database` 写方法。
+- [x] D2 `task_artifacts.add(...)` 仍在回调里同步执行。
+- [x] D3 flush 触发条件为 200ms 或 64 行，两者取先到（决策 D4）。
+- [x] D4 缓冲溢出会产生一条可见的丢弃提示行，不静默丢数据。
+- [x] D5 日志修剪改为确定式计数触发，不再用 `random.random()`。
+- [x] D6 `finish_attempt` 之前有一次 `flush()`。
+- [x] D7 flush 失败不会使任务失败也不会终止写入循环。
+- [x] D8 `scheduler.stop()` 会 flush 并关闭 writer。
+- [x] D9 上述测试要求的行为契约已被覆盖（数量不作硬性要求），其中
       `test_artifacts_still_tracked_with_buffered_logs` 是不可省略的核心回归；
       新增测试全绿，288 个基线测试全绿。
 

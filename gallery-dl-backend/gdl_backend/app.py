@@ -54,6 +54,7 @@ from .discovery import (
     validate_discovery_args,
 )
 from .gallery import GalleryRunner
+from .log_writer import TaskLogWriter
 from .ordered_crawl import OrderedCrawlManager
 from .policy_view import (
     MAX_POLICY_REQUEST_BYTES,
@@ -169,11 +170,13 @@ class ServiceContainer:
         )
         self.auth = AuthManager(settings)
         self.gallery = GalleryRunner(settings.gallery, settings.project_dir)
+        self.log_writer = TaskLogWriter(self.db)
         self.scheduler = TaskScheduler(
             self.db,
             self.gallery,
             self.proxy,
             settings.scheduler,
+            self.log_writer,
             credential_validator=self.auth.managed_credentials_available,
             auth_failure_callback=self.auth.invalidate_if_managed,
         )
