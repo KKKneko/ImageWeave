@@ -99,6 +99,11 @@
   .window-titlebar {
     padding-left: 7px;
     font-size: 0.76rem;
+    cursor: default;
+  }
+
+  .window-resize-handle {
+    display: none;
   }
 
   .window-actions {
@@ -126,7 +131,8 @@
   .route-button,
   .start-menu-item,
   .start-button,
-  .task-window-button {
+  .task-window-button,
+  .task-window-overflow-button {
     min-height: 44px;
   }
 
@@ -139,10 +145,31 @@
     height: 44px;
   }
 
-  .task-window-button {
+  .task-window-list {
+    height: 44px;
+  }
+
+  .task-window-primary {
+    overflow: hidden;
+  }
+
+  .task-window-primary .task-window-button {
+    flex: 1 1 0;
     min-width: 0;
     max-width: none;
     height: 44px;
+  }
+
+  .task-window-overflow-button {
+    flex-basis: 44px;
+    width: 44px;
+    height: 44px;
+  }
+
+  .task-window-overflow .task-window-button {
+    width: 100%;
+    max-width: none;
+    height: auto;
   }
 
   .taskbar-status {

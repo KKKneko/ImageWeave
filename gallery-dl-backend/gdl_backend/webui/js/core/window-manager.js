@@ -9,9 +9,30 @@ import {
 } from "./window-geometry.js";
 import { selectors } from "./store.js";
 import { createIcon } from "../components/icons.js";
+import {
+  activateTaskbarWindow,
+  createTaskbarWindowList,
+} from "../components/taskbar-windows.js";
 
 const KEYBOARD_RESIZE_STEP = 16;
 const MOBILE_QUERY = "(max-width: 767px)";
+
+export function deriveWindowViews(windowStack, focusedAppId, mobileViewport = false) {
+  if (!Array.isArray(windowStack)) throw new TypeError("窗口视图来源必须是数组");
+  const mobile = mobileViewport === true;
+  return Object.freeze(windowStack.map((record) => {
+    const minimized = record.windowState === "minimized";
+    const open = !minimized;
+    return Object.freeze({
+      appId: record.appId,
+      open,
+      minimized,
+      maximized: mobile || record.windowState === "maximized",
+      visible: open && (!mobile || record.appId === focusedAppId),
+      rect: Object.freeze({ ...record.rect }),
+    });
+  }));
+}
 
 function sameRect(left, right) {
   return Boolean(left && right)
@@ -32,7 +53,7 @@ function requireCloneElement(root, selector, Constructor = HTMLElement) {
 export function createWindowManager({
   windowLayer,
   windowTemplate,
-  taskButton,
+  taskList,
   store,
   actions,
   onMount,
@@ -47,6 +68,7 @@ export function createWindowManager({
   const pendingRectRepairs = new Map();
   let currentStack = selectors.windowStack(store.getState());
   let currentView = selectors.windowView(store.getState());
+  let taskbarWindows = null;
   let destroying = false;
   let destroyed = false;
 
@@ -76,9 +98,7 @@ export function createWindowManager({
     selectors.windowStack(store.getState()).find((record) => record.appId === appId) || null
   );
 
-  const isForcedMobileMaximized = (record) => (
-    record?.appId === "review" && mobileViewport.matches
-  );
+  const isForcedMobileMaximized = (record) => Boolean(record && mobileViewport.matches);
 
   const isEffectivelyMaximized = (record) => Boolean(
     record && (record.windowState === "maximized" || isForcedMobileMaximized(record))
@@ -113,9 +133,9 @@ export function createWindowManager({
     });
   };
 
-  const displayedRect = (record) => {
+  const displayedRect = (record, maximized = isEffectivelyMaximized(record)) => {
     const viewport = viewportSnapshot();
-    return isEffectivelyMaximized(record)
+    return maximized
       ? maximizedRect(viewport, geometryOptions(viewport))
       : clampRect(record.rect, viewport, geometryOptions(viewport));
   };
@@ -211,6 +231,10 @@ export function createWindowManager({
   const movePointerInteraction = (instance, event) => {
     const interaction = instance.interaction;
     if (!interaction || event.pointerId !== interaction.pointerId) return;
+    if (mobileViewport.matches) {
+      finishPointerInteraction(instance, event, { commit: false });
+      return;
+    }
     const viewport = viewportSnapshot();
     const options = geometryOptions(viewport);
     const pointerDelta = {
@@ -333,7 +357,7 @@ export function createWindowManager({
     const onLostPointerCapture = (event) => finishPointerInteraction(instance, event);
     const onMinimize = () => requestHide(instance, "minimized", () => {
       actions.minimizeWindow(instance.appId);
-      taskButton.focus({ preventScroll: true });
+      taskbarWindows?.focusButton(instance.appId);
     });
     const onMaximize = (event) => {
       const record = recordFor(instance.appId);
@@ -474,22 +498,24 @@ export function createWindowManager({
     pendingRectRepairs.delete(appId);
   };
 
-  const syncInstance = (instance, record, index, focusedAppId) => {
+  const syncInstance = (instance, record, view, index, focusedAppId) => {
     const app = getApplicationById(record.appId);
-    const visible = record.windowState !== "minimized";
-    const maximized = isEffectivelyMaximized(record);
     const forced = isForcedMobileMaximized(record);
-    instance.element.hidden = !visible;
-    instance.element.dataset.windowVisibility = visible ? "open" : "minimized";
+    instance.element.hidden = !view.visible;
+    instance.element.dataset.windowVisibility = view.open ? "open" : "minimized";
     instance.element.dataset.windowState = record.windowState;
-    instance.element.toggleAttribute("data-maximized", maximized);
+    instance.element.toggleAttribute("data-maximized", view.maximized);
     instance.element.toggleAttribute("data-window-focused", record.appId === focusedAppId);
+    instance.element.toggleAttribute(
+      "data-mobile-suppressed",
+      forced && view.open && !view.visible,
+    );
     // 数组就是 z 序的唯一事实源；zIndex 只投影到 DOM。
     instance.element.style.zIndex = String(index);
     if (!instance.interaction) {
-      const rect = displayedRect(record);
+      const rect = displayedRect(record, view.maximized);
       applyRect(instance.element, rect);
-      if (visible && !maximized) queueNormalRectRepair(record, rect);
+      if (view.open && !view.maximized) queueNormalRectRepair(record, rect);
     }
 
     instance.buttons.maximize.disabled = !app || forced;
@@ -497,45 +523,36 @@ export function createWindowManager({
       "aria-disabled",
       String(instance.buttons.maximize.disabled),
     );
-    instance.buttons.maximize.setAttribute("aria-pressed", String(maximized));
+    instance.buttons.maximize.setAttribute("aria-pressed", String(view.maximized));
     instance.buttons.maximize.setAttribute(
       "aria-label",
-      maximized ? "还原窗口" : "最大化窗口",
+      view.maximized ? "还原窗口" : "最大化窗口",
     );
     instance.buttons.maximize.title = forced
-      ? "审核应用在手机端始终最大化"
-      : maximized
+      ? "手机端所有窗口始终最大化"
+      : view.maximized
         ? "还原"
         : "最大化";
     instance.buttons.maximize.replaceChildren(
-      createIcon(maximized ? "restore" : "square", { size: 15, strokeWidth: 2 }),
+      createIcon(view.maximized ? "restore" : "square", { size: 15, strokeWidth: 2 }),
     );
-    for (const handle of instance.buttons.resize.values()) handle.disabled = maximized;
-
-    if (instance.visible !== visible) {
-      instance.visible = visible;
-      notifyVisibility(visible, app);
+    for (const handle of instance.buttons.resize.values()) {
+      handle.hidden = forced;
+      handle.disabled = view.maximized;
+      handle.tabIndex = forced ? -1 : 0;
     }
-  };
 
-  const syncTaskButton = () => {
-    currentView = selectors.windowView(store.getState());
-    const app = getApplicationById(currentView.appId);
-    const isOpen = currentView.visibility === "open";
-    taskButton.hidden = currentView.visibility === "closed" || !app;
-    taskButton.setAttribute("aria-pressed", String(isOpen));
-    if (!app) {
-      taskButton.textContent = "";
-      taskButton.removeAttribute("title");
-      return;
+    // 移动端的展示抑制不等同于最小化；只有真实 minimized 才停用应用。
+    if (instance.visible !== view.open) {
+      instance.visible = view.open;
+      notifyVisibility(view.open, app);
     }
-    taskButton.textContent = app.windowTitle;
-    taskButton.title = `${app.label} — ${isOpen ? "最小化" : "恢复"}`;
   };
 
   const renderStack = (stack) => {
     if (destroying || destroyed) return;
     currentStack = stack;
+    currentView = selectors.windowView(store.getState());
     const nextIds = new Set(stack.map((record) => record.appId));
     for (const appId of [...windows.keys()]) {
       if (!nextIds.has(appId)) removeInstance(appId);
@@ -544,44 +561,57 @@ export function createWindowManager({
       if (!windows.has(record.appId)) createInstance(record.appId);
     }
     const focusedAppId = selectors.focusedAppId(store.getState());
+    const views = deriveWindowViews(stack, focusedAppId, mobileViewport.matches);
     stack.forEach((record, index) => {
-      syncInstance(windows.get(record.appId), record, index, focusedAppId);
+      syncInstance(windows.get(record.appId), record, views[index], index, focusedAppId);
     });
-    syncTaskButton();
+    taskbarWindows?.render(stack, focusedAppId);
   };
 
-  const onTaskButtonClick = () => {
-    const view = selectors.windowView(store.getState());
-    if (view.appId === null || view.visibility === "closed") return;
-    const instance = windows.get(view.appId);
-    if (!instance) return;
-    if (view.visibility === "open") {
-      requestHide(instance, "minimized", () => {
-        actions.minimizeWindow(view.appId);
-        taskButton.focus({ preventScroll: true });
-      });
-      return;
-    }
-    actions.restoreWindow(view.appId);
-    focusBody(view.appId);
+  const onTaskWindowActivate = (descriptor) => {
+    activateTaskbarWindow(descriptor, {
+      canActivate: (appId) => Boolean(recordFor(appId) && windows.has(appId)),
+      minimize: (appId) => {
+        const instance = windows.get(appId);
+        if (!instance) return;
+        requestHide(instance, "minimized", () => {
+          actions.minimizeWindow(appId);
+          taskbarWindows?.focusButton(appId);
+        });
+      },
+      restore: (appId) => {
+        actions.restoreWindow(appId);
+        focusBody(appId);
+      },
+      focus: (appId) => {
+        actions.focusWindow(appId);
+        focusBody(appId);
+      },
+    });
   };
 
   const onViewportChange = () => {
-    if (!destroying && !destroyed) renderStack(selectors.windowStack(store.getState()));
+    if (destroying || destroyed) return;
+    for (const instance of windows.values()) {
+      finishPointerInteraction(instance, null, { commit: false });
+    }
+    renderStack(selectors.windowStack(store.getState()));
   };
-
-  taskButton.addEventListener("click", onTaskButtonClick);
-  mobileViewport.addEventListener("change", onViewportChange);
-  window.addEventListener("resize", onViewportChange);
 
   let unsubscribe = () => {};
   try {
+    taskbarWindows = createTaskbarWindowList({
+      container: taskList,
+      onActivate: onTaskWindowActivate,
+    });
+    mobileViewport.addEventListener("change", onViewportChange);
+    window.addEventListener("resize", onViewportChange);
     renderStack(currentStack);
     unsubscribe = store.subscribe(selectors.windowStack, renderStack);
   } catch (error) {
     destroying = true;
     for (const appId of [...windows.keys()]) removeInstance(appId);
-    taskButton.removeEventListener("click", onTaskButtonClick);
+    taskbarWindows?.destroy();
     mobileViewport.removeEventListener("change", onViewportChange);
     window.removeEventListener("resize", onViewportChange);
     throw error;
@@ -608,10 +638,10 @@ export function createWindowManager({
       destroying = true;
       for (const instance of windows.values()) finishPointerInteraction(instance);
       unsubscribe();
-      taskButton.removeEventListener("click", onTaskButtonClick);
       mobileViewport.removeEventListener("change", onViewportChange);
       window.removeEventListener("resize", onViewportChange);
       for (const appId of [...windows.keys()]) removeInstance(appId);
+      taskbarWindows?.destroy();
       pendingRectRepairs.clear();
       currentStack = [];
       destroying = false;

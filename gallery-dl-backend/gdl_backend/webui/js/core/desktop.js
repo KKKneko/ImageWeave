@@ -7,13 +7,51 @@ import { createWindowManager } from "./window-manager.js";
 import { createIcon } from "../components/icons.js";
 import { createStatusBadge } from "../components/status.js";
 
+function launcherDescriptor(app, disabled = false) {
+  return Object.freeze({
+    id: app.id,
+    label: app.label,
+    icon: app.icon,
+    route: app.route,
+    windowTitle: app.windowTitle,
+    availability: app.availability,
+    ariaDisabled: disabled ? "true" : null,
+  });
+}
+
+export function describeApplicationLaunchers(source = applications) {
+  if (!Array.isArray(source)) throw new TypeError("应用启动器来源必须是数组");
+  const ready = source.filter((app) => app.availability === "ready");
+  const upcoming = source.filter((app) => app.availability !== "ready");
+  return Object.freeze({
+    desktop: Object.freeze(ready.map((app) => launcherDescriptor(app))),
+    startMenuGroups: Object.freeze([
+      Object.freeze({
+        id: "available",
+        title: "可用应用",
+        items: Object.freeze(ready.map((app) => launcherDescriptor(app))),
+      }),
+      Object.freeze({
+        id: "upcoming",
+        title: "即将推出",
+        items: Object.freeze(upcoming.map((app) => launcherDescriptor(app, true))),
+      }),
+    ]),
+  });
+}
+
 function createApplicationLink(app, location) {
   const isDesktop = location === "desktop";
+  const disabled = app.ariaDisabled === "true";
   const link = createElement("a", {
     className: isDesktop ? "desktop-icon" : "start-menu-item",
     attributes: {
-      href: `#${app.route}`,
-      title: `${app.label} — ${app.windowTitle}`,
+      ...(disabled
+        ? { "aria-disabled": "true", tabindex: "0" }
+        : { href: `#${app.route}` }),
+      title: disabled
+        ? `${app.label} — 即将推出`
+        : `${app.label} — ${app.windowTitle}`,
     },
     dataset: { appLink: app.id, appLocation: location },
   });
@@ -21,10 +59,26 @@ function createApplicationLink(app, location) {
     createIcon(app.icon, { size: isDesktop ? 30 : 22, strokeWidth: 1.6 }),
     createElement("span", { className: "application-label", text: app.label }),
   );
-  if (app.availability !== "ready") {
-    link.append(createStatusBadge("disabled", "开发中", { compact: true }));
-  }
+  if (disabled) link.append(createStatusBadge("disabled", "开发中", { compact: true }));
   return link;
+}
+
+function createStartMenuGroup(group) {
+  const headingId = `start-menu-group-${group.id}`;
+  const items = createElement("div", { className: "start-menu-group__items" });
+  for (const app of group.items) items.append(createApplicationLink(app, "menu"));
+  return createElement("section", {
+    className: "start-menu-group",
+    attributes: { "aria-labelledby": headingId },
+    dataset: { startMenuGroup: group.id },
+  }, [
+    createElement("h2", {
+      className: "start-menu-group__title",
+      text: group.title,
+      attributes: { id: headingId },
+    }),
+    items,
+  ]);
 }
 
 function startClock(clockElement) {
@@ -80,15 +134,18 @@ export function initializeDesktop(root = document, services = {}) {
   if (!(windowTemplate instanceof HTMLTemplateElement)) {
     throw new Error("窗口模板节点无效");
   }
-  const taskButton = requireElement("[data-task-window]", desktop);
+  const taskList = requireElement("[data-task-window-list]", desktop);
   const clock = requireElement("[data-clock]", desktop);
   const clockIcon = requireElement("[data-clock-icon]", desktop);
   const skipLink = requireElement("[data-skip-link]", root);
   const announcer = requireElement("[data-route-announcer]", root);
 
-  for (const app of applications) {
+  const launchers = describeApplicationLaunchers();
+  for (const app of launchers.desktop) {
     desktopIcons.append(createApplicationLink(app, "desktop"));
-    startMenuItems.append(createApplicationLink(app, "menu"));
+  }
+  for (const group of launchers.startMenuGroups) {
+    startMenuItems.append(createStartMenuGroup(group));
   }
 
   const mountedApplications = new Map();
@@ -229,7 +286,7 @@ export function initializeDesktop(root = document, services = {}) {
   windowManager = createWindowManager({
     windowLayer,
     windowTemplate,
-    taskButton,
+    taskList,
     store,
     actions,
     onMount(app, bodyElement) {
@@ -256,7 +313,9 @@ export function initializeDesktop(root = document, services = {}) {
   const renderStartMenu = (open, previous) => {
     startMenu.hidden = !open;
     startButton.setAttribute("aria-expanded", String(open));
-    if (open && !previous) startMenuItems.querySelector("a")?.focus();
+    if (open && !previous) {
+      startMenuItems.querySelector('a:not([aria-disabled="true"])')?.focus();
+    }
   };
   const unsubscribeStartMenu = store.subscribe(selectors.startMenuOpen, renderStartMenu, {
     fireImmediately: true,
@@ -272,8 +331,16 @@ export function initializeDesktop(root = document, services = {}) {
     const link = event.target.closest("[data-app-link]");
     if (!(link instanceof HTMLAnchorElement)) return;
     event.preventDefault();
+    if (link.getAttribute("aria-disabled") === "true") return;
     focusBodyAfterRouteAppId = event.detail === 0 ? link.dataset.appLink : null;
     actions.navigateToApp(link.dataset.appLink);
+  };
+  const onNavigationKeyDown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    if (!(event.target instanceof Element)) return;
+    const link = event.target.closest('[data-app-link][aria-disabled="true"]');
+    if (!(link instanceof HTMLAnchorElement) || !startMenuItems.contains(link)) return;
+    event.preventDefault();
   };
 
   const onStartClick = () => setMenuOpen(!store.getState().ui.startMenuOpen);
@@ -297,6 +364,7 @@ export function initializeDesktop(root = document, services = {}) {
 
   desktopIcons.addEventListener("click", onNavigationClick);
   startMenuItems.addEventListener("click", onNavigationClick);
+  startMenuItems.addEventListener("keydown", onNavigationKeyDown);
   startButton.addEventListener("click", onStartClick);
   document.addEventListener("pointerdown", onOutsidePointerDown);
   document.addEventListener("keydown", onKeyDown);
@@ -320,6 +388,7 @@ export function initializeDesktop(root = document, services = {}) {
       unsubscribeStartMenu();
       desktopIcons.removeEventListener("click", onNavigationClick);
       startMenuItems.removeEventListener("click", onNavigationClick);
+      startMenuItems.removeEventListener("keydown", onNavigationKeyDown);
       startButton.removeEventListener("click", onStartClick);
       document.removeEventListener("pointerdown", onOutsidePointerDown);
       document.removeEventListener("keydown", onKeyDown);

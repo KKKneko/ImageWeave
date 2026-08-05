@@ -4,22 +4,26 @@ import {
   getApplicationByRoute,
 } from "./app-registry.js";
 
+function readyApplication(application) {
+  return application?.availability === "ready" ? application : null;
+}
+
 export function parseHashRoute(hash) {
   if (typeof hash !== "string" || !hash.startsWith("#/")) return DEFAULT_ROUTE;
   const route = hash.slice(1);
-  return getApplicationByRoute(route) ? route : DEFAULT_ROUTE;
+  return readyApplication(getApplicationByRoute(route)) ? route : DEFAULT_ROUTE;
 }
 
 export function hashForRoute(route) {
-  const normalized = getApplicationByRoute(route) ? route : DEFAULT_ROUTE;
+  const normalized = readyApplication(getApplicationByRoute(route))?.route || DEFAULT_ROUTE;
   return `#${normalized}`;
 }
 
 export function resolveNavigationTarget(target) {
   if (typeof target !== "string") return DEFAULT_ROUTE;
-  const byId = getApplicationById(target);
+  const byId = readyApplication(getApplicationById(target));
   if (byId) return byId.route;
-  return getApplicationByRoute(target)?.route || DEFAULT_ROUTE;
+  return readyApplication(getApplicationByRoute(target))?.route || DEFAULT_ROUTE;
 }
 
 export function createHashRouter(onRouteChange) {

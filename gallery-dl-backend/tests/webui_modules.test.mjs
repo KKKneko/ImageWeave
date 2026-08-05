@@ -16,6 +16,7 @@ import {
 } from "../gdl_backend/webui/js/core/actions.js";
 import {
   applications,
+  DEFAULT_ROUTE,
   getApplicationById,
 } from "../gdl_backend/webui/js/core/app-registry.js";
 import { createPollingManager } from "../gdl_backend/webui/js/core/polling.js";
@@ -147,6 +148,8 @@ import {
   nextRectForDrag,
   nextRectForResize,
 } from "../gdl_backend/webui/js/core/window-geometry.js";
+import { describeApplicationLaunchers } from "../gdl_backend/webui/js/core/desktop.js";
+import { deriveWindowViews } from "../gdl_backend/webui/js/core/window-manager.js";
 import {
   createStorageService,
   isValidBatchId,
@@ -161,6 +164,12 @@ import {
   sanitizeHealthPayload,
   sanitizeReadinessPayload,
 } from "../gdl_backend/webui/js/components/taskbar-summary.js";
+import {
+  _TASKBAR_VISIBLE_LIMIT,
+  activateTaskbarWindow,
+  deriveTaskbarWindowModel,
+  describeTaskbarWindows,
+} from "../gdl_backend/webui/js/components/taskbar-windows.js";
 import { toSafeErrorViewModel } from "../gdl_backend/webui/js/components/error-view.js";
 import { createSourceErrorWarning } from "../gdl_backend/webui/js/components/crawl-view.js";
 import {
@@ -1222,6 +1231,195 @@ test("selectors.windowView 保持旧形状且 hash 只包含单个聚焦应用",
   assert.equal(hashForRoute(resolveNavigationTarget("review")), "#/review");
   assert.equal(hashForRoute(resolveNavigationTarget("review")).includes("?"), false);
   assert.equal(parseHashRoute("#/review?windows=crawl"), "/crawl");
+});
+
+test("每个已开窗口产生一个使用中文 label 的任务栏按钮描述", () => {
+  const stack = [
+    windowRecord("crawl"),
+    windowRecord("tasks"),
+    windowRecord("review", "maximized"),
+  ];
+  const descriptions = describeTaskbarWindows(stack, "review");
+  assert.equal(descriptions.length, stack.length);
+  assert.deepEqual(
+    descriptions.map((item) => [item.appId, item.label, item.title]),
+    stack.map((record) => {
+      const app = getApplicationById(record.appId);
+      return [record.appId, app.label, app.windowTitle];
+    }),
+  );
+  assert.equal(descriptions[0].label, "图片采集");
+  assert.notEqual(descriptions[0].label, descriptions[0].title);
+});
+
+test("聚焦窗口任务栏按钮 aria-pressed 为 true 且其他为 false", () => {
+  const descriptions = describeTaskbarWindows([
+    windowRecord("crawl"),
+    windowRecord("review", "maximized"),
+    windowRecord("tasks"),
+  ], "tasks");
+  assert.deepEqual(
+    descriptions.map((item) => [item.appId, item.ariaPressed]),
+    [["crawl", "false"], ["review", "false"], ["tasks", "true"]],
+  );
+});
+
+test("minimized 窗口任务栏按钮描述带最小化标记", () => {
+  const descriptions = describeTaskbarWindows([
+    windowRecord("crawl", "minimized"),
+    windowRecord("tasks"),
+  ], "tasks");
+  assert.equal(descriptions[0].minimized, true);
+  assert.equal(descriptions[0].ariaPressed, "false");
+  assert.equal(descriptions[1].minimized, false);
+});
+
+test("超过六个窗口时严格前六个可见且其余进入任务栏溢出列表", () => {
+  const readyIds = applications
+    .filter((app) => app.availability === "ready")
+    .map((app) => app.id);
+  const model = deriveTaskbarWindowModel(
+    readyIds.map((appId) => windowRecord(appId)),
+    readyIds.at(-1),
+  );
+  assert.equal(_TASKBAR_VISIBLE_LIMIT, 6);
+  assert.equal(model.buttons.length, readyIds.length);
+  assert.deepEqual(model.visible.map((item) => item.appId), readyIds.slice(0, 6));
+  assert.deepEqual(model.overflow.map((item) => item.appId), readyIds.slice(6));
+});
+
+test("任务栏按钮意图区分已聚焦最小化与非聚焦恢复后聚焦", () => {
+  const descriptions = describeTaskbarWindows([
+    windowRecord("crawl"),
+    windowRecord("tasks", "minimized"),
+    windowRecord("review", "maximized"),
+  ], "review");
+  assert.deepEqual(
+    descriptions.map((item) => [item.appId, item.activation]),
+    [["crawl", "focus"], ["tasks", "restore"], ["review", "minimize"]],
+  );
+});
+
+test("任务栏按钮真实激活路径只执行 descriptor 对应的生产回调", () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [
+        windowRecord("crawl"),
+        windowRecord("tasks", "minimized"),
+        windowRecord("review", "maximized"),
+      ],
+    }),
+    reportError: () => {},
+  });
+  const stack = selectors.windowStack(store.getState());
+  const descriptions = describeTaskbarWindows(
+    stack,
+    selectors.focusedAppId(store.getState()),
+  );
+  const byId = new Map(descriptions.map((item) => [item.appId, item]));
+  const available = new Set(stack.map((record) => record.appId));
+  const calls = [];
+  const callbacks = {
+    canActivate: (appId) => available.has(appId),
+    minimize: (appId) => calls.push(["minimize-request", appId]),
+    focus: (appId) => calls.push(["focus", appId]),
+    restore: (appId) => {
+      calls.push(["restore", appId]);
+      store.dispatch(actionCreators.windowOpened(appId));
+    },
+  };
+
+  assert.equal(activateTaskbarWindow(byId.get("review"), callbacks), true);
+  assert.deepEqual(calls, [["minimize-request", "review"]]);
+
+  calls.length = 0;
+  assert.equal(activateTaskbarWindow(byId.get("crawl"), callbacks), true);
+  assert.deepEqual(calls, [["focus", "crawl"]]);
+
+  calls.length = 0;
+  assert.equal(activateTaskbarWindow(byId.get("tasks"), callbacks), true);
+  assert.deepEqual(calls, [["restore", "tasks"]]);
+  assert.deepEqual(
+    selectors.windowStack(store.getState()).map((record) => [record.appId, record.windowState]),
+    [["crawl", "normal"], ["review", "maximized"], ["tasks", "normal"]],
+  );
+  assert.equal(selectors.focusedAppId(store.getState()), "tasks");
+
+  calls.length = 0;
+  assert.equal(activateTaskbarWindow(null, callbacks), false);
+  assert.equal(activateTaskbarWindow({ appId: "unknown", activation: "focus" }, callbacks), false);
+  available.delete("crawl");
+  assert.equal(activateTaskbarWindow(byId.get("crawl"), callbacks), false);
+  assert.deepEqual(calls, []);
+});
+
+test("移动断点窗口视图全部最大化且仅聚焦窗口可见", () => {
+  const views = deriveWindowViews([
+    windowRecord("crawl"),
+    windowRecord("tasks"),
+    windowRecord("review", "minimized"),
+  ], "tasks", true);
+  assert.equal(views.every((view) => view.maximized), true);
+  assert.deepEqual(
+    views.map((view) => [view.appId, view.visible, view.open, view.minimized]),
+    [
+      ["crawl", false, true, false],
+      ["tasks", true, true, false],
+      ["review", false, false, true],
+    ],
+  );
+});
+
+test("退出移动断点后窗口 rect 原样恢复且源窗口栈不被改写", () => {
+  const stack = [
+    windowRecord("crawl", "normal", windowRect({ x: 91, y: 73, w: 641, h: 421 })),
+    windowRecord("tasks", "normal", windowRect({ x: -220, y: 118, w: 812, h: 516 })),
+  ];
+  const original = structuredClone(stack);
+  const mobileViews = deriveWindowViews(stack, "tasks", true);
+  const restoredViews = deriveWindowViews(stack, "tasks", false);
+  assert.equal(mobileViews.every((view) => view.maximized), true);
+  assert.deepEqual(restoredViews.map((view) => view.rect), original.map((item) => item.rect));
+  assert.deepEqual(stack, original);
+});
+
+test("桌面图标描述只包含 availability 为 ready 的应用", () => {
+  const launchers = describeApplicationLaunchers();
+  assert.equal(launchers.desktop.length, 8);
+  assert.equal(launchers.desktop.every((item) => item.availability === "ready"), true);
+  assert.deepEqual(
+    launchers.desktop.map((item) => item.id),
+    applications.filter((app) => app.availability === "ready").map((app) => app.id),
+  );
+  for (const appId of ["gallery", "schedule", "export"]) {
+    assert.equal(launchers.desktop.some((item) => item.id === appId), false);
+  }
+});
+
+test("START 菜单含即将推出分组且占位项全部 aria-disabled", () => {
+  const launchers = describeApplicationLaunchers();
+  assert.deepEqual(
+    launchers.startMenuGroups.map((group) => group.title),
+    ["可用应用", "即将推出"],
+  );
+  const upcoming = launchers.startMenuGroups[1];
+  assert.deepEqual(upcoming.items.map((item) => item.id), ["gallery", "schedule", "export"]);
+  assert.equal(upcoming.items.every((item) => item.ariaDisabled === "true"), true);
+  assert.equal(launchers.startMenuGroups[0].items.every((item) => item.ariaDisabled === null), true);
+});
+
+test("占位应用 hash 与导航目标仍严格回退到 DEFAULT_ROUTE", () => {
+  for (const target of ["gallery", "schedule", "export"]) {
+    const app = getApplicationById(target);
+    assert(app, target);
+    assert.notEqual(app.availability, "ready");
+    assert.equal(parseHashRoute(`#${app.route}`), DEFAULT_ROUTE);
+    assert.equal(resolveNavigationTarget(target), DEFAULT_ROUTE);
+    assert.equal(resolveNavigationTarget(app.route), DEFAULT_ROUTE);
+    assert.equal(hashForRoute(app.route), `#${DEFAULT_ROUTE}`);
+  }
+  assert.equal(parseHashRoute("#/review"), "/review");
+  assert.equal(parseHashRoute("#/review?windows=crawl"), DEFAULT_ROUTE);
 });
 
 test("布局反序列化会丢弃未知和非 ready 应用、去重并 clamp rect", () => {

@@ -606,6 +606,122 @@ class WebUiModuleTests(unittest.TestCase):
         self.assertIn("Canvas", forced)
         self.assertIn(".window-resize-handle", forced)
 
+    def test_window_manager_t13_static_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        webui = backend_root / "gdl_backend" / "webui"
+        index = (webui / "index.html").read_text(encoding="utf-8")
+        manager = (webui / "js" / "core" / "window-manager.js").read_text(
+            encoding="utf-8"
+        )
+        taskbar = (
+            webui / "js" / "components" / "taskbar-windows.js"
+        ).read_text(encoding="utf-8")
+        desktop = (webui / "js" / "core" / "desktop.js").read_text(
+            encoding="utf-8"
+        )
+        router = (webui / "js" / "core" / "router.js").read_text(
+            encoding="utf-8"
+        )
+        registry = (webui / "js" / "core" / "app-registry.js").read_text(
+            encoding="utf-8"
+        )
+        desktop_css = (webui / "styles" / "desktop.css").read_text(
+            encoding="utf-8"
+        )
+        responsive_css = (webui / "styles" / "responsive.css").read_text(
+            encoding="utf-8"
+        )
+
+        def javascript_block(source, marker):
+            start = source.index(marker)
+            opening = source.index("{", start + len(marker))
+            depth = 0
+            for position in range(opening, len(source)):
+                character = source[position]
+                if character == "{":
+                    depth += 1
+                elif character == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return source[opening + 1 : position]
+            self.fail(f"JavaScript block 未闭合：{marker}")
+
+        self.assertEqual(index.count("data-task-window-list"), 1)
+        self.assertIsNone(re.search(r"data-task-window(?!-list)", index))
+        self.assertIn("_TASKBAR_VISIBLE_LIMIT = 6", taskbar)
+        self.assertIn("buttons.slice(0, _TASKBAR_VISIBLE_LIMIT)", taskbar)
+        self.assertIn("buttons.slice(_TASKBAR_VISIBLE_LIMIT)", taskbar)
+        self.assertIn('text: "⋯"', taskbar)
+        self.assertIn('"aria-expanded": "false"', taskbar)
+        self.assertIn('"aria-controls": TASKBAR_OVERFLOW_LIST_ID', taskbar)
+        self.assertIn("overflowPanel.hidden = true", taskbar)
+        self.assertIn('event.key !== "Escape"', taskbar)
+        self.assertIn('documentObject.addEventListener("pointerdown"', taskbar)
+        self.assertIn("button.textContent = descriptor.label", taskbar)
+        self.assertIn("button.title = descriptor.title", taskbar)
+        self.assertIn('button.setAttribute("aria-pressed"', taskbar)
+        self.assertIn('button.toggleAttribute("data-minimized"', taskbar)
+        self.assertIn("onActivate(descriptor, button)", taskbar)
+        self.assertNotIn("innerHTML", taskbar)
+
+        task_activation = javascript_block(
+            manager, "activateTaskbarWindow(descriptor,"
+        )
+        self.assertIn('requestHide(instance, "minimized"', task_activation)
+        self.assertIn("actions.minimizeWindow(appId)", task_activation)
+        self.assertIn("actions.restoreWindow(appId)", task_activation)
+        self.assertIn("actions.focusWindow(appId)", task_activation)
+        self.assertIn("deriveWindowViews", manager)
+        self.assertIn("mobile || record.windowState", manager)
+        self.assertIn("rect: Object.freeze({ ...record.rect })", manager)
+        view_projection = javascript_block(
+            manager, "export function deriveWindowViews"
+        )
+        self.assertNotIn("actions.", view_projection)
+        self.assertNotIn("record.rect =", view_projection)
+        self.assertIn("instance.element.hidden = !view.visible", manager)
+        self.assertIn("handle.hidden = forced", manager)
+        self.assertIn("handle.tabIndex = forced ? -1 : 0", manager)
+        self.assertIn("instance.visible !== view.open", manager)
+        self.assertIn("只有真实 minimized 才停用应用", manager)
+        self.assertNotIn('record?.appId === "review"', manager)
+        self.assertIn("if (view.open && !view.maximized)", manager)
+
+        viewport_listener = re.search(
+            r'mobileViewport\.addEventListener\("change",\s*([A-Za-z_$][\w$]*)\)',
+            manager,
+        )
+        self.assertIsNotNone(viewport_listener)
+        viewport_change = javascript_block(
+            manager, f"const {viewport_listener.group(1)} ="
+        )
+        self.assertIn("commit: false", viewport_change)
+        self.assertNotIn("actions.moveWindow", viewport_change)
+        self.assertNotIn("actions.toggleWindowMaximized", viewport_change)
+        self.assertNotIn("windowStateChanged", viewport_change)
+
+        self.assertIn("describeApplicationLaunchers", desktop)
+        self.assertIn('app.availability === "ready"', desktop)
+        self.assertIn('title: "即将推出"', desktop)
+        self.assertIn('"aria-disabled": "true"', desktop)
+        self.assertIn('link.getAttribute("aria-disabled") === "true"', desktop)
+        self.assertIn('event.key !== "Enter" && event.key !== " "', desktop)
+        self.assertIn('application?.availability === "ready"', router)
+        for app_id in ("gallery", "schedule", "export"):
+            self.assertEqual(registry.count(f'id: "{app_id}"'), 1)
+        self.assertEqual(registry.count('availability: "placeholder"'), 3)
+
+        self.assertIn(".task-window-list", desktop_css)
+        self.assertIn('.task-window-button[aria-pressed="true"]', desktop_css)
+        self.assertIn(".task-window-button[data-minimized]", desktop_css)
+        self.assertIn(".task-window-overflow", desktop_css)
+        self.assertIn(".start-menu-group__title", desktop_css)
+        self.assertIn('.start-menu-item[aria-disabled="true"]', desktop_css)
+        mobile_css = responsive_css.split("@media (max-width: 767px)", 1)[1]
+        self.assertIn(".window-resize-handle", mobile_css)
+        self.assertIn("display: none", mobile_css)
+        self.assertIn(".task-window-primary", mobile_css)
+
     def test_pure_javascript_modules(self):
         node = shutil.which("node")
         if not node:
