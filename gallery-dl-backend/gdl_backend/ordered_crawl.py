@@ -13,16 +13,28 @@ from .discovery import DiscoveryError, DiscoveryService
 from .proxy import ProxyPoolAdapter
 from .redaction import redact_text
 from .scheduler import TaskScheduler
-from .schemas import SitePolicy, TaskCreate, TaskPolicy
+from .schemas import (
+    CrawlTaskLinkMetadata,
+    SitePolicy,
+    TaskCreate,
+    TaskPolicy,
+)
 from .source_keys import candidate_source_key
 
 
-EnqueueTask = Callable[
-    [TaskCreate, str, int],
-    Awaitable[tuple[dict, bool]],
+EnqueueBatch = Callable[
+    [list[TaskCreate], list[str], int],
+    Awaitable[list[dict]],
 ]
 PolicyProvider = Callable[[str], SitePolicy]
 _TWITTER_MEDIA_HOSTS = {"pbs.twimg.com", "video.twimg.com"}
+_ENQUEUE_CHUNK_SIZE = 50
+
+
+class EnqueueBatchCancelled(asyncio.CancelledError):
+    def __init__(self, results: list[dict]) -> None:
+        super().__init__("批量任务写入完成后收到取消请求")
+        self.results = results
 
 
 def _is_twitter_media_url(site: str, url: str) -> bool:
@@ -50,12 +62,12 @@ class OrderedCrawlManager:
         self.proxy = proxy
         self.policy_for = policy_for
         self.poll_interval = max(0.05, float(poll_interval))
-        self._enqueue: EnqueueTask | None = None
+        self._enqueue: EnqueueBatch | None = None
         self._loop_task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._stopping = False
 
-    def set_enqueue(self, callback: EnqueueTask) -> None:
+    def set_enqueue(self, callback: EnqueueBatch) -> None:
         self._enqueue = callback
 
     def notify(self) -> None:
@@ -203,46 +215,71 @@ class OrderedCrawlManager:
                 / f"{int(address['source_order']):02d}-{address['site']}"
                 / f"{int(address['address_order']):04d}"
             )
-            for sequence_no, (unit, digest) in enumerate(deduplicated, start=1):
-                # Hot loop over up to max_tasks units: use the cheap cancel-flag read
-                # instead of get_crawl_batch (which loads every address + the review)
-                # on each iteration — that lookup made planning a large address O(N²)
-                # and blocked the event loop for seconds.
+            for chunk_start in range(0, len(deduplicated), _ENQUEUE_CHUNK_SIZE):
+                # 热路径每块只读取一次取消标记，避免按媒体单元重复查询。
                 cancelled = self.db.crawl_batch_cancel_requested(batch["id"])
                 if cancelled is None or cancelled:
                     await cancel_linked()
                     return
-                unit_site = unit.site or address["site"]
-                direct_twitter_media = _is_twitter_media_url(unit_site, unit.url)
-                task_body = TaskCreate(
-                    url=unit.url,
-                    site=unit_site,
-                    output_dir=str(address_output),
-                    proxy_mode=address["proxy_mode"],
-                    max_attempts=address["max_attempts"],
-                    priority=address["priority"],
-                    credentials_ref=address.get("credentials_ref"),
-                    cookies_file=None if direct_twitter_media else address.get("cookies_file"),
-                    config_file=address.get("config_file"),
-                    eh_download=(address.get("download_options") or {}).get("eh"),
-                    extra_args=[*address.get("extra_args", []), *unit.extra_args],
+
+                bodies: list[TaskCreate] = []
+                idempotency_keys: list[str] = []
+                chunk = deduplicated[
+                    chunk_start : chunk_start + _ENQUEUE_CHUNK_SIZE
+                ]
+                for chunk_offset, (unit, digest) in enumerate(chunk):
+                    sequence_no = chunk_start + chunk_offset + 1
+                    unit_site = unit.site or address["site"]
+                    direct_twitter_media = _is_twitter_media_url(unit_site, unit.url)
+                    task_body = TaskCreate(
+                        url=unit.url,
+                        site=unit_site,
+                        output_dir=str(address_output),
+                        proxy_mode=address["proxy_mode"],
+                        max_attempts=address["max_attempts"],
+                        priority=address["priority"],
+                        credentials_ref=address.get("credentials_ref"),
+                        cookies_file=(
+                            None
+                            if direct_twitter_media
+                            else address.get("cookies_file")
+                        ),
+                        config_file=address.get("config_file"),
+                        eh_download=(address.get("download_options") or {}).get("eh"),
+                        extra_args=[*address.get("extra_args", []), *unit.extra_args],
+                    )
+                    task_body._policy_override = policy
+                    task_body._skip_managed_credentials = direct_twitter_media
+                    task_body._crawl_link = CrawlTaskLinkMetadata(
+                        address_id=address["id"],
+                        sequence_no=sequence_no,
+                        source_key=unit.source_key,
+                        source_url=unit.source_url,
+                    )
+                    bodies.append(task_body)
+                    idempotency_keys.append(
+                        f"crawl:{batch['id']}:{address['id']}:{digest[:48]}"
+                    )
+
+                try:
+                    chunk_results = await self._enqueue(
+                        bodies,
+                        idempotency_keys,
+                        int(batch["concurrency"]),
+                    )
+                except EnqueueBatchCancelled as exc:
+                    # 数据库 worker 可能已在取消到达前提交；先接回 ID，外层取消
+                    # 分支才能将这些已链接任务一并取消并保留在当前地址上排空。
+                    linked_tasks.extend(
+                        str(result["task_id"]) for result in exc.results
+                    )
+                    raise
+                linked_tasks.extend(
+                    str(result["task_id"]) for result in chunk_results
                 )
-                task_body._policy_override = policy
-                task_body._skip_managed_credentials = direct_twitter_media
-                key = f"crawl:{batch['id']}:{address['id']}:{digest[:48]}"
-                task, _created = await self._enqueue(
-                    task_body,
-                    key,
-                    int(batch["concurrency"]),
-                )
-                linked_tasks.append(task["id"])
-                self.db.link_crawl_task(
-                    address["id"],
-                    task["id"],
-                    sequence_no,
-                    source_key=unit.source_key,
-                    source_url=unit.source_url,
-                )
+                if len(chunk_results) != len(bodies):
+                    raise RuntimeError("批量任务入队返回数量不匹配")
+                await asyncio.sleep(0)
             latest = self.db.get_crawl_batch(batch["id"])
             if latest is None or latest["cancel_requested"]:
                 await cancel_linked()

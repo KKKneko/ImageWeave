@@ -55,7 +55,7 @@ from .discovery import (
 )
 from .gallery import GalleryRunner
 from .log_writer import TaskLogWriter
-from .ordered_crawl import OrderedCrawlManager
+from .ordered_crawl import EnqueueBatchCancelled, OrderedCrawlManager
 from .policy_view import (
     MAX_POLICY_REQUEST_BYTES,
     POLICY_RESPONSE_PROFILE,
@@ -100,7 +100,7 @@ from .schemas import (
     build_runtime_site_policy,
 )
 from .site_policy import EDITABLE_SITE_POLICY_FIELDS, EditableSitePolicy
-from .site import SiteResolver
+from .site import SiteInfo, SiteResolver
 
 # How long an EH/Pawchive search waits for the shared Danbooru artist-directory
 # lookup before proceeding without alias expansion.  The lookup keeps running
@@ -876,6 +876,72 @@ def create_app(
             config_file or managed.get("config_file"),
         )
 
+    def _build_task_row(
+        body: TaskCreate,
+        site_info: SiteInfo,
+        container: ServiceContainer,
+        *,
+        concurrency_override: int | None = None,
+    ) -> dict[str, Any]:
+        if body.site:
+            site = _canonical_site_name(body.site)
+            if site_info.supported:
+                _validate_site_match(site, site_info.site)
+        else:
+            site = site_info.site
+        policy = body._policy_override or container.policy_for(site)
+        if body.eh_download is not None:
+            if site != "exhentai":
+                raise ValueError("eh_download 仅适用于 EH/EHX 任务")
+            policy = TaskPolicy.model_validate(
+                {
+                    **policy.model_dump(),
+                    "eh_download": body.eh_download.model_dump(),
+                }
+            )
+        if concurrency_override is not None:
+            effective = min(
+                int(concurrency_override),
+                container.settings.scheduler.max_concurrent_tasks,
+            )
+            policy = policy.model_copy(update={"max_concurrency": max(1, effective)})
+        task_id = str(uuid.uuid4())
+        output_dir = container.settings.task_output_dir(body.output_dir, task_id)
+        if body._skip_managed_credentials:
+            credentials_ref = body.credentials_ref
+            cookies_value = body.cookies_file
+            config_value = body.config_file
+        else:
+            credentials_ref, cookies_value, config_value = _managed_request_credentials(
+                container,
+                site,
+                credentials_ref=body.credentials_ref,
+                cookies_file=body.cookies_file,
+                config_file=body.config_file,
+            )
+        cookies, config_file = _allowed_request_files(
+            container,
+            cookies_file=cookies_value,
+            config_file=config_value,
+        )
+        container.gallery.validate_args([*policy.extra_args, *body.extra_args])
+        return {
+            "id": task_id,
+            "url": body.url,
+            "site": site,
+            "subcategory": site_info.subcategory,
+            "extractor": site_info.extractor,
+            "priority": body.priority,
+            "output_dir": str(output_dir),
+            "proxy_mode": body.proxy_mode or policy.proxy_mode,
+            "max_attempts": body.max_attempts or (policy.retry_limit + 1),
+            "cookies_file": str(cookies) if cookies else None,
+            "config_file": str(config_file) if config_file else None,
+            "credentials_ref": credentials_ref,
+            "extra_args": body.extra_args,
+            "policy": policy.model_dump(),
+        }
+
     async def _enqueue_task(
         body: TaskCreate,
         *,
@@ -899,88 +965,100 @@ def create_app(
                     strict=container.settings.server.strict_target_dns,
                 )
             site_info = await asyncio.to_thread(container.resolver.resolve, body.url)
-            if body.site:
-                site = _canonical_site_name(body.site)
-                if site_info.supported:
-                    _validate_site_match(site, site_info.site)
-            else:
-                site = site_info.site
-            policy = body._policy_override or container.policy_for(site)
-            if body.eh_download is not None:
-                if site != "exhentai":
-                    raise ValueError("eh_download 仅适用于 EH/EHX 任务")
-                policy = TaskPolicy.model_validate(
-                    {
-                        **policy.model_dump(),
-                        "eh_download": body.eh_download.model_dump(),
-                    }
-                )
-            if concurrency_override is not None:
-                effective = min(
-                    int(concurrency_override),
-                    container.settings.scheduler.max_concurrent_tasks,
-                )
-                policy = policy.model_copy(update={"max_concurrency": max(1, effective)})
-            task_id = str(uuid.uuid4())
-            output_dir = container.settings.task_output_dir(body.output_dir, task_id)
-            if body._skip_managed_credentials:
-                credentials_ref = body.credentials_ref
-                cookies_value = body.cookies_file
-                config_value = body.config_file
-            else:
-                credentials_ref, cookies_value, config_value = _managed_request_credentials(
-                    container,
-                    site,
-                    credentials_ref=body.credentials_ref,
-                    cookies_file=body.cookies_file,
-                    config_file=body.config_file,
-                )
-            cookies, config_file = _allowed_request_files(
+            task_row = _build_task_row(
+                body,
+                site_info,
                 container,
-                cookies_file=cookies_value,
-                config_file=config_value,
+                concurrency_override=concurrency_override,
             )
-            container.gallery.validate_args([*policy.extra_args, *body.extra_args])
         except ValueError as exc:
             raise ApiError(422, "invalid_task", str(exc)) from exc
         task, created = container.db.create_task(
-            {
-                "id": task_id,
-                "url": body.url,
-                "site": site,
-                "subcategory": site_info.subcategory,
-                "extractor": site_info.extractor,
-                "priority": body.priority,
-                "output_dir": str(output_dir),
-                "proxy_mode": body.proxy_mode or policy.proxy_mode,
-                "max_attempts": body.max_attempts or (policy.retry_limit + 1),
-                "cookies_file": str(cookies) if cookies else None,
-                "config_file": str(config_file) if config_file else None,
-                "credentials_ref": credentials_ref,
-                "extra_args": body.extra_args,
-                "policy": policy.model_dump(),
-            },
+            task_row,
             idempotency_key=key,
         )
         if notify:
             container.scheduler.notify()
         return task, created
 
-    async def _enqueue_ordered_task(
-        body: TaskCreate,
-        idempotency_key: str,
+    async def _enqueue_ordered_tasks(
+        bodies: list[TaskCreate],
+        idempotency_keys: list[str],
         concurrency: int,
-    ) -> tuple[dict[str, Any], bool]:
-        return await _enqueue_task(
-            body,
-            idempotency_key=idempotency_key,
-            container=service,
-            concurrency_override=concurrency,
-            network_validated=True,
-            notify=False,
-        )
+    ) -> list[dict]:
+        if len(bodies) != len(idempotency_keys):
+            raise RuntimeError("批量任务与幂等键数量不一致")
+        if not bodies:
+            return []
 
-    service.ordered_crawls.set_enqueue(_enqueue_ordered_task)
+        keys: list[str] = []
+        metadata = []
+        for body, raw_key in zip(bodies, idempotency_keys):
+            key = _validate_idempotency_key(raw_key)
+            if key is None:
+                raise RuntimeError("顺序爬取任务缺少幂等键")
+            link = body._crawl_link
+            if link is None:
+                raise RuntimeError("顺序爬取任务缺少地址链接元数据")
+            keys.append(key)
+            metadata.append(link)
+        address_id = metadata[0].address_id
+        if any(link.address_id != address_id for link in metadata):
+            raise RuntimeError("同一入队块包含多个地址")
+
+        def _build_task_rows() -> list[dict[str, Any]]:
+            return [
+                _build_task_row(
+                    body,
+                    service.resolver.resolve(body.url),
+                    service,
+                    concurrency_override=concurrency,
+                )
+                for body in bodies
+            ]
+
+        try:
+            task_rows = await asyncio.to_thread(_build_task_rows)
+        except ValueError as exc:
+            raise ApiError(422, "invalid_task", str(exc)) from exc
+
+        items = [
+            {
+                "task": task_row,
+                "idempotency_key": key,
+                "sequence_no": link.sequence_no,
+                "source_key": link.source_key,
+                "source_url": link.source_url,
+            }
+            for task_row, key, link in zip(task_rows, keys, metadata)
+        ]
+        # shield 只覆盖已提交的 SQLite worker；取消若在提交竞态中到达，必须先
+        # 收回结果，再由顺序管理器把这些已链接任务纳入原有取消排空分支。
+        write_task = asyncio.create_task(
+            asyncio.to_thread(
+                service.db.create_crawl_media_tasks,
+                address_id,
+                items,
+            ),
+            name="ordered-crawl-media-write",
+        )
+        try:
+            return await asyncio.shield(write_task)
+        except asyncio.CancelledError as cancelled:
+            while not write_task.done():
+                try:
+                    await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    continue
+            if write_task.cancelled():
+                raise
+            try:
+                results = write_task.result()
+            except Exception as exc:
+                raise EnqueueBatchCancelled([]) from exc
+            raise EnqueueBatchCancelled(results) from cancelled
+
+    service.ordered_crawls.set_enqueue(_enqueue_ordered_tasks)
 
     @api.post("/tasks")
     async def create_task(

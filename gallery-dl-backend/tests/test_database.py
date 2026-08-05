@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from gdl_backend.database import Database
 
@@ -87,6 +88,65 @@ def crawl_address_values(batch_id: str) -> list[dict]:
             "max_attempts": 1,
         }
     ]
+
+
+def create_media_batch(
+    database: Database,
+    root: Path,
+    *,
+    batch_id: str = "batch-media",
+    address_id: str = "address-media",
+) -> None:
+    database.create_crawl_batch(
+        {
+            "id": batch_id,
+            "output_dir": str(root / "batch-media"),
+            "concurrency": 3,
+            "max_tasks": 100,
+        },
+        [
+            {
+                "id": address_id,
+                "site": "example.com",
+                "source_order": 0,
+                "address_order": 0,
+                "url": "https://example.com/gallery/media",
+                "proxy_mode": "prefer",
+                "max_attempts": 4,
+            }
+        ],
+    )
+
+
+def media_task_item(root: Path, index: int, *, sequence_no: int | None = None) -> dict:
+    return {
+        "task": {
+            **task_values(root),
+            "id": f"media-task-{index}",
+            "url": f"https://example.com/media/{index}",
+            "subcategory": "image",
+            "extractor": "ExampleImageExtractor",
+            "priority": index,
+            "output_dir": str(root / f"out-{index}"),
+            "proxy_mode": "required",
+            "max_attempts": 4,
+            "cookies_file": str(root / "cookies.txt"),
+            "config_file": str(root / "gallery.conf"),
+            "credentials_ref": "managed-example",
+            "extra_args": ["--range", str(index)],
+            "policy": {"max_concurrency": 3, "label": "字段对照"},
+        },
+        "idempotency_key": f"media-key-{index}",
+        "sequence_no": index if sequence_no is None else sequence_no,
+        "source_key": f"example:{index}",
+        "source_url": f"https://source.example/{index}",
+    }
+
+
+def table_rows(database: Database, table: str, order_by: str) -> list[dict]:
+    with database._read() as conn:
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
+    return [dict(row) for row in rows]
 
 
 class DatabaseSourceAuditTests(unittest.TestCase):
@@ -281,6 +341,140 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("lease", duplicate)
         self.assertIsNotNone(duplicate["latest_attempt"])
         self.assertIsNotNone(duplicate["lease"])
+
+    def test_chunked_enqueue_creates_same_tasks_as_before(self):
+        other = Database(self.root / "batch.sqlite3", max_logs_per_task=100)
+        try:
+            items = [
+                media_task_item(self.root, 1),
+                media_task_item(self.root, 2, sequence_no=1),
+                media_task_item(self.root, 3),
+            ]
+            with patch("gdl_backend.database.time.time", return_value=1234.5):
+                create_media_batch(self.db, self.root)
+                create_media_batch(other, self.root)
+                for item in items:
+                    task, created = self.db.create_task(
+                        item["task"],
+                        idempotency_key=item["idempotency_key"],
+                    )
+                    self.assertTrue(created)
+                    self.db.link_crawl_task(
+                        "address-media",
+                        task["id"],
+                        item["sequence_no"],
+                        source_key=item["source_key"],
+                        source_url=item["source_url"],
+                    )
+                results = other.create_crawl_media_tasks("address-media", items)
+
+            self.assertEqual(
+                results,
+                [
+                    {"task_id": f"media-task-{index}", "created": True}
+                    for index in range(1, 4)
+                ],
+            )
+            for table, order_by in (
+                ("tasks", "id"),
+                ("crawl_address_tasks", "sequence_no, task_id"),
+                ("crawl_task_source_keys", "task_id, source_key"),
+                ("task_events", "id"),
+            ):
+                with self.subTest(table=table):
+                    self.assertEqual(
+                        table_rows(other, table, order_by),
+                        table_rows(self.db, table, order_by),
+                    )
+            task_row = table_rows(other, "tasks", "id")[0]
+            self.assertEqual(task_row["status"], "queued")
+            self.assertEqual(task_row["attempt_count"], 0)
+            self.assertEqual(task_row["backoff_anchor_attempt"], 0)
+            self.assertEqual(task_row["cancel_requested"], 0)
+            self.assertEqual(task_row["last_error_class"], "")
+            self.assertEqual(task_row["last_error"], "")
+            self.assertEqual(task_row["tried_proxy_ids_json"], "[]")
+            self.assertEqual(task_row["artifact_count"], 0)
+            self.assertEqual(task_row["artifact_bytes"], 0)
+            self.assertEqual(task_row["version"], 0)
+            self.assertEqual(
+                [row["sequence_no"] for row in table_rows(
+                    other, "crawl_address_tasks", "sequence_no"
+                )],
+                [1, 2, 3],
+            )
+            self.assertEqual(other.get_crawl_batch("batch-media")["task_count"], 3)
+            self.assertTrue(
+                all(
+                    event["event_type"] == "queued"
+                    for event in table_rows(other, "task_events", "id")
+                )
+            )
+        finally:
+            other.close()
+
+    def test_chunk_rollback_on_failure(self):
+        create_media_batch(self.db, self.root)
+        first_chunk = [
+            media_task_item(self.root, 1),
+            media_task_item(self.root, 2),
+        ]
+        self.db.create_crawl_media_tasks("address-media", first_chunk)
+        second_chunk = [
+            media_task_item(self.root, 3),
+            media_task_item(self.root, 4),
+            media_task_item(self.root, 5),
+        ]
+        del second_chunk[1]["task"]["output_dir"]
+
+        with self.assertRaises(KeyError):
+            self.db.create_crawl_media_tasks("address-media", second_chunk)
+
+        self.assertEqual(
+            [row["id"] for row in table_rows(self.db, "tasks", "id")],
+            ["media-task-1", "media-task-2"],
+        )
+        self.assertEqual(len(table_rows(self.db, "crawl_address_tasks", "task_id")), 2)
+        self.assertEqual(len(table_rows(self.db, "crawl_task_source_keys", "task_id")), 2)
+        self.assertEqual(len(table_rows(self.db, "task_events", "id")), 2)
+        self.assertEqual(self.db.get_crawl_batch("batch-media")["task_count"], 2)
+
+    def test_idempotent_replan_creates_no_duplicates(self):
+        create_media_batch(self.db, self.root)
+        items = [
+            media_task_item(self.root, 1),
+            media_task_item(self.root, 2, sequence_no=1),
+        ]
+        first = self.db.create_crawl_media_tasks("address-media", items)
+        replanned = [
+            {
+                **item,
+                "task": {**item["task"], "id": f"replacement-{index}"},
+                "sequence_no": 90 + index,
+                "source_url": f"https://updated.example/{index}",
+            }
+            for index, item in enumerate(items, start=1)
+        ]
+        second = self.db.create_crawl_media_tasks("address-media", replanned)
+
+        self.assertTrue(all(item["created"] for item in first))
+        self.assertEqual(
+            second,
+            [
+                {"task_id": "media-task-1", "created": False},
+                {"task_id": "media-task-2", "created": False},
+            ],
+        )
+        self.assertEqual(len(table_rows(self.db, "tasks", "id")), 2)
+        self.assertEqual(len(table_rows(self.db, "task_events", "id")), 2)
+        links = table_rows(self.db, "crawl_address_tasks", "sequence_no")
+        self.assertEqual([row["sequence_no"] for row in links], [1, 2])
+        sources = table_rows(self.db, "crawl_task_source_keys", "task_id")
+        self.assertEqual(
+            [row["source_url"] for row in sources],
+            ["https://updated.example/1", "https://updated.example/2"],
+        )
+        self.assertEqual(self.db.get_crawl_batch("batch-media")["task_count"], 2)
 
     def test_task_attempt_retry_and_completion(self):
         created, is_new = self.db.create_task(task_values(self.root), idempotency_key="same")

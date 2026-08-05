@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -126,11 +127,20 @@ class TaskPolicy(SitePolicy):
         return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
+@dataclass(frozen=True, slots=True)
+class CrawlTaskLinkMetadata:
+    address_id: str
+    sequence_no: int
+    source_key: str | None = None
+    source_url: str | None = None
+
+
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     _policy_override: TaskPolicy | None = PrivateAttr(default=None)
     _skip_managed_credentials: bool = PrivateAttr(default=False)
+    _crawl_link: CrawlTaskLinkMetadata | None = PrivateAttr(default=None)
 
     url: str = Field(min_length=4, max_length=8192)
     site: str | None = Field(default=None, min_length=1, max_length=128)

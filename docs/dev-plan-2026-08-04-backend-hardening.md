@@ -1084,14 +1084,14 @@ EnqueueBatch = Callable[
 
 ### 验收标准
 
-- [ ] I1 `create_crawl_media_tasks` 存在，单事务完成 tasks + 链接 + source_keys + 事件。
-- [ ] I2 写入列与默认值与旧路径逐字段一致（由测试 1 保证）。
-- [ ] I3 `_ENQUEUE_CHUNK_SIZE = 50`，每块一次 cancel 检查、一次解析 `to_thread`、一次写入、
+- [x] I1 `create_crawl_media_tasks` 存在，单事务完成 tasks + 链接 + source_keys + 事件。
+- [x] I2 写入列与默认值与旧路径逐字段一致（由测试 1 保证）。
+- [x] I3 `_ENQUEUE_CHUNK_SIZE = 50`，每块一次 cancel 检查、一次解析 `to_thread`、一次写入、
       一次 `await asyncio.sleep(0)`。
-- [ ] I4 幂等键生成规则与 `_deduplicate` 未变。
-- [ ] I5 块内失败整块回滚。
-- [ ] I6 所有现有参数校验仍然执行。
-- [ ] I7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] I4 幂等键生成规则与 `_deduplicate` 未变。
+- [x] I5 块内失败整块回滚。
+- [x] I6 所有现有参数校验仍然执行。
+- [x] I7 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个基线测试全绿。
 
 ---

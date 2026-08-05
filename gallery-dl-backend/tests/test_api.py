@@ -113,6 +113,45 @@ class ApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
 
+    def _prepare_chunk_plan(self, count: int):
+        batch_id = "batch-chunks"
+        address_id = "address-chunks"
+        self.container.db.create_crawl_batch(
+            {
+                "id": batch_id,
+                "output_dir": str(self.settings.default_output_root / batch_id),
+                "concurrency": 7,
+                "max_tasks": count + 10,
+            },
+            [
+                {
+                    "id": address_id,
+                    "site": "example.com",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://example.com/gallery/chunks",
+                    "proxy_mode": "direct",
+                    "max_attempts": 4,
+                    "priority": 3,
+                }
+            ],
+        )
+        batch = self.container.db.get_crawl_batch(batch_id)
+        address = batch["sources"][0]["addresses"][0]
+        units = [
+            CrawlUnit(
+                url=f"https://example.com/media/{index}",
+                site="example.com",
+                kind="media",
+                source_id=f"example:{index}",
+                extra_args=["--range", str(index)],
+                source_key=f"example:{index}",
+                source_url=f"https://source.example/{index}",
+            )
+            for index in range(1, count + 1)
+        ]
+        return batch, address, units
+
     def test_health_ready_and_local_api(self):
         health = self.client.get("/healthz")
         self.assertEqual(health.status_code, 200)
@@ -2556,6 +2595,225 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid_mode.status_code, 422, invalid_mode.text)
 
+    def test_resolver_called_once_per_chunk(self):
+        import asyncio
+
+        batch, address, units = self._prepare_chunk_plan(120)
+        real_to_thread = asyncio.to_thread
+        original_create = self.container.db.create_crawl_media_tasks
+        original_cancel_check = self.container.db.crawl_batch_cancel_requested
+        resolver_workers = 0
+        write_calls = 0
+        cancel_checks = 0
+
+        async def tracked_to_thread(func, /, *args, **kwargs):
+            nonlocal resolver_workers
+            if getattr(func, "__name__", "") == "_build_task_rows":
+                resolver_workers += 1
+            return await real_to_thread(func, *args, **kwargs)
+
+        def tracked_create(address_id, items):
+            nonlocal write_calls
+            write_calls += 1
+            return original_create(address_id, items)
+
+        def tracked_cancel_check(batch_id):
+            nonlocal cancel_checks
+            cancel_checks += 1
+            return original_cancel_check(batch_id)
+
+        with (
+            patch.object(
+                self.container.ordered_crawls,
+                "_plan_address",
+                new=AsyncMock(return_value=(units, 0)),
+            ),
+            patch("gdl_backend.app.asyncio.to_thread", new=tracked_to_thread),
+            patch.object(
+                self.container.db,
+                "create_crawl_media_tasks",
+                new=tracked_create,
+            ),
+            patch.object(
+                self.container.db,
+                "crawl_batch_cancel_requested",
+                new=tracked_cancel_check,
+            ),
+        ):
+            asyncio.run(
+                self.container.ordered_crawls._activate_address(batch, address)
+            )
+
+        self.assertEqual(resolver_workers, 3)
+        self.assertEqual(write_calls, 3)
+        self.assertEqual(cancel_checks, 3)
+        self.assertEqual(self.container.db.crawl_address_task_count(address["id"]), 120)
+
+    def test_cancel_between_chunks_stops_enqueue(self):
+        import asyncio
+
+        batch, address, units = self._prepare_chunk_plan(120)
+        original_enqueue = self.container.ordered_crawls._enqueue
+        calls = 0
+
+        async def cancelling_enqueue(bodies, keys, concurrency):
+            nonlocal calls
+            calls += 1
+            results = await original_enqueue(bodies, keys, concurrency)
+            if calls == 1:
+                self.container.db.request_cancel_crawl_batch(batch["id"])
+            return results
+
+        self.container.ordered_crawls.set_enqueue(cancelling_enqueue)
+        try:
+            with patch.object(
+                self.container.ordered_crawls,
+                "_plan_address",
+                new=AsyncMock(return_value=(units, 0)),
+            ):
+                asyncio.run(
+                    self.container.ordered_crawls._activate_address(batch, address)
+                )
+        finally:
+            self.container.ordered_crawls.set_enqueue(original_enqueue)
+
+        linked = self.container.db.crawl_address_tasks(address["id"])
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(linked), 50)
+        self.assertTrue(all(task["status"] == "cancelled" for task in linked))
+        self.assertEqual(len(self.container.db.list_tasks(limit=500)), 50)
+
+    def test_event_loop_yields_between_chunks(self):
+        import asyncio
+
+        batch, address, units = self._prepare_chunk_plan(200)
+        real_sleep = asyncio.sleep
+        chunk_yields = 0
+        ticker_runs = 0
+        stop_ticker = False
+
+        async def tracked_sleep(delay, *args, **kwargs):
+            nonlocal chunk_yields
+            if delay == 0:
+                chunk_yields += 1
+            return await real_sleep(delay, *args, **kwargs)
+
+        async def scenario():
+            nonlocal ticker_runs, stop_ticker
+
+            async def ticker():
+                nonlocal ticker_runs
+                while not stop_ticker:
+                    await real_sleep(0)
+                    ticker_runs += 1
+
+            ticker_task = asyncio.create_task(ticker())
+            try:
+                await self.container.ordered_crawls._activate_address(batch, address)
+            finally:
+                stop_ticker = True
+                await ticker_task
+
+        with (
+            patch.object(
+                self.container.ordered_crawls,
+                "_plan_address",
+                new=AsyncMock(return_value=(units, 0)),
+            ),
+            patch("gdl_backend.ordered_crawl.asyncio.sleep", new=tracked_sleep),
+        ):
+            asyncio.run(scenario())
+
+        self.assertEqual(chunk_yields, 4)
+        self.assertGreaterEqual(ticker_runs, 4)
+        self.assertEqual(self.container.db.crawl_address_task_count(address["id"]), 200)
+
+    def test_chunked_enqueue_keeps_existing_task_validation(self):
+        import asyncio
+
+        batch, address, units = self._prepare_chunk_plan(2)
+        validation_calls = 0
+
+        def validate_args(_args):
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                raise ValueError("测试注入的参数拒绝")
+
+        with (
+            patch.object(
+                self.container.ordered_crawls,
+                "_plan_address",
+                new=AsyncMock(return_value=(units, 0)),
+            ),
+            patch.object(self.container.gallery, "validate_args", new=validate_args),
+        ):
+            asyncio.run(
+                self.container.ordered_crawls._activate_address(batch, address)
+            )
+
+        self.assertEqual(validation_calls, 2)
+        self.assertEqual(self.container.db.crawl_address_task_count(address["id"]), 0)
+        failed = self.container.db.get_crawl_batch(batch["id"])
+        self.assertEqual(failed["sources"][0]["addresses"][0]["status"], "failed")
+
+    def test_cancel_during_chunk_write_keeps_committed_tasks_visible(self):
+        import asyncio
+        import threading
+
+        batch, address, units = self._prepare_chunk_plan(2)
+        original_create = self.container.db.create_crawl_media_tasks
+        committed = threading.Event()
+        release_result = threading.Event()
+
+        def delayed_result(address_id, items):
+            results = original_create(address_id, items)
+            committed.set()
+            release_result.wait()
+            return results
+
+        async def scenario():
+            worker = asyncio.create_task(
+                self.container.ordered_crawls._activate_address(batch, address)
+            )
+            try:
+                ready = await asyncio.wait_for(
+                    asyncio.to_thread(committed.wait),
+                    timeout=2,
+                )
+                self.assertTrue(ready)
+                worker.cancel()
+                release_result.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+            finally:
+                release_result.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        with (
+            patch.object(
+                self.container.ordered_crawls,
+                "_plan_address",
+                new=AsyncMock(return_value=(units, 0)),
+            ),
+            patch.object(
+                self.container.db,
+                "create_crawl_media_tasks",
+                new=delayed_result,
+            ),
+        ):
+            asyncio.run(scenario())
+
+        current = self.container.db.get_crawl_batch(batch["id"])
+        current_address = current["sources"][0]["addresses"][0]
+        linked = self.container.db.crawl_address_tasks(address["id"])
+        self.assertEqual(current_address["status"], "running")
+        self.assertEqual(current_address["planned_task_count"], 2)
+        self.assertEqual(len(linked), 2)
+        self.assertTrue(all(task["status"] == "cancelled" for task in linked))
+
     def test_partial_enqueue_drains_current_address_before_next_address(self):
         import asyncio
 
@@ -2567,7 +2825,7 @@ class ApiTests(unittest.TestCase):
                         "site": "twitter",
                         "kind": "work",
                         "url": "https://x.com/artist/status/1",
-                        "media_count": 2,
+                        "media_count": 51,
                     }
                 ]
             }
@@ -2592,12 +2850,12 @@ class ApiTests(unittest.TestCase):
         original_enqueue = self.container.ordered_crawls._enqueue
         calls = 0
 
-        async def flaky_enqueue(body, key, concurrency):
+        async def flaky_enqueue(bodies, keys, concurrency):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise RuntimeError("injected enqueue failure")
-            return await original_enqueue(body, key, concurrency)
+            return await original_enqueue(bodies, keys, concurrency)
 
         self.container.ordered_crawls.set_enqueue(flaky_enqueue)
         asyncio.run(self.container.ordered_crawls.run_once())
@@ -2622,7 +2880,7 @@ class ApiTests(unittest.TestCase):
                         "site": "twitter",
                         "kind": "work",
                         "url": "https://x.com/artist/status/1",
-                        "media_count": 2,
+                        "media_count": 51,
                     }
                 ]
             }
@@ -2650,13 +2908,13 @@ class ApiTests(unittest.TestCase):
             second_enqueue = asyncio.Event()
             calls = 0
 
-            async def blocking_enqueue(body, key, concurrency):
+            async def blocking_enqueue(bodies, keys, concurrency):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     second_enqueue.set()
                     await asyncio.Event().wait()
-                return await original_enqueue(body, key, concurrency)
+                return await original_enqueue(bodies, keys, concurrency)
 
             self.container.ordered_crawls.set_enqueue(blocking_enqueue)
             worker = asyncio.create_task(self.container.ordered_crawls.run_once())
@@ -2670,11 +2928,11 @@ class ApiTests(unittest.TestCase):
             batch = self.container.db.get_crawl_batch(batch_id)
             first = batch["sources"][0]["addresses"][0]
             self.assertEqual(first["status"], "running")
-            self.assertEqual(first["planned_task_count"], 1)
+            self.assertEqual(first["planned_task_count"], 50)
             self.assertEqual(batch["sources"][0]["addresses"][1]["status"], "pending")
             linked = self.container.db.crawl_address_tasks(first["id"])
-            self.assertEqual(len(linked), 1)
-            self.assertEqual(linked[0]["status"], "cancelled")
+            self.assertEqual(len(linked), 50)
+            self.assertTrue(all(task["status"] == "cancelled" for task in linked))
 
             asyncio.run(self.container.ordered_crawls.run_once())
             batch = self.container.db.get_crawl_batch(batch_id)

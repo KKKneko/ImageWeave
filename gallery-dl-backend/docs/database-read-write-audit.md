@@ -11,6 +11,7 @@
 | `close` | 读写混合 | 否 | 连接生命周期操作；必须关闭唯一写连接和 registry 中的全部读连接，不是查询迁移对象。 |
 | `ping` | 读 | 是 | — |
 | `create_task` | 读写混合 | 否 | 创建路径必须使用写事务；幂等命中只读已提交行，可安全间接使用已迁移的 `get_task()`。 |
+| `create_crawl_media_tasks` | 读写混合 | 否 | 整块任务创建、排队事件、地址链接、来源键与批次计数必须在单一写事务内原子完成。 |
 | `get_task` | 读 | 是 | — |
 | `get_task_by_idempotency` | 读 | 是 | — |
 | `list_tasks` | 读 | 是 | — |
@@ -115,7 +116,7 @@
 | `ordered_crawl.py` | `_activate_address()` 计算重新规划预算 | `crawl_address_task_count` | 1 个标量计数，扫描当前地址的任务链接。 |
 | `ordered_crawl.py` | `_activate_address()` 计算批次剩余额度 | `crawl_batch_task_count` | 1 个标量计数，扫描批次全部任务链接；默认规模上限 10,000。 |
 | `ordered_crawl.py` | `_activate_address()` 在探活后、规划后、入队后、状态切换失败及异常路径复核取消状态 | `get_crawl_batch` | 每次返回 1 个完整批次聚合视图；单次地址激活路径最多调用 5 次。 |
-| `ordered_crawl.py` | `_activate_address()` 每个媒体单元入队前检查取消标记 | `crawl_batch_cancel_requested` | 每次 1 个布尔标量；按媒体单元调用，默认最多约 10,000 次/批次。 |
+| `ordered_crawl.py` | `_activate_address()` 每个媒体分块入队前检查取消标记 | `crawl_batch_cancel_requested` | 每次 1 个布尔标量；块大小固定为 50，默认最多约 200 次/批次。 |
 | `ordered_crawl.py` | `_plan_address()` 计算跨站预去重发现余量 | `succeeded_danbooru_source_key_count` | 1 个标量计数，扫描本批次已成功的 Danbooru 来源键。 |
 | `ordered_crawl.py` | `_plan_address()` 直接调用同步 `_filter_previously_downloaded_danbooru_sources()` | `succeeded_danbooru_source_keys` | 候选来源键按 500 个分块查询；常见可到批次媒体规模（默认 `max_tasks=10,000`）。 |
 | `scheduler.py` | `start()` 启动恢复前读取遗留进程 | `incomplete_processes` | 全部 `starting/running/cancelling` 任务；正常运行通常不超过全局并发默认值 20，崩溃恢复时可能包含遗留行。 |
@@ -132,4 +133,4 @@
 
 T5 留下的 8 个长尾纯读方法均已迁移到 `_read()`：`queued_task_ids`、`get_crawl_batch_by_idempotency`、`next_crawl_review_automatic`、`crawl_review_apply_images`、`crawl_review_automatic_images`、`next_crawl_address`、`succeeded_danbooru_source_keys`、`succeeded_danbooru_source_key_count`。
 
-最终审计覆盖全部 78 个公开方法，其中 31 个纯读方法全部使用 `_read()`；19 个纯写方法和 28 个读写混合/连接生命周期方法均在各自 `def` 紧邻上方保留一行中文原因注释。`tests/test_database.py` 的 `test_read_methods_do_not_take_write_lock` 使用 `inspect.getsource()` 检查全部纯读方法不引用 `self._lock`，模块级例外名单为 `frozenset` 且当前为空。
+最终审计覆盖全部 79 个公开方法，其中 31 个纯读方法全部使用 `_read()`；19 个纯写方法和 29 个读写混合/连接生命周期方法均在各自 `def` 紧邻上方保留一行中文原因注释。`tests/test_database.py` 的 `test_read_methods_do_not_take_write_lock` 使用 `inspect.getsource()` 检查全部纯读方法不引用 `self._lock`，模块级例外名单为 `frozenset` 且当前为空。

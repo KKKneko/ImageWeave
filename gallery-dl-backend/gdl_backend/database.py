@@ -601,6 +601,126 @@ class Database:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             return self._task(row), True  # type: ignore[return-value]
 
+    # 块内任务创建、地址链接、来源键和排队事件必须保留在单一写事务中。
+    def create_crawl_media_tasks(
+        self,
+        address_id: str,
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        with self._transaction() as conn:
+            for item in items:
+                values = item["task"]
+                idempotency_key = item["idempotency_key"]
+                if not isinstance(idempotency_key, str) or not idempotency_key:
+                    raise ValueError("爬取媒体任务缺少有效幂等键")
+
+                now = time.time()
+                proposed_task_id = str(values.get("id") or uuid.uuid4())
+                inserted = conn.execute(
+                    """
+                    INSERT INTO tasks(
+                        id, idempotency_key, url, site, subcategory, extractor, status,
+                        priority, output_dir, proxy_mode, max_attempts, attempt_count,
+                        next_run_at, created_at, updated_at, cookies_file, config_file,
+                        credentials_ref, extra_args_json, policy_json, tried_proxy_ids_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '[]')
+                    ON CONFLICT(idempotency_key) DO NOTHING
+                    """,
+                    (
+                        proposed_task_id,
+                        idempotency_key,
+                        values["url"],
+                        values["site"],
+                        values.get("subcategory", ""),
+                        values.get("extractor", ""),
+                        int(values.get("priority", 0)),
+                        values["output_dir"],
+                        values["proxy_mode"],
+                        int(values["max_attempts"]),
+                        now,
+                        now,
+                        now,
+                        values.get("cookies_file"),
+                        values.get("config_file"),
+                        values.get("credentials_ref"),
+                        json.dumps(values.get("extra_args", []), ensure_ascii=False),
+                        json.dumps(values.get("policy", {}), ensure_ascii=False),
+                    ),
+                )
+                created = bool(inserted.rowcount)
+                task_row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if task_row is None:
+                    raise RuntimeError("爬取媒体任务写入后无法回读")
+                task_id = str(task_row["id"])
+                if created:
+                    self._event(conn, task_id, "queued", {"site": values["site"]})
+
+                link_now = time.time()
+                already_linked = conn.execute(
+                    "SELECT 1 FROM crawl_address_tasks WHERE address_id=? AND task_id=?",
+                    (address_id, task_id),
+                ).fetchone()
+                if already_linked is None:
+                    requested_sequence = int(item["sequence_no"])
+                    slot_taken = conn.execute(
+                        "SELECT 1 FROM crawl_address_tasks WHERE address_id=? AND sequence_no=?",
+                        (address_id, requested_sequence),
+                    ).fetchone()
+                    if slot_taken is None:
+                        effective_sequence = requested_sequence
+                    else:
+                        effective_sequence = int(
+                            conn.execute(
+                                "SELECT COALESCE(MAX(sequence_no), 0) + 1 "
+                                "FROM crawl_address_tasks WHERE address_id=?",
+                                (address_id,),
+                            ).fetchone()[0]
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO crawl_address_tasks(
+                            address_id, task_id, sequence_no, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (address_id, task_id, effective_sequence, link_now),
+                    )
+
+                normalized_key = str(item.get("source_key") or "").strip()
+                if normalized_key:
+                    conn.execute(
+                        """
+                        INSERT INTO crawl_task_source_keys(
+                            task_id, source_key, source_url, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(task_id, source_key) DO UPDATE SET
+                            source_url=excluded.source_url
+                        """,
+                        (
+                            task_id,
+                            normalized_key[:500],
+                            str(item.get("source_url") or "").strip()[:8192],
+                            link_now,
+                        ),
+                    )
+
+                if already_linked is None:
+                    address_row = conn.execute(
+                        "SELECT batch_id FROM crawl_addresses WHERE id=?",
+                        (address_id,),
+                    ).fetchone()
+                    if address_row:
+                        conn.execute(
+                            "UPDATE crawl_batches SET task_count=task_count+1, "
+                            "updated_at=? WHERE id=?",
+                            (link_now, address_row["batch_id"]),
+                        )
+                results.append({"task_id": task_id, "created": created})
+        return results
+
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self._read() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
