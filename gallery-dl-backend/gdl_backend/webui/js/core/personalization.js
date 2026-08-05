@@ -63,9 +63,9 @@ export const WALLPAPER_BLUR_CLASSES = Object.freeze({
 });
 
 export const WINDOW_OPACITY_CLASSES = Object.freeze({
-  solid: "application-window--opacity-solid",
-  subtle: "application-window--opacity-subtle",
-  soft: "application-window--opacity-soft",
+  solid: "window-layer--opacity-solid",
+  subtle: "window-layer--opacity-subtle",
+  soft: "window-layer--opacity-soft",
 });
 
 export const PERSONALIZATION_RUNTIME_CLASS_MAPS = Object.freeze({
@@ -239,7 +239,7 @@ function applyWallpaperColor(wallpaper, colorId) {
   );
 }
 
-function applyPresentationClasses(wallpaper, applicationWindow, preferences) {
+function applyPresentationClasses(wallpaper, windowLayer, preferences) {
   const projected = projectPersonalizationPreferences(preferences);
   for (const field of WALLPAPER_PRESENTATION_FIELDS) {
     applyMappedClass(
@@ -250,7 +250,7 @@ function applyPresentationClasses(wallpaper, applicationWindow, preferences) {
     );
   }
   applyMappedClass(
-    applicationWindow,
+    windowLayer,
     WINDOW_OPACITY_CLASSES,
     projected.windowOpacity,
     "窗口透明度设置无效",
@@ -364,7 +364,7 @@ export function createPersonalizationRuntime({
   wallpaper = globalThis.document?.querySelector?.("[data-desktop-wallpaper]") ?? null,
   wallpaperImage = wallpaper?.querySelector?.("[data-desktop-wallpaper-image]") ?? null,
   wallpaperMask = wallpaper?.querySelector?.("[data-desktop-wallpaper-mask]") ?? null,
-  applicationWindow = globalThis.document?.querySelector?.("[data-application-window]") ?? null,
+  windowLayer = globalThis.document?.querySelector?.("[data-window-layer]") ?? null,
   themeRoot = globalThis.document?.documentElement ?? null,
   storage = null,
   wallpaperStorage = null,
@@ -644,7 +644,7 @@ export function createPersonalizationRuntime({
   };
 
   const applyDraft = (isCurrent = () => !destroyed) => {
-    const projected = applyPresentationClasses(wallpaper, applicationWindow, draft);
+    const projected = applyPresentationClasses(wallpaper, windowLayer, draft);
     const themeApplied = applyInterfaceTheme(themeRoot, projected);
     const image = selectedCustomImage();
     applyWallpaperColor(
@@ -1266,7 +1266,7 @@ export function createPersonalizationRuntime({
       try {
         const projected = applyPresentationClasses(
           wallpaper,
-          applicationWindow,
+          windowLayer,
           committed,
         );
         applyWallpaperColor(

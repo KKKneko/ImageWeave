@@ -52,16 +52,24 @@ try {
     wallpaper: document.querySelector("[data-desktop-wallpaper]"),
     wallpaperImage: document.querySelector("[data-desktop-wallpaper-image]"),
     wallpaperMask: document.querySelector("[data-desktop-wallpaper-mask]"),
-    applicationWindow: document.querySelector("[data-application-window]"),
+    windowLayer: document.querySelector("[data-window-layer]"),
     themeRoot: document.documentElement,
     storage,
     wallpaperStorage,
     motion: motionController,
   });
   const api = createApiClient();
+  const taskbarHeight = Number.parseFloat(
+    getComputedStyle(document.documentElement)
+      .getPropertyValue("--imageweave-taskbar-height"),
+  );
   const windows = storage.readWindowLayout({
     width: window.innerWidth,
     height: window.innerHeight,
+  }, {
+    taskbarHeight: Number.isFinite(taskbarHeight) && taskbarHeight >= 0
+      ? taskbarHeight
+      : 0,
   });
   const store = createStore({ initialState: createInitialState({ windows }) });
   polling = createPollingManager();

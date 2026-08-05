@@ -357,7 +357,7 @@ class WebUiModuleTests(unittest.TestCase):
             main,
         )
         self.assertIn(
-            'applicationWindow: document.querySelector("[data-application-window]")',
+            'windowLayer: document.querySelector("[data-window-layer]")',
             main,
         )
         self.assertIn(
@@ -369,6 +369,7 @@ class WebUiModuleTests(unittest.TestCase):
             index,
         )
         self.assertIn("data-desktop-wallpaper-mask", index)
+        self.assertIn("data-window-layer", index)
         self.assertIn("data-application-window", index)
 
         root_tokens = css_block(tokens_css, ":root")
@@ -476,18 +477,27 @@ class WebUiModuleTests(unittest.TestCase):
         self.assertIn(".desktop-icon:focus-visible", desktop_css)
         self.assertIn('.desktop-icon[aria-current="page"]', desktop_css)
 
-        subtle = css_block(desktop_css, ".application-window--opacity-subtle")
-        soft = css_block(desktop_css, ".application-window--opacity-soft")
+        subtle = css_block(
+            desktop_css,
+            ".window-layer--opacity-subtle .application-window",
+        )
+        soft = css_block(
+            desktop_css,
+            ".window-layer--opacity-soft .application-window",
+        )
         self.assertIn("96%", subtle)
         self.assertIn("92%", soft)
         self.assertNotIn("opacity:", subtle + soft)
         self.assertNotRegex(desktop_css, r"imageweave-surface\)\s+(?:[0-8]\d|9[01])%")
-        self.assertIn("@media (forced-colors: active), (prefers-contrast: more)", desktop_css)
+        self.assertIn("@media (forced-colors: active)", desktop_css)
         forced_colors = desktop_css.split(
-            "@media (forced-colors: active), (prefers-contrast: more)", 1
+            "@media (forced-colors: active)", 1
         )[1]
         self.assertIn(".application-window", forced_colors)
-        self.assertIn("background: var(--imageweave-surface) !important", forced_colors)
+        self.assertIn(".window-titlebar", forced_colors)
+        self.assertIn(".window-resize-handle", forced_colors)
+        self.assertIn("border-color: CanvasText", forced_colors)
+        self.assertIn("background: Canvas !important", forced_colors)
 
         # 透明背景不使用元素 opacity，因此这些实体表面仍保持实色。
         self.assertIn("background: var(--imageweave-surface)", css_block(desktop_css, ".start-menu"))
@@ -500,6 +510,101 @@ class WebUiModuleTests(unittest.TestCase):
             "background: var(--imageweave-surface)",
             css_block(status_css, ".error-view"),
         )
+
+    def test_window_manager_t12_static_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        webui = backend_root / "gdl_backend" / "webui"
+        index = (webui / "index.html").read_text(encoding="utf-8")
+        manager = (webui / "js" / "core" / "window-manager.js").read_text(
+            encoding="utf-8"
+        )
+        desktop = (webui / "js" / "core" / "desktop.js").read_text(
+            encoding="utf-8"
+        )
+        actions = (webui / "js" / "core" / "actions.js").read_text(
+            encoding="utf-8"
+        )
+        main = (webui / "js" / "main.js").read_text(encoding="utf-8")
+        desktop_css = (webui / "styles" / "desktop.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("<template data-window-template>", index)
+        self.assertIn("data-window-layer", index)
+        self.assertEqual(index.count('data-application-window'), 1)
+        self.assertEqual(index.count('data-window-resize="'), 3)
+        for direction, label in (
+            ("right", "调整窗口宽度"),
+            ("bottom", "调整窗口高度"),
+            ("corner", "调整窗口宽度和高度"),
+        ):
+            self.assertIn(f'data-window-resize="{direction}"', index)
+            self.assertIn(f'aria-label="{label}"', index)
+        self.assertNotIn('id="window-title"', index)
+        self.assertNotIn('id="app-content"', index)
+        self.assertIn('role="group"', index)
+
+        self.assertNotIn('role="dialog"', manager)
+        self.assertIn("const windows = new Map()", manager)
+        self.assertIn("windowTemplate.content.cloneNode(true)", manager)
+        self.assertIn("onMount?.(app, bodyEl)", manager)
+        self.assertIn("onUnmount?.(app, instance.bodyEl)", manager)
+        self.assertIn("instance.element.style.zIndex = String(index)", manager)
+        self.assertIn("setPointerCapture", manager)
+        self.assertIn("releasePointerCapture", manager)
+        self.assertIn('event.target.closest("button")', manager)
+        self.assertIn('{ capture: true }', manager)
+        self.assertNotIn('"mousemove"', manager)
+        self.assertNotIn("document.onmousemove", manager)
+        pointer_focus = manager[
+            manager.index("const onWindowPointerDown") :
+            manager.index("const onTitlebarPointerDown")
+        ]
+        self.assertIn("actions.focusWindow(instance.appId)", pointer_focus)
+        self.assertNotIn("preventDefault", pointer_focus)
+        pointer_move = manager[
+            manager.index("const movePointerInteraction") :
+            manager.index("const resizeFromKeyboard")
+        ]
+        self.assertIn("applyRect(instance.element, interaction.rect)", pointer_move)
+        self.assertNotIn("actions.", pointer_move)
+        self.assertIn("KEYBOARD_RESIZE_STEP = 16", manager)
+
+        self.assertRegex(
+            actions,
+            r"WINDOW_LAYOUT_DEBOUNCE_MS\s*=\s*(?:3\d\d|[4-9]\d\d|\d{4,})",
+        )
+        self.assertIn("beginWindowInteraction", actions)
+        self.assertIn("endWindowInteraction", actions)
+        self.assertIn("flushWindowLayout()", actions)
+        self.assertIn("mountApplication(app, bodyElement)", desktop)
+        self.assertIn("unmountApplication(app)", desktop)
+        self.assertIn("windowManager.focusBody()", desktop)
+        self.assertIn("`window-title-${app.id}`", manager)
+        self.assertIn("`app-content-${app.id}`", manager)
+
+        self.assertIn(
+            'windowLayer: document.querySelector("[data-window-layer]")',
+            main,
+        )
+        self.assertIn(".window-layer {", desktop_css)
+        self.assertIn("position: absolute", desktop_css)
+        self.assertIn("inset: 0", desktop_css)
+        self.assertIn(
+            ".window-layer--opacity-subtle .application-window",
+            desktop_css,
+        )
+        self.assertIn(
+            ".window-layer--opacity-soft .application-window",
+            desktop_css,
+        )
+        self.assertIn(':root[data-motion="off"] .application-window', desktop_css)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", desktop_css)
+        self.assertIn("@media (forced-colors: active)", desktop_css)
+        forced = desktop_css.split("@media (forced-colors: active)", 1)[1]
+        self.assertIn("CanvasText", forced)
+        self.assertIn("Canvas", forced)
+        self.assertIn(".window-resize-handle", forced)
 
     def test_pure_javascript_modules(self):
         node = shutil.which("node")

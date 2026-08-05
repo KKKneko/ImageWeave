@@ -1,4 +1,5 @@
 import { getApplicationById } from "./app-registry.js";
+import { clampRect } from "./window-geometry.js";
 import {
   normalizePersonalizationPreferences,
   PERSONALIZATION_PREFERENCE_KEYS,
@@ -137,23 +138,21 @@ function projectWindowRect(value) {
   return rect;
 }
 
-export function clampWindowRect(rect, viewport) {
+export function clampWindowRect(rect, viewport, geometryOptions = {}) {
   const projected = projectWindowRect(rect);
   const normalizedViewport = normalizeViewport(viewport);
-  return {
-    ...projected,
-    x: Math.min(
-      Math.max(projected.x, 32 - projected.w),
-      normalizedViewport.width - 32,
-    ),
-    y: Math.min(
-      Math.max(projected.y, 32 - projected.h),
-      normalizedViewport.height - 32,
-    ),
-  };
+  try {
+    return clampRect(projected, normalizedViewport, geometryOptions);
+  } catch {
+    // 读取端保持 T11 的静默自愈：无效视口选项退回无任务栏的安全几何。
+    return clampRect(projected, normalizedViewport);
+  }
 }
 
-function projectWindowRecord(value, { readyOnly = false, viewport = null } = {}) {
+function projectWindowRecord(
+  value,
+  { readyOnly = false, viewport = null, geometryOptions = {} } = {},
+) {
   if (!hasExactDataKeys(value, ["appId", "windowState", "rect"])) {
     throw new TypeError("窗口记录无效");
   }
@@ -164,7 +163,7 @@ function projectWindowRecord(value, { readyOnly = false, viewport = null } = {})
   const windowState = ownDataValue(value, "windowState");
   if (!WINDOW_STATES.has(windowState)) throw new TypeError("窗口状态无效");
   const rect = viewport
-    ? clampWindowRect(ownDataValue(value, "rect"), viewport)
+    ? clampWindowRect(ownDataValue(value, "rect"), viewport, geometryOptions)
     : projectWindowRect(ownDataValue(value, "rect"));
   return { appId, windowState, rect };
 }
@@ -179,15 +178,18 @@ function deduplicateWindowRecords(windows) {
   return result;
 }
 
-export function createDefaultWindowLayout(viewport = DEFAULT_VIEWPORT) {
+export function createDefaultWindowLayout(
+  viewport = DEFAULT_VIEWPORT,
+  geometryOptions = {},
+) {
   return [{
     appId: "crawl",
     windowState: getApplicationById("crawl").defaultWindowState,
-    rect: clampWindowRect(DEFAULT_WINDOW_RECT, viewport),
+    rect: clampWindowRect(DEFAULT_WINDOW_RECT, viewport, geometryOptions),
   }];
 }
 
-function deserializeWindowLayout(serialized, viewport) {
+function deserializeWindowLayout(serialized, viewport, geometryOptions) {
   const stored = parseObject(serialized);
   if (!stored || !hasExactDataKeys(stored, ["windows"])) return null;
   const rawWindows = ownDataValue(stored, "windows");
@@ -200,7 +202,11 @@ function deserializeWindowLayout(serialized, viewport) {
       if (typeof appId !== "string") return null;
       const app = getApplicationById(appId);
       if (!app || app.availability !== "ready") continue;
-      windows.push(projectWindowRecord(value, { readyOnly: true, viewport }));
+      windows.push(projectWindowRecord(value, {
+        readyOnly: true,
+        viewport,
+        geometryOptions,
+      }));
     }
   } catch {
     return null;
@@ -310,13 +316,14 @@ export function createStorageService({
     clearActiveBatchId() {
       return safeRemove(sessionStorage, STORAGE_KEYS.activeBatch);
     },
-    readWindowLayout(viewport = DEFAULT_VIEWPORT) {
+    readWindowLayout(viewport = DEFAULT_VIEWPORT, geometryOptions = {}) {
       const normalizedViewport = normalizeViewport(viewport);
       const serialized = safeRead(localStorage, STORAGE_KEYS.windowLayout);
       const restored = serialized === null
         ? null
-        : deserializeWindowLayout(serialized, normalizedViewport);
-      const windows = restored ?? createDefaultWindowLayout(normalizedViewport);
+        : deserializeWindowLayout(serialized, normalizedViewport, geometryOptions);
+      const windows = restored
+        ?? createDefaultWindowLayout(normalizedViewport, geometryOptions);
       if (serialized !== null) {
         const repaired = JSON.stringify({ windows });
         if (serialized !== repaired) safeWrite(localStorage, STORAGE_KEYS.windowLayout, repaired);

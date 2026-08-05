@@ -50,34 +50,58 @@
 
     <nav class="desktop-icons" data-desktop-icons aria-label="ImageWeave 应用快捷方式"></nav>
 
-    <section
-      class="application-window"
-      data-application-window
-      aria-labelledby="window-title"
-      hidden
-    >
-      <header class="window-titlebar">
-        <strong id="window-title" data-window-title>C:\IMAGEWEAVE\CRAWL.EXE</strong>
-        <div class="window-actions" aria-label="窗口操作">
-          <button type="button" data-window-minimize aria-label="最小化窗口" title="最小化">
-            <span aria-hidden="true">—</span>
-          </button>
-          <button
-            type="button"
-            data-window-maximize
-            aria-label="最大化窗口"
-            aria-pressed="false"
-            title="最大化"
-          >
-            <span aria-hidden="true">□</span>
-          </button>
-          <button type="button" data-window-close aria-label="关闭窗口" title="关闭">
-            <span aria-hidden="true">×</span>
-          </button>
-        </div>
-      </header>
-      <main id="app-content" class="window-body" data-window-body tabindex="-1"></main>
-    </section>
+    <div
+      class="window-layer window-layer--opacity-solid"
+      data-window-layer
+    ></div>
+
+    <template data-window-template>
+      <section
+        class="application-window"
+        data-application-window
+        role="group"
+      >
+        <header class="window-titlebar" data-window-titlebar>
+          <strong data-window-title></strong>
+          <div class="window-actions" aria-label="窗口操作">
+            <button type="button" data-window-minimize aria-label="最小化窗口" title="最小化">
+              <span aria-hidden="true">—</span>
+            </button>
+            <button
+              type="button"
+              data-window-maximize
+              aria-label="最大化窗口"
+              aria-pressed="false"
+              title="最大化"
+            >
+              <span aria-hidden="true">□</span>
+            </button>
+            <button type="button" data-window-close aria-label="关闭窗口" title="关闭">
+              <span aria-hidden="true">×</span>
+            </button>
+          </div>
+        </header>
+        <main class="window-body" data-window-body tabindex="-1"></main>
+        <button
+          type="button"
+          class="window-resize-handle window-resize-handle--right"
+          data-window-resize="right"
+          aria-label="调整窗口宽度"
+        ></button>
+        <button
+          type="button"
+          class="window-resize-handle window-resize-handle--bottom"
+          data-window-resize="bottom"
+          aria-label="调整窗口高度"
+        ></button>
+        <button
+          type="button"
+          class="window-resize-handle window-resize-handle--corner"
+          data-window-resize="corner"
+          aria-label="调整窗口宽度和高度"
+        ></button>
+      </section>
+    </template>
 
     <aside id="start-menu" class="start-menu" data-start-menu hidden>
       <strong>IMAGEWEAVE — APPLICATIONS</strong>

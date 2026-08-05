@@ -1447,16 +1447,16 @@ state.ui = {
 
 ### 验收标准
 
-- [ ] L1 可同时打开至少 3 个窗口并各自独立渲染、各自正常刷新数据。
-- [ ] L2 标题栏拖拽、右下角与右/下边缩放均可用，且手柄可键盘操作。
-- [ ] L3 拖拽/缩放过程不派 action、不写 localStorage；`pointerup` 后才持久化（防抖 >= 300ms）。
-- [ ] L4 窗口 id 按 appId 生成，无重复 id；skip-link 指向当前聚焦窗口。
-- [ ] L5 窗口为 `role="group"` + `aria-labelledby`，无焦点囚笼；
+- [x] L1 可同时打开至少 3 个窗口并各自独立渲染、各自正常刷新数据。
+- [x] L2 标题栏拖拽、右下角与右/下边缩放均可用，且手柄可键盘操作。
+- [x] L3 拖拽/缩放过程不派 action、不写 localStorage；`pointerup` 后才持久化（防抖 >= 300ms）。
+- [x] L4 窗口 id 按 appId 生成，无重复 id；skip-link 指向当前聚焦窗口。
+- [x] L5 窗口为 `role="group"` + `aria-labelledby`，无焦点囚笼；
       鼠标点击窗体内容不抢焦点。
-- [ ] L6 `data-motion="off"` 与 `prefers-reduced-motion` 下无过渡；
+- [x] L6 `data-motion="off"` 与 `prefers-reduced-motion` 下无过渡；
       forced-colors 下边框与手柄可见；不透明度档位对每个窗口生效。
-- [ ] L7 未引入新依赖；未改 `tokens.css`。
-- [ ] L8 `window-geometry.js` 为纯函数模块，上述测试要求的行为契约已被覆盖
+- [x] L7 未引入新依赖；未改 `tokens.css`。
+- [x] L8 `window-geometry.js` 为纯函数模块，上述测试要求的行为契约已被覆盖
       （数量不作硬性要求），新增测试全绿，288 个后端基线测试全绿。
 
 ---

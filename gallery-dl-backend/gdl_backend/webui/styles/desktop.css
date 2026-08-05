@@ -299,43 +299,74 @@
   font-weight: 700;
 }
 
+.window-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .application-window {
   position: absolute;
-  top: calc(50% - var(--imageweave-taskbar-height) / 2);
-  left: 58%;
-  z-index: 5;
   display: flex;
   flex-direction: column;
-  width: clamp(680px, 68vw, 1000px);
-  height: min(720px, calc(100dvh - var(--imageweave-taskbar-height) - 42px));
-  min-height: 360px;
+  width: 800px;
+  height: 560px;
+  min-width: 360px;
+  min-height: 240px;
   overflow: hidden;
   border: var(--imageweave-border-width) solid var(--imageweave-accent);
   background: var(--imageweave-surface);
-  box-shadow: var(--imageweave-hard-shadow);
-  transform: translate(-50%, -50%);
+  box-shadow: var(--imageweave-small-shadow);
+  pointer-events: auto;
+  transform: none;
+  animation: imageweave-window-appear 120ms ease-out;
+  transition:
+    left 120ms ease-out,
+    top 120ms ease-out,
+    width 120ms ease-out,
+    height 120ms ease-out,
+    box-shadow 120ms ease-out;
 }
 
-.application-window--opacity-solid {
+.application-window[data-window-focused] {
+  box-shadow: var(--imageweave-hard-shadow);
+}
+
+.application-window[data-window-interacting] {
+  animation: none;
+  transition: none;
+}
+
+.window-layer--opacity-solid .application-window {
   background: var(--imageweave-surface);
 }
 
-.application-window--opacity-subtle {
+.window-layer--opacity-subtle .application-window {
   background: var(--imageweave-surface);
   background: color-mix(in srgb, var(--imageweave-surface) 96%, transparent);
 }
 
-.application-window--opacity-soft {
+.window-layer--opacity-soft .application-window {
   background: var(--imageweave-surface);
   background: color-mix(in srgb, var(--imageweave-surface) 92%, transparent);
 }
 
 .application-window[data-maximized] {
-  inset: 8px 8px calc(var(--imageweave-taskbar-height) + 8px);
-  width: auto;
-  height: auto;
+  min-width: 0;
   min-height: 0;
   transform: none;
+}
+
+@keyframes imageweave-window-appear {
+  from {
+    transform: translateY(6px);
+  }
+
+  to {
+    transform: none;
+  }
 }
 
 .window-titlebar {
@@ -349,6 +380,9 @@
   color: var(--imageweave-surface);
   background: var(--imageweave-accent);
   line-height: 1.2;
+  cursor: move;
+  touch-action: none;
+  user-select: none;
 }
 
 .window-titlebar strong {
@@ -363,6 +397,64 @@
   flex: 0 0 auto;
   gap: 4px;
   margin-left: 8px;
+}
+
+.window-actions button {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.window-resize-handle {
+  position: absolute;
+  z-index: 2;
+  display: block;
+  margin: 0;
+  padding: 0;
+  appearance: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  touch-action: none;
+}
+
+.window-resize-handle--right {
+  top: var(--imageweave-window-title-height);
+  right: 0;
+  bottom: 16px;
+  width: 12px;
+  cursor: ew-resize;
+}
+
+.window-resize-handle--bottom {
+  right: 16px;
+  bottom: 0;
+  left: 0;
+  height: 12px;
+  cursor: ns-resize;
+}
+
+.window-resize-handle--corner {
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  border-top: var(--imageweave-border-width) solid var(--imageweave-accent);
+  border-left: var(--imageweave-border-width) solid var(--imageweave-accent);
+  cursor: nwse-resize;
+}
+
+.window-resize-handle--right:hover,
+.window-resize-handle--right:focus-visible {
+  border-left: var(--imageweave-border-width) solid var(--imageweave-accent);
+}
+
+.window-resize-handle--bottom:hover,
+.window-resize-handle--bottom:focus-visible {
+  border-top: var(--imageweave-border-width) solid var(--imageweave-accent);
+}
+
+.application-window[data-maximized] .window-resize-handle {
+  display: none;
 }
 
 .window-body {
@@ -503,11 +595,49 @@
   white-space: nowrap;
 }
 
-@media (forced-colors: active), (prefers-contrast: more) {
+:root[data-motion="off"] .application-window {
+  animation: none;
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .application-window {
+    animation: none;
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
   .application-window,
-  .application-window--opacity-solid,
-  .application-window--opacity-subtle,
-  .application-window--opacity-soft {
+  .window-layer--opacity-solid .application-window,
+  .window-layer--opacity-subtle .application-window,
+  .window-layer--opacity-soft .application-window {
+    border-color: CanvasText;
+    background: Canvas !important;
+    box-shadow: none;
+  }
+
+  .window-titlebar {
+    border-bottom: var(--imageweave-border-width) solid CanvasText;
+    color: Canvas;
+    background: CanvasText;
+  }
+
+  .window-resize-handle,
+  .window-resize-handle--right,
+  .window-resize-handle--bottom,
+  .window-resize-handle--corner {
+    border: var(--imageweave-border-width) solid CanvasText;
+    color: CanvasText;
+    background: Canvas;
+    forced-color-adjust: auto;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .window-layer--opacity-solid .application-window,
+  .window-layer--opacity-subtle .application-window,
+  .window-layer--opacity-soft .application-window {
     background: var(--imageweave-surface) !important;
   }
 }

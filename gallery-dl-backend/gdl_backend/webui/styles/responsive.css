@@ -34,15 +34,6 @@
     justify-self: start;
   }
 
-  .application-window,
-  .application-window[data-maximized] {
-    inset: 10px 10px calc(var(--imageweave-taskbar-height) + 10px) 128px;
-    width: auto;
-    height: auto;
-    min-height: 0;
-    transform: none;
-  }
-
   .taskbar-status .status-badge span:last-child {
     max-width: 58px;
     overflow: hidden;
@@ -101,18 +92,8 @@
     font-size: 0.52rem;
   }
 
-  .application-window,
-  .application-window[data-maximized] {
-    inset: 146px 4px calc(var(--imageweave-taskbar-height) + env(safe-area-inset-bottom) + 4px);
-    width: auto;
-    height: auto;
-    min-height: 0;
+  .application-window {
     box-shadow: var(--imageweave-small-shadow);
-    transform: none;
-  }
-
-  .application-window[data-maximized] {
-    top: 4px;
   }
 
   .window-titlebar {

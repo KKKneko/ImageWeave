@@ -75,12 +75,11 @@ export function initializeDesktop(root = document, services = {}) {
   const startMenu = requireElement("[data-start-menu]", desktop);
   const startMenuItems = requireElement("[data-start-menu-items]", startMenu);
   const startButton = requireElement("[data-start-button]", desktop);
-  const windowElement = requireElement("[data-application-window]", desktop);
-  const windowTitle = requireElement("[data-window-title]", windowElement);
-  const windowBody = requireElement("[data-window-body]", windowElement);
-  const minimizeButton = requireElement("[data-window-minimize]", windowElement);
-  const maximizeButton = requireElement("[data-window-maximize]", windowElement);
-  const closeButton = requireElement("[data-window-close]", windowElement);
+  const windowLayer = requireElement("[data-window-layer]", desktop);
+  const windowTemplate = requireElement("[data-window-template]", desktop);
+  if (!(windowTemplate instanceof HTMLTemplateElement)) {
+    throw new Error("窗口模板节点无效");
+  }
   const taskButton = requireElement("[data-task-window]", desktop);
   const clock = requireElement("[data-clock]", desktop);
   const clockIcon = requireElement("[data-clock-icon]", desktop);
@@ -96,9 +95,11 @@ export function initializeDesktop(root = document, services = {}) {
   let currentApp = null;
   let router;
   let actions;
+  let windowManager = null;
   let routeTransitionVersion = 0;
+  let focusBodyAfterRouteAppId = null;
 
-  const ensureMounted = (app) => {
+  const mountApplication = (app, windowBody) => {
     if (mountedApplications.has(app.id)) return mountedApplications.get(app.id);
 
     const appRoot = createElement("section", {
@@ -128,13 +129,14 @@ export function initializeDesktop(root = document, services = {}) {
       throw error;
     }
     setElementInert(appRoot, true);
-    const mounted = { context, active: false };
+    const mounted = { context, active: false, windowBody };
     mountedApplications.set(app.id, mounted);
     return mounted;
   };
 
   const setLifecycleActive = (app, active) => {
-    const mounted = ensureMounted(app);
+    const mounted = mountedApplications.get(app.id);
+    if (!mounted) throw new Error("应用窗口尚未挂载");
     if (mounted.active === active) return;
     if (active) {
       app.activate(mounted.context);
@@ -146,6 +148,19 @@ export function initializeDesktop(root = document, services = {}) {
     } finally {
       mounted.active = false;
       polling.stopScope(mounted.context.pollingScope);
+    }
+  };
+
+  const unmountApplication = (app) => {
+    const mounted = mountedApplications.get(app.id);
+    if (!mounted) return;
+    try {
+      if (mounted.active) setLifecycleActive(app, false);
+      app.unmount(mounted.context);
+    } finally {
+      polling.stopScope(mounted.context.pollingScope);
+      mounted.context.root.remove();
+      mountedApplications.delete(app.id);
     }
   };
 
@@ -170,29 +185,39 @@ export function initializeDesktop(root = document, services = {}) {
     const transition = ++routeTransitionVersion;
     void (async () => {
       const previous = currentApp;
-      if (previous && previous.id !== app.id && typeof previous.beforeLeave === "function") {
-        const mounted = ensureMounted(previous);
+      const previousMounted = previous ? mountedApplications.get(previous.id) : null;
+      if (
+        previous
+        && previousMounted
+        && previous.id !== app.id
+        && typeof previous.beforeLeave === "function"
+      ) {
         let allowed = false;
         try {
-          allowed = await previous.beforeLeave(mounted.context, app);
+          allowed = await previous.beforeLeave(previousMounted.context, app);
         } catch {
           allowed = false;
         }
         if (transition !== routeTransitionVersion) return;
         if (!allowed) {
+          focusBodyAfterRouteAppId = null;
           announcer.textContent = `无法离开${previous.label}；请先处理未保存内容。`;
           router.navigate(previous.id);
           return;
         }
       }
       if (transition !== routeTransitionVersion) return;
-      ensureMounted(app);
       currentApp = app;
       updateNavigationState(app);
       actions.routeResolved(app);
+      if (focusBodyAfterRouteAppId === app.id) {
+        focusBodyAfterRouteAppId = null;
+        windowManager?.focusBody(app.id);
+      }
       document.title = `ImageWeave — ${app.label}`;
       announcer.textContent = `已打开${app.label}，${app.windowTitle}`;
     })().catch(() => {
+      focusBodyAfterRouteAppId = null;
       announcer.textContent = "应用切换失败；当前窗口保持不变。";
       if (currentApp) router.navigate(currentApp.id);
     });
@@ -201,16 +226,18 @@ export function initializeDesktop(root = document, services = {}) {
   router = createHashRouter(activateRoute);
   actions = createShellActions({ store, router, storage });
 
-  const windowManager = createWindowManager({
-    windowElement,
-    titleElement: windowTitle,
-    bodyElement: windowBody,
-    minimizeButton,
-    maximizeButton,
-    closeButton,
+  windowManager = createWindowManager({
+    windowLayer,
+    windowTemplate,
     taskButton,
     store,
     actions,
+    onMount(app, bodyElement) {
+      mountApplication(app, bodyElement);
+    },
+    onUnmount(app) {
+      unmountApplication(app);
+    },
     onVisibilityChange(visible, app) {
       setLifecycleActive(app, visible);
     },
@@ -219,8 +246,10 @@ export function initializeDesktop(root = document, services = {}) {
     },
     onBeforeHide(app, visibility) {
       if (typeof app?.beforeWindowHide !== "function") return true;
-      const mounted = ensureMounted(app);
-      return app.beforeWindowHide(mounted.context, visibility);
+      const mounted = mountedApplications.get(app.id);
+      return mounted
+        ? app.beforeWindowHide(mounted.context, visibility)
+        : true;
     },
   });
 
@@ -243,6 +272,7 @@ export function initializeDesktop(root = document, services = {}) {
     const link = event.target.closest("[data-app-link]");
     if (!(link instanceof HTMLAnchorElement)) return;
     event.preventDefault();
+    focusBodyAfterRouteAppId = event.detail === 0 ? link.dataset.appLink : null;
     actions.navigateToApp(link.dataset.appLink);
   };
 
@@ -259,9 +289,10 @@ export function initializeDesktop(root = document, services = {}) {
     }
   };
   const onSkip = () => {
+    if (windowManager.focusBody()) return;
     const snapshot = windowManager.getSnapshot();
-    if (snapshot.visibility === "open") windowBody.focus({ preventScroll: true });
-    else if (currentApp) focusDesktopApplication(currentApp);
+    const fallbackApp = snapshot.appId ? applications.find((app) => app.id === snapshot.appId) : null;
+    if (fallbackApp) focusDesktopApplication(fallbackApp);
   };
 
   desktopIcons.addEventListener("click", onNavigationClick);
@@ -281,6 +312,8 @@ export function initializeDesktop(root = document, services = {}) {
     router,
     windowManager,
     destroy() {
+      routeTransitionVersion += 1;
+      focusBodyAfterRouteAppId = null;
       router.stop();
       stopClock();
       windowManager.destroy();
@@ -291,18 +324,11 @@ export function initializeDesktop(root = document, services = {}) {
       document.removeEventListener("pointerdown", onOutsidePointerDown);
       document.removeEventListener("keydown", onKeyDown);
       skipLink.removeEventListener("click", onSkip);
-      for (const [appId, mounted] of mountedApplications) {
+      for (const appId of [...mountedApplications.keys()]) {
         const app = applications.find((candidate) => candidate.id === appId);
-        if (!app) continue;
-        if (mounted.active) {
-          try {
-            app.deactivate(mounted.context);
-          } finally {
-            polling.stopScope(mounted.context.pollingScope);
-          }
-        }
-        app.unmount(mounted.context);
+        if (app) unmountApplication(app);
       }
+      actions.destroy();
       mountedApplications.clear();
       delete document.documentElement.dataset.webuiReady;
     },

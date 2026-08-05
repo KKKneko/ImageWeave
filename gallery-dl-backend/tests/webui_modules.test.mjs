@@ -10,7 +10,10 @@ import {
   normalizeApiError,
   parseResponseText,
 } from "../gdl_backend/webui/js/core/api.js";
-import { createShellActions } from "../gdl_backend/webui/js/core/actions.js";
+import {
+  createShellActions,
+  WINDOW_LAYOUT_DEBOUNCE_MS,
+} from "../gdl_backend/webui/js/core/actions.js";
 import {
   applications,
   getApplicationById,
@@ -138,6 +141,12 @@ import {
   WALLPAPER_STORAGE_SCHEMA,
   WallpaperStorageError,
 } from "../gdl_backend/webui/js/core/wallpaper-storage.js";
+import {
+  clampRect,
+  maximizedRect,
+  nextRectForDrag,
+  nextRectForResize,
+} from "../gdl_backend/webui/js/core/window-geometry.js";
 import {
   createStorageService,
   isValidBatchId,
@@ -372,6 +381,7 @@ class FakeTimers {
     this.now = 0;
     this.sequence = 0;
     this.jobs = new Map();
+    this.cleared = [];
   }
 
   setTimeout = (callback, delay) => {
@@ -381,8 +391,23 @@ class FakeTimers {
   };
 
   clearTimeout = (id) => {
+    this.cleared.push(id);
     this.jobs.delete(id);
   };
+
+  advanceBy(duration) {
+    const target = this.now + duration;
+    while (true) {
+      const next = [...this.jobs.entries()].sort((left, right) =>
+        left[1].due - right[1].due || left[0] - right[0])[0];
+      if (!next || next[1].due > target) break;
+      const [id, job] = next;
+      this.jobs.delete(id);
+      this.now = job.due;
+      job.callback();
+    }
+    this.now = target;
+  }
 
   runNext() {
     const next = [...this.jobs.entries()].sort((left, right) =>
@@ -584,7 +609,7 @@ function createWallpaperSurfaceFixture({ onSourceChange = null } = {}) {
       return selector === "[data-desktop-wallpaper-mask]" ? mask : null;
     },
   };
-  const applicationWindow = { classList: new FakeClassList() };
+  const windowLayer = { classList: new FakeClassList() };
   const urlApi = Object.freeze({
     createObjectURL(blob) {
       sequence += 1;
@@ -601,7 +626,7 @@ function createWallpaperSurfaceFixture({ onSourceChange = null } = {}) {
     wallpaper,
     image,
     mask,
-    applicationWindow,
+    windowLayer,
     urlApi,
     created,
     revoked,
@@ -838,10 +863,13 @@ test("跨应用 action 先调用 router，只有路由结果才能更新 focused
     writeActiveBatchId: (batchId) => writes.push(["batch", batchId]),
     clearActiveBatchId: () => writes.push(["batch-clear"]),
   };
+  const timers = new FakeTimers();
   const actions = createShellActions({
     store,
     router: { navigate: (target) => navigations.push(target) },
     storage,
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
   });
 
   actions.navigateToApp("review");
@@ -850,21 +878,21 @@ test("跨应用 action 先调用 router，只有路由结果才能更新 focused
   actions.routeResolved(getApplicationById("review"));
   assert.equal(store.getState().ui.focusedAppId, "review");
   assert.equal(store.getState().ui.windows[0].windowState, "maximized");
-  actions.toggleWindowMaximized();
+  actions.toggleWindowMaximized("review");
   assert.equal(store.getState().ui.windows[0].windowState, "normal");
-  actions.minimizeWindow();
+  actions.minimizeWindow("review");
   assert.equal(store.getState().ui.focusedAppId, null);
   assert.deepEqual(navigations, ["review"], "无聚焦窗口时不得触发路由重开");
-  actions.restoreWindow();
+  actions.restoreWindow("review");
   assert.equal(store.getState().ui.focusedAppId, "review");
   assert.deepEqual(navigations, ["review", "review"]);
-  assert.deepEqual(writes.map((entry) => entry[0]), [
-    "layout", "app", "layout", "layout", "layout", "app",
-  ]);
-  assert.deepEqual(writes[0][1].map((item) => item.windowState), ["maximized"]);
-  assert.deepEqual(writes[2][1].map((item) => item.windowState), ["normal"]);
-  assert.deepEqual(writes[3][1].map((item) => item.windowState), ["minimized"]);
-  assert.deepEqual(writes[4][1].map((item) => item.windowState), ["normal"]);
+  assert.equal(WINDOW_LAYOUT_DEBOUNCE_MS >= 300, true);
+  assert.deepEqual(timers.delays(), [WINDOW_LAYOUT_DEBOUNCE_MS]);
+  assert.deepEqual(writes.map((entry) => entry[0]), ["app", "app"]);
+  timers.runNext();
+  assert.deepEqual(writes.map((entry) => entry[0]), ["app", "app", "layout"]);
+  assert.deepEqual(writes.at(-1)[1].map((item) => item.windowState), ["normal"]);
+  actions.destroy();
 });
 
 test("windowOpened 重复打开同一 appId 不会产生第二个窗口", () => {
@@ -1004,6 +1032,176 @@ test("窗口 rect 小于最小尺寸时抛 TypeError", () => {
   assert.deepEqual(store.getState().ui.windows[0].rect, windowRect({ w: 360, h: 240 }));
 });
 
+test("clampRect 在四个视口边缘都保留至少 32px 可见区域", () => {
+  const viewport = { width: 1000, height: 700 };
+  const options = { minW: 360, minH: 240, taskbarHeight: 40 };
+  const topLeft = clampRect(
+    { x: -5000, y: -5000, w: 720, h: 480 },
+    viewport,
+    options,
+  );
+  assert.deepEqual(topLeft, { x: -688, y: -448, w: 720, h: 480 });
+  assert.equal(topLeft.x + topLeft.w, 32);
+  assert.equal(topLeft.y + topLeft.h, 32);
+
+  const bottomRight = clampRect(
+    { x: 5000, y: 5000, w: 720, h: 480 },
+    viewport,
+    options,
+  );
+  assert.deepEqual(bottomRight, { x: 968, y: 180, w: 720, h: 480 });
+  assert.equal(viewport.width - bottomRight.x, 32);
+});
+
+test("clampRect 与 maximizedRect 始终停在任务栏可用区上方", () => {
+  const viewport = { width: 1024, height: 768 };
+  const options = { minW: 360, minH: 240, taskbarHeight: 48 };
+  const normal = clampRect(
+    { x: 20, y: 700, w: 640, h: 400 },
+    viewport,
+    options,
+  );
+  assert.equal(normal.y + normal.h, 720);
+  assert.deepEqual(maximizedRect(viewport, options), {
+    x: 0,
+    y: 0,
+    w: 1024,
+    h: 720,
+  });
+});
+
+test("resize 遵守 360x240 最小尺寸且 drag 在边缘 clamp", () => {
+  const viewport = { width: 1000, height: 700 };
+  const options = { minW: 360, minH: 240, taskbarHeight: 40 };
+  assert.deepEqual(nextRectForResize(
+    { x: 100, y: 80, w: 500, h: 300 },
+    { x: -1000, y: -1000 },
+    viewport,
+    options,
+  ), { x: 100, y: 80, w: 360, h: 240 });
+  assert.deepEqual(nextRectForDrag(
+    { x: 100, y: 80, w: 500, h: 300 },
+    { x: 5000, y: 5000 },
+    viewport,
+    options,
+  ), { x: 968, y: 360, w: 500, h: 300 });
+});
+
+test("窗口几何严格拒绝未知字段、访问器与非有限数字", () => {
+  assert.throws(() => clampRect(
+    { x: 0, y: 0, w: 500, h: 300, zIndex: 1 },
+    { width: 1000, height: 700 },
+  ), TypeError);
+  assert.throws(() => nextRectForDrag(
+    { x: 0, y: 0, w: 500, h: 300 },
+    { x: Number.NaN, y: 0 },
+    { width: 1000, height: 700 },
+  ), TypeError);
+  const accessor = { x: 0, y: 0, w: 500 };
+  Object.defineProperty(accessor, "h", { enumerable: true, get: () => 300 });
+  assert.throws(() => clampRect(accessor, { width: 1000, height: 700 }), TypeError);
+});
+
+test("maximized 只改变窗口状态，恢复后保留最大化前 rect", () => {
+  const rect = windowRect({ x: 91, y: 73, w: 640, h: 420 });
+  const store = createStore({
+    initialState: createInitialState({ windows: [windowRecord("crawl", "normal", rect)] }),
+    reportError: () => {},
+  });
+  store.dispatch(actionCreators.windowStateChanged("crawl", "maximized"));
+  assert.deepEqual(store.getState().ui.windows[0].rect, rect);
+  store.dispatch(actionCreators.windowStateChanged("crawl", "normal"));
+  assert.deepEqual(store.getState().ui.windows[0], windowRecord("crawl", "normal", rect));
+});
+
+test("布局防抖在交互期间不写 storage，destroy 会落定最终 rect", () => {
+  const store = createStore({
+    initialState: createInitialState({ windows: [windowRecord("crawl")] }),
+    reportError: () => {},
+  });
+  const timers = new FakeTimers();
+  const layouts = [];
+  const actions = createShellActions({
+    store,
+    router: { navigate() {} },
+    storage: {
+      writeCurrentApp() {},
+      writeWindowLayout(windows) {
+        layouts.push(windows.map((record) => ({ ...record, rect: { ...record.rect } })));
+      },
+      writeActiveBatchId() {},
+      clearActiveBatchId() {},
+    },
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
+  });
+  actions.beginWindowInteraction();
+  const finalRect = windowRect({ x: 144, y: 96, w: 800, h: 520 });
+  actions.moveWindow("crawl", finalRect);
+  assert.equal(layouts.length, 0);
+  assert.equal(timers.jobs.size, 0);
+  actions.endWindowInteraction();
+  assert.deepEqual(timers.delays(), [WINDOW_LAYOUT_DEBOUNCE_MS]);
+  actions.destroy();
+  assert.equal(timers.jobs.size, 0);
+  assert.equal(layouts.length, 1);
+  assert.deepEqual(layouts[0][0].rect, finalRect);
+});
+
+test("布局防抖从最后一次变化重新计算完整 300ms 静默期", () => {
+  const store = createStore({
+    initialState: createInitialState({ windows: [windowRecord("crawl")] }),
+    reportError: () => {},
+  });
+  const timers = new FakeTimers();
+  const layouts = [];
+  const actions = createShellActions({
+    store,
+    router: { navigate() {} },
+    storage: {
+      writeCurrentApp() {},
+      writeWindowLayout(windows) {
+        layouts.push(windows.map((record) => ({ ...record, rect: { ...record.rect } })));
+      },
+      writeActiveBatchId() {},
+      clearActiveBatchId() {},
+    },
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
+  });
+
+  const firstRect = windowRect({ x: 80, y: 64, w: 760, h: 500 });
+  const latestRect = windowRect({ x: 112, y: 88, w: 784, h: 512 });
+  assert.equal(actions.moveWindow("crawl", firstRect), true);
+  const firstJobId = timers.sequence;
+  assert.equal(timers.jobs.get(firstJobId).due, WINDOW_LAYOUT_DEBOUNCE_MS);
+
+  timers.advanceBy(250);
+  assert.equal(layouts.length, 0);
+  assert.equal(actions.moveWindow("crawl", latestRect), true);
+  const latestJobId = timers.sequence;
+  assert.notEqual(latestJobId, firstJobId);
+  assert.deepEqual(timers.cleared, [firstJobId], "第二次变化必须清除旧 job");
+  assert.equal(timers.jobs.has(firstJobId), false);
+  assert.deepEqual(timers.delays(), [WINDOW_LAYOUT_DEBOUNCE_MS]);
+
+  timers.advanceBy(WINDOW_LAYOUT_DEBOUNCE_MS - 250);
+  assert.equal(timers.now, WINDOW_LAYOUT_DEBOUNCE_MS);
+  assert.equal(layouts.length, 0, "旧 deadline 不得写入 storage");
+  assert.deepEqual(timers.delays(), [250]);
+  timers.advanceBy(249);
+  assert.equal(layouts.length, 0);
+  timers.advanceBy(1);
+  assert.equal(layouts.length, 1);
+  assert.deepEqual(layouts[0][0].rect, latestRect);
+  assert.equal(timers.jobs.size, 0);
+
+  timers.advanceBy(WINDOW_LAYOUT_DEBOUNCE_MS);
+  assert.equal(layouts.length, 1, "最终只允许写入一次最新布局");
+  actions.destroy();
+  assert.equal(layouts.length, 1);
+});
+
 test("selectors.windowView 保持旧形状且 hash 只包含单个聚焦应用", () => {
   const store = createStore({ reportError: () => {} });
   assert.deepEqual(selectors.windowView(store.getState()), {
@@ -1042,7 +1240,7 @@ test("布局反序列化会丢弃未知和非 ready 应用、去重并 clamp rec
   const windows = storage.readWindowLayout({ width: 1024, height: 600 });
   assert.deepEqual(windows, [
     windowRecord("review", "maximized", { x: 992, y: -528, w: 800, h: 560 }),
-    windowRecord("crawl", "minimized", { x: -688, y: 568, w: 720, h: 480 }),
+    windowRecord("crawl", "minimized", { x: -688, y: 120, w: 720, h: 480 }),
   ]);
   const repaired = JSON.parse(local.values.get(STORAGE_KEYS.windowLayout));
   assert.deepEqual(repaired, { windows });
@@ -1074,7 +1272,7 @@ test("损坏的 localStorage 窗口布局静默回退到安全默认布局", () 
       windows = storage.readWindowLayout({ width: 800, height: 600 });
     });
     assert.deepEqual(windows, [
-      windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 }),
+      windowRecord("crawl", "normal", { x: 160, y: 40, w: 800, h: 560 }),
     ]);
     assert.deepEqual(JSON.parse(local.values.get(STORAGE_KEYS.windowLayout)), { windows });
   }
@@ -2082,7 +2280,7 @@ test("G2 主题低对比即时预览应用，格式与 setter 失败仍安全阻
       wallpaper: surface.wallpaper,
       wallpaperImage: surface.image,
       wallpaperMask: surface.mask,
-      applicationWindow: surface.applicationWindow,
+      windowLayer: surface.windowLayer,
       themeRoot,
       storage: preferenceStorage.service,
       wallpaperStorage: null,
@@ -2879,7 +3077,7 @@ test("Storage 兼容不可用或损坏的浏览器存储并自愈偏好 JSON", (
   assert.equal(storage.readActiveBatchId(), null);
   assert.deepEqual(
     storage.readWindowLayout({ width: 800, height: 600 }),
-    [windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 })],
+    [windowRecord("crawl", "normal", { x: 160, y: 40, w: 800, h: 560 })],
   );
   assert.deepEqual(storage.readUiPreferences(), PERSONALIZATION_DEFAULTS);
   assert.deepEqual(
@@ -2895,7 +3093,7 @@ test("Storage 兼容不可用或损坏的浏览器存储并自愈偏好 JSON", (
   assert.equal(unavailable.writeCurrentApp("crawl"), false);
   assert.deepEqual(
     unavailable.readWindowLayout({ width: 800, height: 600 }),
-    [windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 })],
+    [windowRecord("crawl", "normal", { x: 160, y: 40, w: 800, h: 560 })],
   );
   assert.equal(unavailable.writeWindowLayout([windowRecord("crawl")]), false);
   assert.deepEqual(unavailable.readUiPreferences(), PERSONALIZATION_DEFAULTS);
@@ -3142,7 +3340,7 @@ test("主题-only 预览只应用 Token，等值草稿 no-op，混合字段仍�
     wallpaper: surface.wallpaper,
     wallpaperImage: surface.image,
     wallpaperMask: surface.mask,
-    applicationWindow: surface.applicationWindow,
+    windowLayer: surface.windowLayer,
     themeRoot,
     storage: preferenceStorage.service,
     motion,
@@ -3156,7 +3354,7 @@ test("主题-only 预览只应用 Token，等值草稿 no-op，混合字段仍�
     wallpaperClasses: surface.wallpaper.classList.operations.length,
     imageSourceClears: surface.calls.clearImageSource,
     backgroundImageClears: surface.calls.clearBackgroundImage,
-    windowClasses: surface.applicationWindow.classList.operations.length,
+    windowClasses: surface.windowLayer.classList.operations.length,
     motion: motionCalls.length,
   });
 
@@ -3208,7 +3406,7 @@ test("主题-only 预览只应用 Token，等值草稿 no-op，混合字段仍�
   assert.ok(surface.calls.clearImageSource > beforeMixed.imageSourceClears);
   assert.ok(surface.calls.clearBackgroundImage > beforeMixed.backgroundImageClears);
   assert.ok(
-    surface.applicationWindow.classList.operations.length > beforeMixed.windowClasses,
+    surface.windowLayer.classList.operations.length > beforeMixed.windowClasses,
     "混合草稿必须应用窗口透明度类",
   );
   assert.ok(motionCalls.length > beforeMixed.motion, "混合草稿必须应用动效");
@@ -3380,7 +3578,7 @@ test("E1 受控类实时映射并在平铺全生命周期先断开再撤销 URL"
   const runtime = createPersonalizationRuntime({
     wallpaper: surface.wallpaper,
     wallpaperImage: surface.image,
-    applicationWindow: surface.applicationWindow,
+    windowLayer: surface.windowLayer,
     storage: preferenceStorage.service,
     wallpaperStorage: wallpaperRepository.repository,
     decodeWallpaperBlob: async () => ({ width: 640, height: 360 }),
@@ -3433,12 +3631,12 @@ test("E1 受控类实时映射并在平铺全生命周期先断开再撤销 URL"
     }
     const opacityClasses = PERSONALIZATION_RUNTIME_CLASS_MAPS.windowOpacity;
     assert.equal(
-      surface.applicationWindow.classList.contains(opacityClasses[state.draft.windowOpacity]),
+      surface.windowLayer.classList.contains(opacityClasses[state.draft.windowOpacity]),
       true,
     );
     assert.equal(
       Object.values(opacityClasses).filter(
-        (className) => surface.applicationWindow.classList.contains(className),
+        (className) => surface.windowLayer.classList.contains(className),
       ).length,
       1,
     );
