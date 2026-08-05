@@ -55,15 +55,17 @@ export const ACTION_TYPES = Object.freeze({
   REVIEW_PAGE_MODE_CHANGED: "review/pageModeChanged",
   REVIEW_PAGE_SAVED: "review/pageSaved",
   REVIEW_CLEARED: "review/cleared",
-  UI_ROUTE_RESOLVED: "ui/routeResolved",
-  UI_WINDOW_VISIBILITY_CHANGED: "ui/windowVisibilityChanged",
+  UI_WINDOW_OPENED: "ui/windowOpened",
+  UI_WINDOW_CLOSED: "ui/windowClosed",
+  UI_WINDOW_FOCUSED: "ui/windowFocused",
+  UI_WINDOW_MOVED: "ui/windowMoved",
   UI_WINDOW_STATE_CHANGED: "ui/windowStateChanged",
   UI_START_MENU_CHANGED: "ui/startMenuChanged",
 });
 
 const UI_STATUSES = new Set(["ready", "running", "warning", "error", "disabled"]);
-const WINDOW_STATES = new Set(["normal", "maximized"]);
-const WINDOW_VISIBILITIES = new Set(["open", "minimized", "closed"]);
+const WINDOW_STATES = new Set(["normal", "maximized", "minimized"]);
+export const DEFAULT_WINDOW_RECT = Object.freeze({ x: 160, y: 64, w: 800, h: 560 });
 const IMMUTABLE_VALUES = new WeakSet();
 const READONLY_MAPS = new WeakSet();
 const DANGEROUS_OBJECT_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -84,7 +86,8 @@ function initialSummary() {
   };
 }
 
-export function createInitialState() {
+export function createInitialState({ windows = [] } = {}) {
+  const normalizedWindows = normalizeWindowStack(windows);
   return {
     system: {
       health: null,
@@ -134,9 +137,8 @@ export function createInitialState() {
       dirty: false,
     },
     ui: {
-      activeApp: "crawl",
-      windowState: "normal",
-      windowVisibility: "closed",
+      windows: normalizedWindows,
+      focusedAppId: deriveFocusedAppId(normalizedWindows),
       startMenuOpen: false,
     },
   };
@@ -250,6 +252,77 @@ function requireAppId(value) {
   return value;
 }
 
+function requireWindowState(value) {
+  if (!WINDOW_STATES.has(value)) throw new TypeError("窗口状态无效");
+  return value;
+}
+
+function requireWindowRect(value) {
+  if (!isPlainObject(value)) throw new TypeError("窗口位置无效");
+  const keys = Object.keys(value);
+  if (keys.length !== 4 || !["x", "y", "w", "h"].every((key) => keys.includes(key))) {
+    throw new TypeError("窗口位置无效");
+  }
+  const rect = {};
+  for (const key of ["x", "y", "w", "h"]) {
+    if (!Number.isFinite(value[key])) throw new TypeError("窗口位置无效");
+    rect[key] = value[key];
+  }
+  if (rect.w < 360 || rect.h < 240) throw new TypeError("窗口尺寸过小");
+  return rect;
+}
+
+function requireWindowRecord(value) {
+  if (!isPlainObject(value)) throw new TypeError("窗口记录无效");
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 3
+    || !["appId", "windowState", "rect"].every((key) => keys.includes(key))
+  ) {
+    throw new TypeError("窗口记录无效");
+  }
+  return {
+    appId: requireAppId(value.appId),
+    windowState: requireWindowState(value.windowState),
+    rect: requireWindowRect(value.rect),
+  };
+}
+
+function normalizeWindowStack(windows) {
+  if (!Array.isArray(windows)) throw new TypeError("窗口栈必须是数组");
+  const result = [];
+  for (const value of windows) {
+    const windowRecord = requireWindowRecord(value);
+    const existing = result.findIndex((item) => item.appId === windowRecord.appId);
+    if (existing >= 0) result.splice(existing, 1);
+    result.push(windowRecord);
+  }
+  return result;
+}
+
+function deriveFocusedAppId(windows) {
+  for (let index = windows.length - 1; index >= 0; index -= 1) {
+    if (windows[index].windowState !== "minimized") return windows[index].appId;
+  }
+  return null;
+}
+
+function withDerivedWindowFocus(state) {
+  if (!isPlainObject(state?.ui) || !Array.isArray(state.ui.windows)) return state;
+  const focusedAppId = deriveFocusedAppId(state.ui.windows);
+  if (state.ui.focusedAppId === focusedAppId) return state;
+  return { ...state, ui: { ...state.ui, focusedAppId } };
+}
+
+function defaultWindowRecord(appId) {
+  const app = getApplicationById(requireAppId(appId));
+  return {
+    appId,
+    windowState: requireWindowState(app.defaultWindowState),
+    rect: { ...DEFAULT_WINDOW_RECT },
+  };
+}
+
 function requireBatchId(value) {
   if (value === "") return value;
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
@@ -356,7 +429,7 @@ function emptyReviewState(batchId = "") {
   };
 }
 
-export function rootReducer(state, action) {
+function reduceRootState(state, action) {
   switch (action.type) {
     case ACTION_TYPES.SYSTEM_SHELL_SUMMARY_UPDATED: {
       const snapshot = validateShellSnapshot(action.payload);
@@ -529,30 +602,60 @@ export function rootReducer(state, action) {
       return { ...state, review: markReviewPageSaved(state.review, action.payload?.summary) };
     case ACTION_TYPES.REVIEW_CLEARED:
       return { ...state, review: emptyReviewState(action.payload?.batchId || "") };
-    case ACTION_TYPES.UI_ROUTE_RESOLVED: {
+    case ACTION_TYPES.UI_WINDOW_OPENED: {
       const appId = requireAppId(action.payload?.appId);
-      const windowState = action.payload?.windowState;
-      if (!WINDOW_STATES.has(windowState)) throw new TypeError("窗口状态无效");
+      const existingIndex = state.ui.windows.findIndex((item) => item.appId === appId);
+      const existing = existingIndex >= 0 ? state.ui.windows[existingIndex] : null;
+      const opened = existing
+        ? {
+            ...existing,
+            windowState: existing.windowState === "minimized" ? "normal" : existing.windowState,
+          }
+        : defaultWindowRecord(appId);
+      const windows = state.ui.windows.filter((item) => item.appId !== appId);
+      windows.push(opened);
       return {
         ...state,
-        ui: {
-          ...state.ui,
-          activeApp: appId,
-          windowState,
-          windowVisibility: "open",
-          startMenuOpen: false,
-        },
+        ui: { ...state.ui, windows, startMenuOpen: false },
       };
     }
-    case ACTION_TYPES.UI_WINDOW_VISIBILITY_CHANGED: {
-      const visibility = action.payload?.visibility;
-      if (!WINDOW_VISIBILITIES.has(visibility)) throw new TypeError("窗口可见状态无效");
-      return { ...state, ui: { ...state.ui, windowVisibility: visibility } };
+    case ACTION_TYPES.UI_WINDOW_CLOSED: {
+      const appId = requireAppId(action.payload?.appId);
+      const windows = state.ui.windows.filter((item) => item.appId !== appId);
+      return windows.length === state.ui.windows.length
+        ? state
+        : { ...state, ui: { ...state.ui, windows } };
+    }
+    case ACTION_TYPES.UI_WINDOW_FOCUSED: {
+      const appId = requireAppId(action.payload?.appId);
+      const existing = state.ui.windows.find((item) => item.appId === appId);
+      if (!existing || existing.windowState === "minimized") return state;
+      if (state.ui.windows[state.ui.windows.length - 1]?.appId === appId) return state;
+      const windows = state.ui.windows.filter((item) => item.appId !== appId);
+      windows.push(existing);
+      return { ...state, ui: { ...state.ui, windows } };
+    }
+    case ACTION_TYPES.UI_WINDOW_MOVED: {
+      const appId = requireAppId(action.payload?.appId);
+      const rect = requireWindowRect(action.payload?.rect);
+      let changed = false;
+      const windows = state.ui.windows.map((item) => {
+        if (item.appId !== appId) return item;
+        changed = true;
+        return { ...item, rect };
+      });
+      return changed ? { ...state, ui: { ...state.ui, windows } } : state;
     }
     case ACTION_TYPES.UI_WINDOW_STATE_CHANGED: {
-      const windowState = action.payload?.windowState;
-      if (!WINDOW_STATES.has(windowState)) throw new TypeError("窗口状态无效");
-      return { ...state, ui: { ...state.ui, windowState } };
+      const appId = requireAppId(action.payload?.appId);
+      const windowState = requireWindowState(action.payload?.windowState);
+      let changed = false;
+      const windows = state.ui.windows.map((item) => {
+        if (item.appId !== appId || item.windowState === windowState) return item;
+        changed = true;
+        return { ...item, windowState };
+      });
+      return changed ? { ...state, ui: { ...state.ui, windows } } : state;
     }
     case ACTION_TYPES.UI_START_MENU_CHANGED:
       return {
@@ -565,6 +668,10 @@ export function rootReducer(state, action) {
     default:
       throw new UnknownActionError(action.type);
   }
+}
+
+export function rootReducer(state, action) {
+  return withDerivedWindowFocus(reduceRootState(state, action));
 }
 
 function action(type, payload) {
@@ -658,14 +765,20 @@ export const actionCreators = Object.freeze({
   reviewCleared(batchId = "") {
     return action(ACTION_TYPES.REVIEW_CLEARED, { batchId });
   },
-  routeResolved(appId, windowState) {
-    return action(ACTION_TYPES.UI_ROUTE_RESOLVED, { appId, windowState });
+  windowOpened(appId) {
+    return action(ACTION_TYPES.UI_WINDOW_OPENED, { appId });
   },
-  windowVisibilityChanged(visibility) {
-    return action(ACTION_TYPES.UI_WINDOW_VISIBILITY_CHANGED, { visibility });
+  windowClosed(appId) {
+    return action(ACTION_TYPES.UI_WINDOW_CLOSED, { appId });
   },
-  windowStateChanged(windowState) {
-    return action(ACTION_TYPES.UI_WINDOW_STATE_CHANGED, { windowState });
+  windowFocused(appId) {
+    return action(ACTION_TYPES.UI_WINDOW_FOCUSED, { appId });
+  },
+  windowMoved(appId, rect) {
+    return action(ACTION_TYPES.UI_WINDOW_MOVED, { appId, rect });
+  },
+  windowStateChanged(appId, windowState) {
+    return action(ACTION_TYPES.UI_WINDOW_STATE_CHANGED, { appId, windowState });
   },
   startMenuChanged(open) {
     return action(ACTION_TYPES.UI_START_MENU_CHANGED, { open });
@@ -698,7 +811,16 @@ export function createStore({
 } = {}) {
   if (typeof reducer !== "function") throw new TypeError("reducer 必须是函数");
   if (typeof reportError !== "function") throw new TypeError("错误报告器必须是函数");
-  let state = makeImmutable(cloneInput(initialState));
+  const clonedInitialState = cloneInput(initialState);
+  if (isPlainObject(clonedInitialState.ui) && Array.isArray(clonedInitialState.ui.windows)) {
+    const windows = normalizeWindowStack(clonedInitialState.ui.windows);
+    clonedInitialState.ui = {
+      ...clonedInitialState.ui,
+      windows,
+      focusedAppId: deriveFocusedAppId(windows),
+    };
+  }
+  let state = makeImmutable(clonedInitialState);
   let phase = "idle";
   const subscribers = new Set();
 
@@ -793,7 +915,7 @@ export function shallowEqual(left, right) {
 }
 
 export const selectors = Object.freeze({
-  activeApp: (state) => state.ui.activeApp,
+  focusedAppId: (state) => state.ui.focusedAppId,
   startMenuOpen: (state) => state.ui.startMenuOpen,
   taskbarSummary: (state) => state.system.summary,
   diagnostics: (state) => state.diagnostics.snapshot,
@@ -809,9 +931,21 @@ export const selectors = Object.freeze({
   batchTasks: (state) => state.batches.tasks,
   recentBatches: (state) => state.batches.recent,
   review: (state) => state.review,
-  windowView: (state) => ({
-    appId: state.ui.activeApp,
-    windowState: state.ui.windowState,
-    visibility: state.ui.windowVisibility,
-  }),
+  windowStack: (state) => state.ui.windows,
+  windowView: (state) => {
+    const focused = state.ui.focusedAppId === null
+      ? null
+      : state.ui.windows.find((item) => item.appId === state.ui.focusedAppId) || null;
+    const windowRecord = focused || state.ui.windows[state.ui.windows.length - 1] || null;
+    if (!windowRecord) {
+      return { appId: null, windowState: "normal", visibility: "closed" };
+    }
+    return {
+      appId: windowRecord.appId,
+      windowState: windowRecord.windowState === "minimized"
+        ? "normal"
+        : windowRecord.windowState,
+      visibility: windowRecord.windowState === "minimized" ? "minimized" : "open",
+    };
+  },
 });

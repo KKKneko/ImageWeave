@@ -1329,14 +1329,14 @@ state.ui = {
 
 ### 验收标准
 
-- [ ] K1 `state.ui.windows` 为数组，`focusedAppId` 由栈顶推导，无绝对 zIndex 存储。
-- [ ] K2 一个 appId 最多一个窗口（测试 1 保证）。
-- [ ] K3 全部新 action 有严格校验且非法输入 throw。
-- [ ] K4 `selectors.windowView` 保留且形状不变；新增 `selectors.windowStack`。
-- [ ] K5 hash 只包含聚焦应用路由，未序列化打开集。
-- [ ] K6 布局持久化带版本号 key，反序列化具备四项修复能力。
-- [ ] K7 本任务结束后界面仍可正常使用（单窗口表现）。
-- [ ] K8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增前端测试全绿，
+- [x] K1 `state.ui.windows` 为数组，`focusedAppId` 由栈顶推导，无绝对 zIndex 存储。
+- [x] K2 一个 appId 最多一个窗口（测试 1 保证）。
+- [x] K3 全部新 action 有严格校验且非法输入 throw。
+- [x] K4 `selectors.windowView` 保留且形状不变；新增 `selectors.windowStack`。
+- [x] K5 hash 只包含聚焦应用路由，未序列化打开集。
+- [x] K6 布局持久化带版本号 key，反序列化具备四项修复能力。
+- [x] K7 本任务结束后界面仍可正常使用（单窗口表现）。
+- [x] K8 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增前端测试全绿，
       288 个后端基线测试全绿。
 
 ---

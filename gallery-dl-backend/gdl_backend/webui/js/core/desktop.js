@@ -49,7 +49,11 @@ function validateServices({ api, store, polling, storage, dialogs }) {
   if (!api || typeof api.get !== "function") throw new TypeError("桌面缺少 API 服务");
   if (!store || typeof store.dispatch !== "function") throw new TypeError("桌面缺少状态仓库");
   if (!polling || typeof polling.stopScope !== "function") throw new TypeError("桌面缺少轮询服务");
-  if (!storage || typeof storage.writeCurrentApp !== "function") {
+  if (
+    !storage
+    || typeof storage.writeCurrentApp !== "function"
+    || typeof storage.writeWindowLayout !== "function"
+  ) {
     throw new TypeError("桌面缺少安全存储服务");
   }
   if (!dialogs || typeof dialogs.open !== "function") throw new TypeError("桌面缺少对话框服务");
@@ -159,8 +163,10 @@ export function initializeDesktop(root = document, services = {}) {
     if (link instanceof HTMLElement) link.focus();
   };
 
-  const activateRoute = (app) => {
+  const activateRoute = (app, navigation = {}) => {
     if (!app) return;
+    // 恢复为空栈或全最小化布局时，初始 hash 只保留地址，不得擅自重开窗口。
+    if (navigation.reason === "initial" && store.getState().ui.focusedAppId === null) return;
     const transition = ++routeTransitionVersion;
     void (async () => {
       const previous = currentApp;

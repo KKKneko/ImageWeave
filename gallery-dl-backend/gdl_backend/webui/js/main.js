@@ -5,7 +5,7 @@ import { createPersonalizationRuntime } from "./core/personalization.js";
 import { createWallpaperStorage } from "./core/wallpaper-storage.js";
 import { createPollingManager } from "./core/polling.js";
 import { createStorageService } from "./core/storage.js";
-import { createStore } from "./core/store.js";
+import { createInitialState, createStore } from "./core/store.js";
 import { createDialogController } from "./components/dialog.js";
 import { createStatusBadge } from "./components/status.js";
 import { initializeTaskbarSummary } from "./components/taskbar-summary.js";
@@ -59,7 +59,11 @@ try {
     motion: motionController,
   });
   const api = createApiClient();
-  const store = createStore();
+  const windows = storage.readWindowLayout({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
+  const store = createStore({ initialState: createInitialState({ windows }) });
   polling = createPollingManager();
   dialogs = createDialogController();
   desktopController = initializeDesktop(document, {

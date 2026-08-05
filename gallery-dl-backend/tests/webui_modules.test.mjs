@@ -82,6 +82,11 @@ import {
   vaultErrorGuidance,
 } from "../gdl_backend/webui/js/core/vault-model.js";
 import {
+  hashForRoute,
+  parseHashRoute,
+  resolveNavigationTarget,
+} from "../gdl_backend/webui/js/core/router.js";
+import {
   actionCreators,
   createInitialState,
   createStore,
@@ -176,6 +181,14 @@ import proxyApplication, {
 import vaultApplication, {
   VAULT_ENDPOINTS,
 } from "../gdl_backend/webui/js/apps/vault.js";
+
+function windowRect(overrides = {}) {
+  return { x: 48, y: 36, w: 720, h: 480, ...overrides };
+}
+
+function windowRecord(appId, windowState = "normal", rect = windowRect()) {
+  return { appId, windowState, rect };
+}
 
 function shellSnapshot(overrides = {}) {
   return {
@@ -755,20 +768,22 @@ test("store 初始化完整状态并阻止外部修改数组、对象和 Map", (
 test("store 仅通过已知 action 更新，selector 避免无关通知", () => {
   const reports = [];
   const store = createStore({ reportError: (event) => reports.push(event) });
-  let activeAppNotifications = 0;
-  store.subscribe(selectors.activeApp, () => { activeAppNotifications += 1; });
+  let focusNotifications = 0;
+  store.subscribe(selectors.focusedAppId, () => { focusNotifications += 1; });
   store.dispatch(actionCreators.startMenuChanged(true));
-  assert.equal(activeAppNotifications, 0);
-  store.dispatch(actionCreators.routeResolved("review", "maximized"));
-  assert.equal(activeAppNotifications, 1);
-  assert.equal(store.getState().ui.activeApp, "review");
-  assert.equal(store.getState().ui.windowVisibility, "open");
-  assert.equal(store.getState().ui.windowState, "maximized");
-  assert.throws(() => store.dispatch({ type: "unknown/action" }), UnknownActionError);
+  assert.equal(focusNotifications, 0);
+  store.dispatch(actionCreators.windowOpened("review"));
+  assert.equal(focusNotifications, 1);
+  assert.equal(store.getState().ui.focusedAppId, "review");
+  assert.deepEqual(store.getState().ui.windows.map((item) => ({
+    appId: item.appId,
+    windowState: item.windowState,
+  })), [{ appId: "review", windowState: "maximized" }]);
   assert.throws(
-    () => store.dispatch(actionCreators.windowVisibilityChanged("invisible")),
+    () => store.dispatch(actionCreators.windowStateChanged("review", "invisible")),
     TypeError,
   );
+  assert.throws(() => store.dispatch({ type: "unknown/action" }), UnknownActionError);
   assert.deepEqual(reports, []);
 });
 
@@ -788,7 +803,7 @@ test("store 克隆 action payload，订阅者异常与嵌套 dispatch 不阻断�
   });
   store.subscribe(selectors.startMenuOpen, () => {
     secondSubscriberRan = true;
-    assert.throws(() => { store.getState().ui.activeApp = "proxy"; }, TypeError);
+    assert.throws(() => { store.getState().ui.focusedAppId = "proxy"; }, TypeError);
   });
   store.dispatch(actionCreators.startMenuChanged(true));
   assert.equal(reportCount, 1);
@@ -806,14 +821,20 @@ test("store 初次订阅渲染期间同样禁止嵌套 dispatch", () => {
   assert.equal(store.getState().ui.startMenuOpen, false);
 });
 
-test("跨应用 action 先调用 router，只有路由结果才能更新 activeApp", () => {
+test("跨应用 action 先调用 router，只有路由结果才能更新 focusedAppId", () => {
   const store = createStore({ reportError: () => {} });
   const navigations = [];
   const writes = [];
   const storage = {
-    readWindowMaximized: (appId) => appId === "review" ? false : null,
     writeCurrentApp: (appId) => writes.push(["app", appId]),
-    writeWindowMaximized: (appId, value) => writes.push(["window", appId, value]),
+    writeWindowLayout: (windows) => writes.push([
+      "layout",
+      windows.map((item) => ({
+        appId: item.appId,
+        windowState: item.windowState,
+        rect: { ...item.rect },
+      })),
+    ]),
     writeActiveBatchId: (batchId) => writes.push(["batch", batchId]),
     clearActiveBatchId: () => writes.push(["batch-clear"]),
   };
@@ -825,16 +846,238 @@ test("跨应用 action 先调用 router，只有路由结果才能更新 activeA
 
   actions.navigateToApp("review");
   assert.deepEqual(navigations, ["review"]);
-  assert.equal(store.getState().ui.activeApp, "crawl");
+  assert.equal(store.getState().ui.focusedAppId, null);
   actions.routeResolved(getApplicationById("review"));
-  assert.equal(store.getState().ui.activeApp, "review");
-  assert.equal(store.getState().ui.windowState, "normal");
+  assert.equal(store.getState().ui.focusedAppId, "review");
+  assert.equal(store.getState().ui.windows[0].windowState, "maximized");
   actions.toggleWindowMaximized();
-  assert.equal(store.getState().ui.windowState, "maximized");
-  assert.deepEqual(writes, [
-    ["app", "review"],
-    ["window", "review", true],
+  assert.equal(store.getState().ui.windows[0].windowState, "normal");
+  actions.minimizeWindow();
+  assert.equal(store.getState().ui.focusedAppId, null);
+  assert.deepEqual(navigations, ["review"], "无聚焦窗口时不得触发路由重开");
+  actions.restoreWindow();
+  assert.equal(store.getState().ui.focusedAppId, "review");
+  assert.deepEqual(navigations, ["review", "review"]);
+  assert.deepEqual(writes.map((entry) => entry[0]), [
+    "layout", "app", "layout", "layout", "layout", "app",
   ]);
+  assert.deepEqual(writes[0][1].map((item) => item.windowState), ["maximized"]);
+  assert.deepEqual(writes[2][1].map((item) => item.windowState), ["normal"]);
+  assert.deepEqual(writes[3][1].map((item) => item.windowState), ["minimized"]);
+  assert.deepEqual(writes[4][1].map((item) => item.windowState), ["normal"]);
+});
+
+test("windowOpened 重复打开同一 appId 不会产生第二个窗口", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("review"));
+  const first = selectors.windowStack(store.getState())[0];
+  store.dispatch(actionCreators.windowOpened("review"));
+  const windows = selectors.windowStack(store.getState());
+  assert.equal(windows.length, 1);
+  assert.equal(windows[0].appId, "review");
+  assert.deepEqual(windows[0].rect, first.rect);
+  assert.equal("zIndex" in windows[0], false);
+});
+
+test("windowOpened 已存在时会提到栈顶且从 minimized 恢复", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  store.dispatch(actionCreators.windowOpened("review"));
+  store.dispatch(actionCreators.windowStateChanged("crawl", "minimized"));
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  assert.deepEqual(
+    selectors.windowStack(store.getState()).map((item) => [item.appId, item.windowState]),
+    [["review", "maximized"], ["crawl", "normal"]],
+  );
+  assert.equal(store.getState().ui.focusedAppId, "crawl");
+});
+
+test("focusedAppId 始终为栈顶非 minimized 窗口", () => {
+  const tamperedInitial = createInitialState({
+    windows: [windowRecord("crawl"), windowRecord("tasks", "minimized")],
+  });
+  tamperedInitial.ui.focusedAppId = "tasks";
+  const normalizedStore = createStore({
+    initialState: tamperedInitial,
+    reportError: () => {},
+  });
+  assert.equal(normalizedStore.getState().ui.focusedAppId, "crawl");
+
+  const store = createStore({ reportError: () => {} });
+  const assertDerivedFocus = () => {
+    const windows = selectors.windowStack(store.getState());
+    const expected = [...windows].reverse()
+      .find((item) => item.windowState !== "minimized")?.appId ?? null;
+    assert.equal(store.getState().ui.focusedAppId, expected);
+  };
+
+  for (const appId of ["crawl", "tasks", "review"]) {
+    store.dispatch(actionCreators.windowOpened(appId));
+    assertDerivedFocus();
+  }
+  store.dispatch(actionCreators.windowStateChanged("review", "minimized"));
+  assertDerivedFocus();
+  store.dispatch(actionCreators.windowFocused("crawl"));
+  assert.deepEqual(
+    selectors.windowStack(store.getState()).map((item) => item.appId),
+    ["tasks", "review", "crawl"],
+  );
+  assertDerivedFocus();
+  store.dispatch(actionCreators.windowStateChanged("crawl", "minimized"));
+  assertDerivedFocus();
+  store.dispatch(actionCreators.startMenuChanged(true));
+  assertDerivedFocus();
+});
+
+test("全部 minimized 时 focusedAppId 为 null 且兼容视图仍可恢复", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  store.dispatch(actionCreators.windowOpened("tasks"));
+  store.dispatch(actionCreators.windowStateChanged("crawl", "minimized"));
+  store.dispatch(actionCreators.windowStateChanged("tasks", "minimized"));
+  assert.equal(store.getState().ui.focusedAppId, null);
+  assert.deepEqual(selectors.windowView(store.getState()), {
+    appId: "tasks",
+    windowState: "normal",
+    visibility: "minimized",
+  });
+});
+
+test("windowClosed 后聚焦回落到新栈顶", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  store.dispatch(actionCreators.windowOpened("tasks"));
+  store.dispatch(actionCreators.windowOpened("review"));
+  store.dispatch(actionCreators.windowClosed("review"));
+  assert.equal(store.getState().ui.focusedAppId, "tasks");
+  store.dispatch(actionCreators.windowClosed("tasks"));
+  assert.equal(store.getState().ui.focusedAppId, "crawl");
+  store.dispatch(actionCreators.windowClosed("crawl"));
+  assert.equal(store.getState().ui.focusedAppId, null);
+  assert.deepEqual(selectors.windowStack(store.getState()), []);
+});
+
+test("窗口 actions 对非法 state、rect 与未知 appId 均抛 TypeError", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  const unknownActions = [
+    actionCreators.windowOpened("unknown"),
+    actionCreators.windowClosed("unknown"),
+    actionCreators.windowFocused("unknown"),
+    actionCreators.windowMoved("unknown", windowRect()),
+    actionCreators.windowStateChanged("unknown", "normal"),
+  ];
+  for (const action of unknownActions) {
+    assert.throws(() => store.dispatch(action), TypeError);
+  }
+  for (const windowState of ["open", "closed", "MINIMIZED", null]) {
+    assert.throws(
+      () => store.dispatch(actionCreators.windowStateChanged("crawl", windowState)),
+      TypeError,
+    );
+  }
+  for (const rect of [
+    null,
+    { x: 0, y: 0, w: 720 },
+    { x: 0, y: 0, w: 720, h: 480, url: "https://example.invalid/layout" },
+    windowRect({ x: Number.NaN }),
+    windowRect({ y: Number.POSITIVE_INFINITY }),
+    windowRect({ w: "720" }),
+  ]) {
+    assert.throws(
+      () => store.dispatch(actionCreators.windowMoved("crawl", rect)),
+      TypeError,
+    );
+  }
+});
+
+test("窗口 rect 小于最小尺寸时抛 TypeError", () => {
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.windowOpened("crawl"));
+  for (const rect of [windowRect({ w: 359 }), windowRect({ h: 239 })]) {
+    assert.throws(
+      () => store.dispatch(actionCreators.windowMoved("crawl", rect)),
+      TypeError,
+    );
+  }
+  store.dispatch(actionCreators.windowMoved("crawl", windowRect({ w: 360, h: 240 })));
+  assert.deepEqual(store.getState().ui.windows[0].rect, windowRect({ w: 360, h: 240 }));
+});
+
+test("selectors.windowView 保持旧形状且 hash 只包含单个聚焦应用", () => {
+  const store = createStore({ reportError: () => {} });
+  assert.deepEqual(selectors.windowView(store.getState()), {
+    appId: null,
+    windowState: "normal",
+    visibility: "closed",
+  });
+  store.dispatch(actionCreators.windowOpened("review"));
+  assert.deepEqual(selectors.windowView(store.getState()), {
+    appId: "review",
+    windowState: "maximized",
+    visibility: "open",
+  });
+  assert.deepEqual(Object.keys(selectors.windowView(store.getState())), [
+    "appId", "windowState", "visibility",
+  ]);
+  assert.equal(selectors.windowStack(store.getState()), store.getState().ui.windows);
+  assert.equal(hashForRoute(resolveNavigationTarget("review")), "#/review");
+  assert.equal(hashForRoute(resolveNavigationTarget("review")).includes("?"), false);
+  assert.equal(parseHashRoute("#/review?windows=crawl"), "/crawl");
+});
+
+test("布局反序列化会丢弃未知和非 ready 应用、去重并 clamp rect", () => {
+  const local = new MemoryStorage();
+  const session = new MemoryStorage();
+  local.values.set(STORAGE_KEYS.windowLayout, JSON.stringify({
+    windows: [
+      windowRecord("crawl", "normal", windowRect({ x: 12, y: 18 })),
+      windowRecord("unknown", "normal", windowRect()),
+      windowRecord("gallery", "normal", windowRect()),
+      windowRecord("review", "maximized", windowRect({ x: 5_000, y: -5_000, w: 800, h: 560 })),
+      windowRecord("crawl", "minimized", windowRect({ x: -5_000, y: 5_000 })),
+    ],
+  }));
+  const storage = createStorageService({ localStorage: local, sessionStorage: session });
+  const windows = storage.readWindowLayout({ width: 1024, height: 600 });
+  assert.deepEqual(windows, [
+    windowRecord("review", "maximized", { x: 992, y: -528, w: 800, h: 560 }),
+    windowRecord("crawl", "minimized", { x: -688, y: 568, w: 720, h: 480 }),
+  ]);
+  const repaired = JSON.parse(local.values.get(STORAGE_KEYS.windowLayout));
+  assert.deepEqual(repaired, { windows });
+  assert.equal(JSON.stringify(repaired).includes("unknown"), false);
+  assert.equal(JSON.stringify(repaired).includes("gallery"), false);
+  assert.equal(JSON.stringify(repaired).includes("zIndex"), false);
+  assert.equal(STORAGE_KEYS.windowLayout, "imageweave.window-layout.v1");
+});
+
+test("损坏的 localStorage 窗口布局静默回退到安全默认布局", () => {
+  const damagedValues = [
+    "{broken-json",
+    JSON.stringify([]),
+    JSON.stringify({ windows: {} }),
+    JSON.stringify({ windows: [windowRecord("crawl", "open")] }),
+    JSON.stringify({ windows: [windowRecord("crawl", "normal", windowRect({ w: 359 }))] }),
+    JSON.stringify({ windows: [{ ...windowRecord("crawl"), zIndex: 99 }] }),
+    JSON.stringify({ windows: [], backendPath: "/private/output" }),
+  ];
+  for (const serialized of damagedValues) {
+    const local = new MemoryStorage();
+    local.values.set(STORAGE_KEYS.windowLayout, serialized);
+    const storage = createStorageService({
+      localStorage: local,
+      sessionStorage: new MemoryStorage(),
+    });
+    let windows;
+    assert.doesNotThrow(() => {
+      windows = storage.readWindowLayout({ width: 800, height: 600 });
+    });
+    assert.deepEqual(windows, [
+      windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 }),
+    ]);
+    assert.deepEqual(JSON.parse(local.values.get(STORAGE_KEYS.windowLayout)), { windows });
+  }
 });
 
 test("DESKTOP.CPL 以 ready 应用注册且不改变既有应用相对顺序", () => {
@@ -2422,7 +2665,8 @@ test("Storage 只写固定命名空间白名单并区分 session/local", () => {
   const storage = createStorageService({ localStorage: local, sessionStorage: session });
   assert.equal(storage.writeCurrentApp("review"), true);
   assert.equal(storage.writeActiveBatchId("batch-123"), true);
-  assert.equal(storage.writeWindowMaximized("review", false), true);
+  const savedLayout = [windowRecord("review", "normal")];
+  assert.equal(storage.writeWindowLayout(savedLayout), true);
   assert.equal(storage.writeUiPreferences({ taskbarDensity: "compact" }), true);
 
   assert.deepEqual([...session.values.keys()].sort(), [
@@ -2431,11 +2675,11 @@ test("Storage 只写固定命名空间白名单并区分 session/local", () => {
   ].sort());
   assert.deepEqual([...local.values.keys()].sort(), [
     STORAGE_KEYS.uiPreferences,
-    STORAGE_KEYS.windowMaximized,
+    STORAGE_KEYS.windowLayout,
   ].sort());
   assert.equal(storage.readCurrentApp(), "review");
   assert.equal(storage.readActiveBatchId(), "batch-123");
-  assert.equal(storage.readWindowMaximized("review"), false);
+  assert.deepEqual(storage.readWindowLayout({ width: 1280, height: 720 }), savedLayout);
   assert.deepEqual(storage.readUiPreferences(), {
     ...PERSONALIZATION_DEFAULTS,
     taskbarDensity: "compact",
@@ -2531,7 +2775,14 @@ test("Storage 严格写入完整安全对象并拒绝图片载荷、路径、URL
   const storage = createStorageService({ localStorage: local, sessionStorage: session });
   assert.throws(() => storage.writeCurrentApp("unknown"), TypeError);
   assert.throws(() => storage.writeActiveBatchId("bad/path"), TypeError);
-  assert.throws(() => storage.writeWindowMaximized("review", "yes"), TypeError);
+  assert.throws(
+    () => storage.writeWindowLayout([windowRecord("unknown")]),
+    TypeError,
+  );
+  assert.throws(
+    () => storage.writeWindowLayout([{ ...windowRecord("review"), backendUrl: "/api/private" }]),
+    TypeError,
+  );
 
   const safePreferences = {
     ...PERSONALIZATION_DEFAULTS,
@@ -2622,11 +2873,14 @@ test("Storage 兼容不可用或损坏的浏览器存储并自愈偏好 JSON", (
   const storage = createStorageService({ localStorage: local, sessionStorage: session });
   session.values.set(STORAGE_KEYS.currentApp, "invalid-app");
   session.values.set(STORAGE_KEYS.activeBatch, "bad/path");
-  local.values.set(STORAGE_KEYS.windowMaximized, "not-json");
+  local.values.set(STORAGE_KEYS.windowLayout, "not-json");
   local.values.set(STORAGE_KEYS.uiPreferences, "{broken-json");
   assert.equal(storage.readCurrentApp(), null);
   assert.equal(storage.readActiveBatchId(), null);
-  assert.equal(storage.readWindowMaximized("review"), null);
+  assert.deepEqual(
+    storage.readWindowLayout({ width: 800, height: 600 }),
+    [windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 })],
+  );
   assert.deepEqual(storage.readUiPreferences(), PERSONALIZATION_DEFAULTS);
   assert.deepEqual(
     JSON.parse(local.values.get(STORAGE_KEYS.uiPreferences)),
@@ -2639,8 +2893,11 @@ test("Storage 兼容不可用或损坏的浏览器存储并自愈偏好 JSON", (
   });
   assert.equal(unavailable.readCurrentApp(), null);
   assert.equal(unavailable.writeCurrentApp("crawl"), false);
-  assert.equal(unavailable.readWindowMaximized("review"), null);
-  assert.equal(unavailable.writeWindowMaximized("review", true), false);
+  assert.deepEqual(
+    unavailable.readWindowLayout({ width: 800, height: 600 }),
+    [windowRecord("crawl", "normal", { x: 160, y: 64, w: 800, h: 560 })],
+  );
+  assert.equal(unavailable.writeWindowLayout([windowRecord("crawl")]), false);
   assert.deepEqual(unavailable.readUiPreferences(), PERSONALIZATION_DEFAULTS);
   assert.equal(unavailable.writeUiPreferences(PERSONALIZATION_DEFAULTS), false);
 });
