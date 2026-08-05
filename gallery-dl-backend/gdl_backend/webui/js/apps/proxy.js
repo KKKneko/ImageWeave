@@ -521,6 +521,7 @@ function createProxyController(context) {
       operationSequence += 1;
       activeOperationController?.abort();
       activeOperationController = null;
+      polling.stop(STATUS_POLL_KEY);
       abortRead(statusRead);
       abortRead(sourcesRead);
       view.clearSecretInputs();
@@ -538,6 +539,7 @@ function createProxyController(context) {
       lifecycleVersion += 1;
       operationSequence += 1;
       activeOperationController?.abort();
+      polling.stop(STATUS_POLL_KEY);
       abortRead(statusRead);
       abortRead(sourcesRead);
       view.clearSecretInputs();

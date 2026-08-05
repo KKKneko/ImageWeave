@@ -19,7 +19,14 @@ import {
   DEFAULT_ROUTE,
   getApplicationById,
 } from "../gdl_backend/webui/js/core/app-registry.js";
-import { createPollingManager } from "../gdl_backend/webui/js/core/polling.js";
+import {
+  createPollingManager,
+  UNFOCUSED_POLL_MULTIPLIER,
+} from "../gdl_backend/webui/js/core/polling.js";
+import {
+  createStorePollingFocusSource,
+  POLLING_SCOPE_STATES,
+} from "../gdl_backend/webui/js/core/polling-focus-source.js";
 import {
   buildCrawlPayload,
   buildSearchPayload,
@@ -31,6 +38,7 @@ import {
 import {
   buildDiagnosticsSnapshot,
   diagnosticsCopyText,
+  DIAGNOSTICS_POLL_INTERVAL_MS,
   sanitizeDiagnosticsConfig,
   sanitizeDiagnosticsScheduler,
 } from "../gdl_backend/webui/js/core/diagnostics-model.js";
@@ -49,6 +57,7 @@ import {
 } from "../gdl_backend/webui/js/core/policy-model.js";
 import {
   buildReviewDecisionPayload,
+  REVIEW_POLL_INTERVAL_MS,
   reviewImageUrl,
   sanitizeReviewPage,
   setReviewPageMode,
@@ -59,6 +68,7 @@ import {
   sanitizeRecentBatches,
   sanitizeTaskPage,
   shouldPollBatch,
+  TASK_POLL_INTERVAL_MS,
   taskRecoveryTargets,
 } from "../gdl_backend/webui/js/core/tasks-model.js";
 import {
@@ -163,6 +173,8 @@ import {
   buildShellSnapshot,
   sanitizeHealthPayload,
   sanitizeReadinessPayload,
+  SHELL_POLL_INTERVAL_MS,
+  SHELL_POLL_SCOPE,
 } from "../gdl_backend/webui/js/components/taskbar-summary.js";
 import {
   _TASKBAR_VISIBLE_LIMIT,
@@ -381,6 +393,34 @@ class FakeVisibility {
 
   set(state) {
     this.state = state;
+    for (const listener of [...this.listeners]) listener();
+  }
+}
+
+class FakeFocusSource {
+  constructor({ focusedScope = null, scopeStates = {} } = {}) {
+    this.focusedScope = focusedScope;
+    this.scopeStates = new Map(Object.entries(scopeStates));
+    this.listeners = new Set();
+  }
+
+  getFocusedScope = () => this.focusedScope;
+
+  getScopeState = (scope) => {
+    if (!scope.startsWith("app:")) return POLLING_SCOPE_STATES.UNMANAGED;
+    return this.scopeStates.get(scope) ?? POLLING_SCOPE_STATES.CLOSED;
+  };
+
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  update({ focusedScope = this.focusedScope, scopeStates = {} } = {}) {
+    this.focusedScope = focusedScope;
+    for (const [scope, state] of Object.entries(scopeStates)) {
+      this.scopeStates.set(scope, state);
+    }
     for (const listener of [...this.listeners]) listener();
   }
 }
@@ -660,6 +700,7 @@ function createFakePolling(options = {}) {
     setTimeoutFn: timers.setTimeout,
     clearTimeoutFn: timers.clearTimeout,
     visibilitySource: visibility,
+    focusSource: options.focusSource || null,
     now: () => timers.now,
     onError: (error) => errors.push(error),
   });
@@ -1641,6 +1682,424 @@ test("关键轮询隐藏时继续，destroy 清理定时器和可见性监听", 
   assert.deepEqual(timers.delays(), [500]);
   manager.destroy();
   assert.equal(timers.jobs.size, 0);
+  assert.equal(visibility.listeners.size, 0);
+});
+
+test("轮询倍率与既有基础 interval 常量保持固定", () => {
+  assert.equal(UNFOCUSED_POLL_MULTIPLIER, 4);
+  assert.equal(TASK_POLL_INTERVAL_MS, 1_500);
+  assert.equal(REVIEW_POLL_INTERVAL_MS, 1_500);
+  assert.equal(DIAGNOSTICS_POLL_INTERVAL_MS, 20_000);
+  assert.equal(SHELL_POLL_INTERVAL_MS, 30_000);
+  assert.equal(SHELL_POLL_SCOPE, "shell");
+});
+
+test("store 聚焦适配器只投影窗口 scope 与 open/minimized/closed 状态", () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [
+        windowRecord("crawl", "normal"),
+        windowRecord("tasks", "minimized"),
+      ],
+    }),
+    reportError: () => {},
+  });
+  const source = createStorePollingFocusSource(store);
+
+  assert.equal(source.getFocusedScope(), "app:crawl");
+  assert.equal(source.getScopeState("app:crawl"), POLLING_SCOPE_STATES.OPEN);
+  assert.equal(source.getScopeState("app:tasks"), POLLING_SCOPE_STATES.MINIMIZED);
+  assert.equal(source.getScopeState("app:review"), POLLING_SCOPE_STATES.CLOSED);
+  assert.equal(source.getScopeState("shell"), POLLING_SCOPE_STATES.UNMANAGED);
+  const initial = source.getSnapshot();
+  assert.equal(Object.isFrozen(initial), true);
+  assert.equal(Object.isFrozen(initial.windows), true);
+  assert.equal(Object.isFrozen(initial.windows[0]), true);
+  assert.deepEqual(initial, {
+    focusedScope: "app:crawl",
+    windows: [
+      { scope: "app:crawl", state: "open" },
+      { scope: "app:tasks", state: "minimized" },
+    ],
+  });
+  assert.equal(JSON.stringify(initial).includes("rect"), false);
+
+  const notifications = [];
+  const unsubscribe = source.subscribe((snapshot) => notifications.push(snapshot));
+  store.dispatch(actionCreators.startMenuChanged(true));
+  assert.equal(notifications.length, 0, "无关 UI 状态不得触发聚焦重排");
+  store.dispatch(actionCreators.windowOpened("review"));
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications.at(-1).focusedScope, "app:review");
+  store.dispatch(actionCreators.windowStateChanged("review", "minimized"));
+  assert.equal(notifications.length, 2);
+  assert.equal(notifications.at(-1).focusedScope, "app:crawl");
+  store.dispatch(actionCreators.windowClosed("review"));
+  assert.equal(notifications.length, 3);
+  assert.equal(source.getScopeState("app:review"), POLLING_SCOPE_STATES.CLOSED);
+  unsubscribe();
+  store.dispatch(actionCreators.windowOpened("policy"));
+  assert.equal(notifications.length, 3);
+});
+
+test("未提供 focusSource 时 app scope 保持原速向后兼容", () => {
+  const { manager, timers } = createFakePolling();
+  manager.start({
+    key: "compat.application",
+    scope: "app:tasks",
+    intervalMs: 1_200,
+    immediate: false,
+    critical: false,
+    task: async () => {},
+  });
+  assert.deepEqual(timers.delays(), [1_200]);
+  assert.equal(manager.getSummary()[0].effectiveIntervalMs, 1_200);
+  manager.destroy();
+});
+
+test("聚焦窗口原速、opened-unfocused 四倍且 shell 30 秒不被重排", async () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [windowRecord("review"), windowRecord("tasks")],
+    }),
+    reportError: () => {},
+  });
+  const focusSource = createStorePollingFocusSource(store);
+  const { manager, timers } = createFakePolling({ focusSource });
+  const calls = { tasks: 0, review: 0, shell: 0 };
+  for (const [key, scope, intervalMs] of [
+    ["rate.tasks", "app:tasks", TASK_POLL_INTERVAL_MS],
+    ["rate.review", "app:review", REVIEW_POLL_INTERVAL_MS],
+    ["rate.shell", SHELL_POLL_SCOPE, SHELL_POLL_INTERVAL_MS],
+  ]) {
+    manager.start({
+      key,
+      scope,
+      intervalMs,
+      immediate: false,
+      critical: false,
+      resume: "immediate",
+      task: async () => { calls[key.slice(5)] += 1; },
+    });
+  }
+
+  const initial = new Map(manager.getSummary().map((entry) => [entry.key, entry]));
+  assert.equal(initial.get("rate.tasks").effectiveIntervalMs, 1_500);
+  assert.equal(initial.get("rate.review").effectiveIntervalMs, 6_000);
+  assert.equal(initial.get("rate.shell").effectiveIntervalMs, 30_000);
+  assert.deepEqual(timers.delays(), [1_500, 6_000, 30_000]);
+
+  timers.advanceBy(1_000);
+  const shellDeadline = initial.get("rate.shell").nextRunAt;
+  store.dispatch(actionCreators.windowFocused("review"));
+  const switched = new Map(manager.getSummary().map((entry) => [entry.key, entry]));
+  assert.equal(switched.get("rate.tasks").effectiveIntervalMs, 6_000);
+  assert.equal(switched.get("rate.review").effectiveIntervalMs, 1_500);
+  assert.equal(switched.get("rate.shell").effectiveIntervalMs, 30_000);
+  assert.equal(switched.get("rate.shell").nextRunAt, shellDeadline);
+  assert.deepEqual(timers.delays(), [0, 6_000, 29_000]);
+
+  timers.runNext();
+  await flushPromises();
+  assert.deepEqual(calls, { tasks: 0, review: 1, shell: 0 });
+  assert.deepEqual(timers.delays(), [1_500, 6_000, 29_000]);
+  manager.destroy();
+});
+
+test("minimized 与 closed 窗口挂起既存 entry 并中止活动请求", async () => {
+  const store = createStore({
+    initialState: createInitialState({ windows: [windowRecord("tasks")] }),
+    reportError: () => {},
+  });
+  const { manager, timers } = createFakePolling({
+    focusSource: createStorePollingFocusSource(store),
+  });
+  let activeSignal = null;
+  let release = null;
+  manager.start({
+    key: "lifecycle.tasks",
+    scope: "app:tasks",
+    intervalMs: 1_000,
+    immediate: true,
+    critical: false,
+    alwaysFocusRate: true,
+    task(signal) {
+      activeSignal = signal;
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  timers.runNext();
+  await flushPromises();
+  assert.equal(activeSignal.aborted, false);
+
+  store.dispatch(actionCreators.windowStateChanged("tasks", "minimized"));
+  assert.equal(activeSignal.aborted, true);
+  assert.equal(timers.jobs.size, 0);
+  assert.equal(manager.getSummary()[0].state, "paused");
+  assert.equal(manager.getSummary()[0].effectiveIntervalMs, null);
+
+  manager.start({
+    key: "lifecycle.closed",
+    scope: "app:review",
+    intervalMs: 1_000,
+    immediate: false,
+    critical: false,
+    alwaysFocusRate: true,
+    task: async () => {},
+  });
+  const closed = manager.getSummary().find((entry) => entry.key === "lifecycle.closed");
+  assert.equal(closed.state, "paused");
+  assert.equal(closed.effectiveIntervalMs, null);
+  assert.equal(timers.jobs.size, 0);
+
+  store.dispatch(actionCreators.windowClosed("tasks"));
+  release();
+  await flushPromises();
+  assert.equal(manager.getSummary().every((entry) => entry.state === "paused"), true);
+  assert.equal(timers.jobs.size, 0);
+  manager.destroy();
+});
+
+test("alwaysFocusRate 仅绕过未聚焦降频，页面 hidden 仍优先挂起全部非关键 entry", () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [
+        windowRecord("vault"),
+        windowRecord("review"),
+        windowRecord("tasks"),
+      ],
+    }),
+    reportError: () => {},
+  });
+  const visibility = new FakeVisibility();
+  const { manager, timers } = createFakePolling({
+    visibility,
+    focusSource: createStorePollingFocusSource(store),
+  });
+  manager.start({
+    key: "authorization.vault",
+    scope: "app:vault",
+    intervalMs: 800,
+    immediate: false,
+    critical: false,
+    alwaysFocusRate: true,
+    task: async () => {},
+  });
+  manager.start({
+    key: "authorization.review",
+    scope: "app:review",
+    intervalMs: 800,
+    immediate: false,
+    critical: false,
+    task: async () => {},
+  });
+  manager.start({
+    key: "authorization.shell",
+    scope: SHELL_POLL_SCOPE,
+    intervalMs: SHELL_POLL_INTERVAL_MS,
+    immediate: false,
+    critical: false,
+    task: async () => {},
+  });
+  const visible = new Map(manager.getSummary().map((entry) => [entry.key, entry]));
+  assert.equal(visible.get("authorization.vault").effectiveIntervalMs, 800);
+  assert.equal(visible.get("authorization.vault").alwaysFocusRate, true);
+  assert.equal(visible.get("authorization.review").effectiveIntervalMs, 3_200);
+  assert.equal(visible.get("authorization.shell").effectiveIntervalMs, 30_000);
+
+  visibility.set("hidden");
+  assert.equal(manager.getSummary().every((entry) => entry.state === "paused"), true);
+  assert.equal(manager.getSummary().every((entry) => entry.effectiveIntervalMs === null), true);
+  assert.equal(timers.jobs.size, 0);
+  visibility.set("visible");
+  assert.deepEqual(timers.delays(), [0, 0, 0]);
+  manager.destroy();
+});
+
+test("opened-unfocused 恢复聚焦时 interval 策略等待基础周期", async () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [windowRecord("review"), windowRecord("tasks")],
+    }),
+    reportError: () => {},
+  });
+  const { manager, timers } = createFakePolling({
+    focusSource: createStorePollingFocusSource(store),
+  });
+  let calls = 0;
+  manager.start({
+    key: "resume.interval",
+    scope: "app:review",
+    intervalMs: 1_000,
+    immediate: false,
+    critical: false,
+    resume: "interval",
+    task: async () => { calls += 1; },
+  });
+  assert.deepEqual(timers.delays(), [4_000]);
+  timers.advanceBy(500);
+  store.dispatch(actionCreators.windowFocused("review"));
+  assert.deepEqual(timers.delays(), [1_000]);
+  timers.advanceBy(999);
+  assert.equal(calls, 0);
+  timers.advanceBy(1);
+  await flushPromises();
+  assert.equal(calls, 1);
+  assert.deepEqual(timers.delays(), [1_000]);
+  manager.destroy();
+});
+
+test("活动请求切回聚焦保持单飞并分别沿用 immediate 与 interval 恢复策略", async () => {
+  const store = createStore({
+    initialState: createInitialState({
+      windows: [
+        windowRecord("tasks"),
+        windowRecord("review"),
+        windowRecord("diagnostics"),
+      ],
+    }),
+    reportError: () => {},
+  });
+  const { manager, timers } = createFakePolling({
+    focusSource: createStorePollingFocusSource(store),
+  });
+  let immediateCalls = 0;
+  let intervalCalls = 0;
+  let immediateActive = 0;
+  let intervalActive = 0;
+  let maxImmediateActive = 0;
+  let maxIntervalActive = 0;
+  let releaseImmediate;
+  let releaseInterval;
+
+  manager.start({
+    key: "active.immediate",
+    scope: "app:tasks",
+    intervalMs: 1_000,
+    immediate: true,
+    critical: false,
+    resume: "immediate",
+    task() {
+      immediateCalls += 1;
+      immediateActive += 1;
+      maxImmediateActive = Math.max(maxImmediateActive, immediateActive);
+      if (immediateCalls === 1) {
+        return new Promise((resolve) => {
+          releaseImmediate = () => {
+            immediateActive -= 1;
+            resolve();
+          };
+        });
+      }
+      immediateActive -= 1;
+      return Promise.resolve();
+    },
+  });
+  manager.start({
+    key: "active.interval",
+    scope: "app:review",
+    intervalMs: 1_000,
+    immediate: true,
+    critical: false,
+    resume: "interval",
+    task() {
+      intervalCalls += 1;
+      intervalActive += 1;
+      maxIntervalActive = Math.max(maxIntervalActive, intervalActive);
+      if (intervalCalls === 1) {
+        return new Promise((resolve) => {
+          releaseInterval = () => {
+            intervalActive -= 1;
+            resolve();
+          };
+        });
+      }
+      intervalActive -= 1;
+      return Promise.resolve();
+    },
+  });
+
+  timers.advanceBy(0);
+  await flushPromises();
+  assert.deepEqual([immediateCalls, intervalCalls], [1, 1]);
+  store.dispatch(actionCreators.windowFocused("tasks"));
+  assert.equal(timers.jobs.size, 0, "活动请求恢复时不得并发创建 timer");
+  const firstTrigger = manager.trigger("active.immediate");
+  assert.equal(manager.trigger("active.immediate"), firstTrigger);
+  assert.equal(immediateCalls, 1);
+
+  releaseImmediate();
+  await flushPromises();
+  assert.deepEqual(timers.delays(), [0]);
+  timers.runNext();
+  await flushPromises();
+  assert.equal(immediateCalls, 2);
+  assert.deepEqual(timers.delays(), [1_000]);
+
+  store.dispatch(actionCreators.windowFocused("review"));
+  assert.deepEqual(timers.delays(), [4_000]);
+  releaseInterval();
+  await flushPromises();
+  assert.deepEqual(timers.delays(), [1_000, 4_000]);
+  timers.advanceBy(999);
+  assert.equal(intervalCalls, 1);
+  timers.advanceBy(1);
+  await flushPromises();
+  assert.equal(intervalCalls, 2);
+  assert.equal(maxImmediateActive, 1);
+  assert.equal(maxIntervalActive, 1);
+  manager.destroy();
+});
+
+test("反复切焦 50 次保持每 entry 一个 timer 且不增长状态源监听器", () => {
+  const focusSource = new FakeFocusSource({
+    focusedScope: "app:tasks",
+    scopeStates: {
+      "app:tasks": POLLING_SCOPE_STATES.OPEN,
+      "app:review": POLLING_SCOPE_STATES.OPEN,
+    },
+  });
+  const visibility = new FakeVisibility();
+  const { manager, timers } = createFakePolling({ visibility, focusSource });
+  for (const [key, scope, intervalMs] of [
+    ["cardinality.tasks", "app:tasks", 1_000],
+    ["cardinality.review", "app:review", 1_000],
+    ["cardinality.shell", SHELL_POLL_SCOPE, SHELL_POLL_INTERVAL_MS],
+  ]) {
+    manager.start({
+      key,
+      scope,
+      intervalMs,
+      immediate: false,
+      critical: false,
+      resume: "interval",
+      task: async () => {},
+    });
+  }
+  const shell = manager.getSummary().find((entry) => entry.key === "cardinality.shell");
+  const shellTimerId = [...timers.jobs.entries()]
+    .find(([, job]) => job.due === shell.nextRunAt)?.[0];
+  assert.equal(timers.jobs.size, 3);
+  assert.equal(focusSource.listeners.size, 1);
+  assert.equal(visibility.listeners.size, 1);
+
+  for (let index = 0; index < 50; index += 1) {
+    focusSource.update({
+      focusedScope: index % 2 === 0 ? "app:review" : "app:tasks",
+    });
+    assert.equal(timers.jobs.size, 3, `第 ${index + 1} 次切焦`);
+    assert.equal(focusSource.listeners.size, 1);
+    assert.equal(visibility.listeners.size, 1);
+  }
+  assert.equal(timers.jobs.has(shellTimerId), true, "shell timer 不得被切焦替换");
+  assert.equal(
+    manager.getSummary().find((entry) => entry.key === "cardinality.shell").nextRunAt,
+    shell.nextRunAt,
+  );
+
+  manager.destroy();
+  assert.equal(timers.jobs.size, 0);
+  assert.equal(focusSource.listeners.size, 0);
   assert.equal(visibility.listeners.size, 0);
 });
 

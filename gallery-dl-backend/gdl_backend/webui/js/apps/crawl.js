@@ -28,6 +28,7 @@ function createCrawlController(context) {
   let autocompleteTimer = null;
   let autocompleteController = null;
   let autocompleteSequence = 0;
+  let focusOutTimer = null;
   let operationController = null;
   let operationSequence = 0;
   let addressOperations = new Map();
@@ -38,6 +39,11 @@ function createCrawlController(context) {
     autocompleteController?.abort();
     autocompleteController = null;
     autocompleteSequence += 1;
+  };
+
+  const stopFocusOut = () => {
+    if (focusOutTimer !== null) clearTimeout(focusOutTimer);
+    focusOutTimer = null;
   };
 
   const setBusy = (kind) => {
@@ -288,7 +294,10 @@ function createCrawlController(context) {
 
   const onFocusOut = (event) => {
     if (event.target !== view.elements.keyword) return;
-    setTimeout(() => {
+    stopFocusOut();
+    focusOutTimer = setTimeout(() => {
+      focusOutTimer = null;
+      if (!active || destroyed) return;
       if (!view.elements.suggestions.contains(document.activeElement)) view.hideSuggestions();
     }, 0);
   };
@@ -328,6 +337,7 @@ function createCrawlController(context) {
       lifecycle += 1;
       operationSequence += 1;
       stopAutocomplete();
+      stopFocusOut();
       operationController?.abort();
       operationController = null;
       busy = "";
@@ -345,6 +355,7 @@ function createCrawlController(context) {
       lifecycle += 1;
       operationSequence += 1;
       stopAutocomplete();
+      stopFocusOut();
       operationController?.abort();
       addressOperations.clear();
       root.removeEventListener("submit", onSubmit);

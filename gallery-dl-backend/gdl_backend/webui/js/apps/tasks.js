@@ -336,6 +336,7 @@ function createTasksController(context) {
       dialogs.destroy();
       operationController?.abort();
       operationController = null;
+      polling.stop(BATCH_POLL_KEY);
       abortRead(activeRead);
       abortRead(recentRead);
       busy = "";
@@ -352,6 +353,7 @@ function createTasksController(context) {
       operationSequence += 1;
       dialogs.destroy();
       operationController?.abort();
+      polling.stop(BATCH_POLL_KEY);
       abortRead(activeRead);
       abortRead(recentRead);
       root.removeEventListener("click", onClick);

@@ -477,6 +477,7 @@ function createReviewController(context) {
       dialogs.destroy();
       operationController?.abort();
       operationController = null;
+      polling.stop(REVIEW_POLL_KEY);
       abortRead(pageRead);
       abortRead(recentRead);
       view.releaseImages();
@@ -494,6 +495,7 @@ function createReviewController(context) {
       operationSequence += 1;
       dialogs.destroy();
       operationController?.abort();
+      polling.stop(REVIEW_POLL_KEY);
       abortRead(pageRead);
       abortRead(recentRead);
       view.releaseImages();

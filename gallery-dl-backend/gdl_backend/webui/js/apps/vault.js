@@ -75,6 +75,7 @@ function createVaultController(context) {
       intervalMs: AUTHORIZATION_POLL_INTERVAL_MS,
       immediate: false,
       critical: false,
+      alwaysFocusRate: true,
       resume: "immediate",
       task(signal) {
         if (busy || !activeSession) return Promise.resolve(false);

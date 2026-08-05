@@ -91,6 +91,7 @@ class WebUiModuleTests(unittest.TestCase):
         personalization = app_sources["personalization.js"]
         self.assertIn('STATUS_POLL_KEY = "proxy.status"', proxy)
         self.assertIn('AUTHORIZATION_POLL_KEY = "vault.authorization"', vault)
+        self.assertIn("alwaysFocusRate: true", vault)
         self.assertNotIn("polling.start", policy)
         self.assertIn('BATCH_POLL_KEY = "batches.active"', tasks)
         self.assertIn("queueMicrotask", tasks)
@@ -142,6 +143,74 @@ class WebUiModuleTests(unittest.TestCase):
         )
         self.assertIn("createSourceErrorWarning", crawl_view)
         self.assertNotIn("innerHTML", crawl_view)
+
+    def test_no_global_dom_selector_calls_in_window_modules(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        javascript_root = backend_root / "gdl_backend" / "webui" / "js"
+        selector_call = re.compile(
+            r"\bdocument\s*\.\s*(?:querySelector|getElementById)\s*\("
+        )
+        paths = sorted((javascript_root / "apps").glob("*.js")) + sorted(
+            (javascript_root / "components").glob("*.js")
+        )
+
+        for path in paths:
+            with self.subTest(module=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIsNone(
+                    selector_call.search(source),
+                    f"{path.relative_to(backend_root)} 必须只在窗口根元素内查询 DOM",
+                )
+
+    def test_polling_focus_t14_static_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        javascript_root = backend_root / "gdl_backend" / "webui" / "js"
+        sources = {
+            "polling": (javascript_root / "core" / "polling.js").read_text(
+                encoding="utf-8"
+            ),
+            "focus": (
+                javascript_root / "core" / "polling-focus-source.js"
+            ).read_text(encoding="utf-8"),
+            "main": (javascript_root / "main.js").read_text(encoding="utf-8"),
+            "tasks": (javascript_root / "core" / "tasks-model.js").read_text(
+                encoding="utf-8"
+            ),
+            "review": (javascript_root / "core" / "review-model.js").read_text(
+                encoding="utf-8"
+            ),
+            "proxy": (javascript_root / "apps" / "proxy.js").read_text(
+                encoding="utf-8"
+            ),
+            "vault": (javascript_root / "apps" / "vault.js").read_text(
+                encoding="utf-8"
+            ),
+            "diagnostics": (
+                javascript_root / "core" / "diagnostics-model.js"
+            ).read_text(encoding="utf-8"),
+            "shell": (
+                javascript_root / "components" / "taskbar-summary.js"
+            ).read_text(encoding="utf-8"),
+        }
+
+        self.assertIn("UNFOCUSED_POLL_MULTIPLIER = 4", sources["polling"])
+        self.assertIn("getFocusedScope", sources["focus"])
+        self.assertIn("getScopeState", sources["focus"])
+        self.assertIn("subscribe", sources["focus"])
+        self.assertIn(
+            "focusSource: createStorePollingFocusSource(store)", sources["main"]
+        )
+        self.assertIn("alwaysFocusRate: true", sources["vault"])
+        for name, fingerprint in {
+            "tasks": "TASK_POLL_INTERVAL_MS = 1_500",
+            "review": "REVIEW_POLL_INTERVAL_MS = 1_500",
+            "proxy": "STATUS_POLL_INTERVAL_MS = 10_000",
+            "vault": "AUTHORIZATION_POLL_INTERVAL_MS = 800",
+            "diagnostics": "DIAGNOSTICS_POLL_INTERVAL_MS = 20_000",
+            "shell": "SHELL_POLL_INTERVAL_MS = 30_000",
+        }.items():
+            self.assertIn(fingerprint, sources[name], name)
+        self.assertIn('SHELL_POLL_SCOPE = "shell"', sources["shell"])
 
     def test_policy_simplified_static_contract(self):
         backend_root = Path(__file__).resolve().parents[1]

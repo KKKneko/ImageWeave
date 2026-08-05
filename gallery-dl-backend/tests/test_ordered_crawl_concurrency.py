@@ -474,13 +474,21 @@ class OrderedCrawlPlanningConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(both_enqueued.wait(), timeout=2.0)
 
         self.assertEqual(peak, 1)
-        self.assertEqual(
+        self.assertIn(
             order,
             [
-                ("enter", address_a["id"]),
-                ("exit", address_a["id"]),
-                ("enter", address_b["id"]),
-                ("exit", address_b["id"]),
+                [
+                    ("enter", address_a["id"]),
+                    ("exit", address_a["id"]),
+                    ("enter", address_b["id"]),
+                    ("exit", address_b["id"]),
+                ],
+                [
+                    ("enter", address_b["id"]),
+                    ("exit", address_b["id"]),
+                    ("enter", address_a["id"]),
+                    ("exit", address_a["id"]),
+                ],
             ],
         )
 

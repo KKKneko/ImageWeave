@@ -129,6 +129,7 @@ function createDiagnosticsController(context) {
       if (destroyed) return;
       active = false;
       manualBusy = false;
+      polling.stop(DIAGNOSTICS_POLL_KEY);
       view.setBusy(false);
       root.hidden = true;
       setElementInert(root, true);
@@ -138,6 +139,7 @@ function createDiagnosticsController(context) {
       if (destroyed) return;
       active = false;
       destroyed = true;
+      polling.stop(DIAGNOSTICS_POLL_KEY);
       root.removeEventListener("click", onClick);
       view.destroy();
       root.removeAttribute("data-lifecycle");

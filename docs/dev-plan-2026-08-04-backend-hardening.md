@@ -1626,16 +1626,16 @@ diagnostics / personalization / placeholder）：
 
 ### 验收标准
 
-- [ ] N1 `UNFOCUSED_POLL_MULTIPLIER = 4`，基础 interval 常量全部未改。
-- [ ] N2 minimized / 已关闭窗口的轮询完全挂起。
-- [ ] N3 VAULT 授权会话轮询带 `alwaysFocusRate` 且不被降频。
-- [ ] N4 页面 hidden 优先于聚焦规则；恢复时 `RESUME_POLICIES` 行为不变。
-- [ ] N5 任务栏 30s 轮询不受影响。
-- [ ] N6 全部 `apps/*.js` 与 `components/*.js` 不再使用全局 DOM 查询
+- [x] N1 `UNFOCUSED_POLL_MULTIPLIER = 4`，基础 interval 常量全部未改。
+- [x] N2 minimized / 已关闭窗口的轮询完全挂起。
+- [x] N3 VAULT 授权会话轮询带 `alwaysFocusRate` 且不被降频。
+- [x] N4 页面 hidden 优先于聚焦规则；恢复时 `RESUME_POLICIES` 行为不变。
+- [x] N5 任务栏 30s 轮询不受影响。
+- [x] N6 全部 `apps/*.js` 与 `components/*.js` 不再使用全局 DOM 查询
       （白名单除外），且有静态测试护栏。
-- [ ] N7 每个应用 unmount 时正确 abort 请求、停轮询、解绑事件，无定时器泄漏。
-- [ ] N8 已产出 `docs/webui-multi-window.md`，`README.md` 桌面应用小节已更新。
-- [ ] N9 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
+- [x] N7 每个应用 unmount 时正确 abort 请求、停轮询、解绑事件，无定时器泄漏。
+- [x] N8 已产出 `docs/webui-multi-window.md`，`README.md` 桌面应用小节已更新。
+- [x] N9 上述测试要求的行为契约已被覆盖（数量不作硬性要求），新增测试全绿，
       288 个后端基线测试全绿。
 
 ---

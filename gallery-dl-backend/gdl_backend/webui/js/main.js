@@ -4,6 +4,7 @@ import { createMotionController } from "./core/motion.js";
 import { createPersonalizationRuntime } from "./core/personalization.js";
 import { createWallpaperStorage } from "./core/wallpaper-storage.js";
 import { createPollingManager } from "./core/polling.js";
+import { createStorePollingFocusSource } from "./core/polling-focus-source.js";
 import { createStorageService } from "./core/storage.js";
 import { createInitialState, createStore } from "./core/store.js";
 import { createDialogController } from "./components/dialog.js";
@@ -72,7 +73,9 @@ try {
       : 0,
   });
   const store = createStore({ initialState: createInitialState({ windows }) });
-  polling = createPollingManager();
+  polling = createPollingManager({
+    focusSource: createStorePollingFocusSource(store),
+  });
   dialogs = createDialogController();
   desktopController = initializeDesktop(document, {
     api,
