@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -8,6 +9,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .encrypted_dns import (
+    DEFAULT_DOH_ENDPOINT,
+    DEFAULT_DOH_MAX_RESPONSE_BYTES,
+    DEFAULT_DOH_TIMEOUT_SECONDS,
+    normalize_doh_endpoint,
+)
 from .file_security import ensure_private_directory
 from .site_policy import (
     DEFAULT_EDITABLE_SITE_POLICY,
@@ -144,6 +151,14 @@ class ServerSettings:
     cors_origins: list[str] = field(default_factory=list)
     allow_private_targets: bool = False
     strict_target_dns: bool = True
+
+
+@dataclass(slots=True)
+class EncryptedDNSSettings:
+    enabled: bool = True
+    endpoint: str = DEFAULT_DOH_ENDPOINT
+    timeout_seconds: float = DEFAULT_DOH_TIMEOUT_SECONDS
+    max_response_bytes: int = DEFAULT_DOH_MAX_RESPONSE_BYTES
 
 
 @dataclass(slots=True)
@@ -298,6 +313,7 @@ class AppSettings:
     allowed_config_roots: list[Path] = field(default_factory=lambda: [(PROJECT_DIR / "credentials").resolve()])
     allowed_cookie_roots: list[Path] = field(default_factory=lambda: [(PROJECT_DIR / "credentials").resolve()])
     server: ServerSettings = field(default_factory=ServerSettings)
+    encrypted_dns: EncryptedDNSSettings = field(default_factory=EncryptedDNSSettings)
     gallery: GallerySettings = field(default_factory=GallerySettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     proxy: ProxySettings = field(default_factory=ProxySettings)
@@ -320,6 +336,7 @@ class AppSettings:
         output_root = _managed_path(data.get("default_output_root"), base, runtime / "downloads")
 
         server_data = dict(data.get("server") or {})
+        encrypted_dns_data = dict(data.get("encrypted_dns") or {})
         gallery_data = dict(data.get("gallery") or {})
         auth_data = dict(data.get("auth") or {})
         proxy_data = dict(data.get("proxy") or {})
@@ -332,6 +349,16 @@ class AppSettings:
             cors_origins=[str(x) for x in server_data.get("cors_origins", [])],
             allow_private_targets=bool(server_data.get("allow_private_targets", False)),
             strict_target_dns=server_data.get("strict_target_dns", True),
+        )
+        encrypted_dns = EncryptedDNSSettings(
+            enabled=encrypted_dns_data.get("enabled", True),
+            endpoint=encrypted_dns_data.get("endpoint", DEFAULT_DOH_ENDPOINT),
+            timeout_seconds=encrypted_dns_data.get(
+                "timeout_seconds", DEFAULT_DOH_TIMEOUT_SECONDS
+            ),
+            max_response_bytes=encrypted_dns_data.get(
+                "max_response_bytes", DEFAULT_DOH_MAX_RESPONSE_BYTES
+            ),
         )
         gallery = GallerySettings(
             repo_path=_path(gallery_data.get("repo_path"), base, WORKSPACE_DIR / "gallery-dl-codeberg"),
@@ -453,6 +480,7 @@ class AppSettings:
             allowed_config_roots=_paths(data.get("allowed_config_roots"), base, [PROJECT_DIR / "credentials"]),
             allowed_cookie_roots=_paths(data.get("allowed_cookie_roots"), base, [PROJECT_DIR / "credentials"]),
             server=server,
+            encrypted_dns=encrypted_dns,
             gallery=gallery,
             auth=auth,
             proxy=proxy,
@@ -474,6 +502,32 @@ class AppSettings:
             raise ValueError("server.port 超出范围")
         if not isinstance(self.server.strict_target_dns, bool):
             raise ValueError("server.strict_target_dns 必须是布尔值")
+        if not isinstance(self.encrypted_dns.enabled, bool):
+            raise ValueError("encrypted_dns.enabled 必须是布尔值")
+        try:
+            self.encrypted_dns.endpoint = normalize_doh_endpoint(
+                self.encrypted_dns.endpoint
+            )
+        except ValueError as exc:
+            raise ValueError(f"encrypted_dns.endpoint 无效: {exc}") from exc
+        timeout = self.encrypted_dns.timeout_seconds
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or not 0.1 <= float(timeout) <= 60.0
+        ):
+            raise ValueError("encrypted_dns.timeout_seconds 必须位于 0.1..60")
+        self.encrypted_dns.timeout_seconds = float(timeout)
+        response_limit = self.encrypted_dns.max_response_bytes
+        if (
+            isinstance(response_limit, bool)
+            or not isinstance(response_limit, int)
+            or not 1024 <= response_limit <= 1024 * 1024
+        ):
+            raise ValueError(
+                "encrypted_dns.max_response_bytes 必须位于 1024..1048576"
+            )
         if not self.server.strict_target_dns:
             print(
                 "警告：server.strict_target_dns=false，目标 DNS 校验已降级；"
@@ -654,6 +708,12 @@ class AppSettings:
                 "cors_origins": list(self.server.cors_origins),
                 "allow_private_targets": self.server.allow_private_targets,
                 "strict_target_dns": self.server.strict_target_dns,
+            },
+            "encrypted_dns": {
+                "enabled": self.encrypted_dns.enabled,
+                "endpoint": self.encrypted_dns.endpoint,
+                "timeout_seconds": self.encrypted_dns.timeout_seconds,
+                "max_response_bytes": self.encrypted_dns.max_response_bytes,
             },
             "gallery": {
                 "repo_path": str(self.gallery.repo_path),

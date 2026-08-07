@@ -11,8 +11,19 @@ from gdl_backend.app import ServiceContainer, _validate_network_target, create_a
 from gdl_backend.auth import AuthError, AuthManager
 from gdl_backend.crawl import CrawlUnit
 from gdl_backend.discovery import DiscoveryError
+from gdl_backend.encrypted_dns import EncryptedDNSError, NetworkTargetValidator
+from gdl_backend.proxy import ProxyLease
+from gdl_backend.site import SiteInfo
 
 from tests.helpers import local_test_client, make_settings
+
+
+class _FakeMonotonicClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class _TagCollector(HTMLParser):
@@ -112,6 +123,76 @@ class ApiTests(unittest.TestCase):
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
+
+    def _configure_strict_crawl_network(self) -> None:
+        self.container.settings.server.allow_private_targets = False
+        self.container.settings.server.strict_target_dns = True
+        self.container.network_validator.allow_private_targets = False
+        self.container.network_validator.strict_target_dns = True
+        self.container.resolver.resolve = Mock(
+            return_value=SiteInfo(
+                "danbooru",
+                "",
+                "DanbooruPostExtractor",
+                True,
+                "danbooru.donmai.us",
+            )
+        )
+
+    def _prime_danbooru_proxy_cache(
+        self,
+        *,
+        validator: NetworkTargetValidator | None = None,
+    ) -> Mock:
+        self._configure_strict_crawl_network()
+        validator = validator or self.container.network_validator
+        doh = Mock()
+        doh.resolve.return_value = ("1.1.1.1", "2606:4700:4700::1111")
+        validator.encrypted_dns = doh
+        lease = ProxyLease(
+            task_id="search-29077",
+            node_id="node-29077",
+            endpoint="http://127.0.0.1:29077",
+            name="fixture-29077",
+            protocol="http",
+            tags=["fixture"],
+            acquired_at=1.0,
+        )
+        validator.validate_proxy(
+            "https://danbooru.donmai.us/posts?tags=fixture",
+            lease,
+        )
+        self.assertTrue(
+            validator.validate_proxy_cache_fallback(
+                "https://danbooru.donmai.us/posts/123"
+            )
+        )
+        return doh
+
+    @staticmethod
+    def _danbooru_crawl_payload(
+        *,
+        body_mode: str | None = None,
+        source_mode: str | None = None,
+        url: str = "https://danbooru.donmai.us/posts/123",
+    ) -> dict:
+        source = {
+            "site": "danbooru",
+            "addresses": [{"url": url}],
+        }
+        if source_mode is not None:
+            source["proxy_mode"] = source_mode
+        payload = {"sources": [source]}
+        if body_mode is not None:
+            payload["proxy_mode"] = body_mode
+        return payload
+
+    @staticmethod
+    def _mixed_dns_entries() -> list[tuple[None, None, None, None, tuple[str, int]]]:
+        return [
+            (None, None, None, None, ("1.1.1.1", 443)),
+            (None, None, None, None, ("2001::4a56:cac", 443)),
+        ]
 
     def _prepare_chunk_plan(self, count: int):
         batch_id = "batch-chunks"
@@ -1529,6 +1610,341 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["selection_contract"]["execution_order"], "source_then_address")
         self.assertEqual(payload["selection_contract"]["default_visibility"], "addresses_only")
         self.assertEqual(self.container.discovery.search.await_args.kwargs["site"], "danbooru")
+
+    def test_proxy_backed_search_skips_local_strict_dns_and_calls_discovery(self):
+        self.container.settings.server.allow_private_targets = False
+        result = {
+            "site": "danbooru",
+            "keyword": "proxy-branch-fixture",
+            "search_url": "https://danbooru.donmai.us/posts?tags=proxy-branch-fixture",
+            "candidate_count": 0,
+            "author_count": 0,
+            "candidates": [],
+            "authors": [],
+            "proxy": {"mode": "required", "used": True, "node_id": "node-2"},
+            "attempts": 2,
+        }
+        self.container.discovery.search = AsyncMock(return_value=result)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
+        getaddrinfo = Mock(
+            return_value=[(None, None, None, None, ("2001::4a56:cac", 443))]
+        )
+
+        with patch("gdl_backend.app.socket.getaddrinfo", getaddrinfo):
+            response = self.client.post(
+                "/api/v1/search",
+                headers=self.headers,
+                json={
+                    "sites": ["danbooru"],
+                    "keyword": "proxy-branch-fixture",
+                    "limit": 5,
+                    "proxy_mode": "required",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        source = response.json()["sources"][0]
+        self.assertEqual(source["status"], "succeeded")
+        self.assertIsNone(source["error"])
+        self.assertNotEqual((source.get("error") or {}).get("code"), "invalid_search_source")
+        self.assertEqual(source["attempts"], 2)
+        self.container.discovery.search.assert_awaited_once()
+        self.assertEqual(
+            self.container.discovery.search.await_args.kwargs["proxy_mode"],
+            "required",
+        )
+        getaddrinfo.assert_not_called()
+
+    def test_direct_search_uses_local_strict_dns_and_rejects_teredo(self):
+        self.container.settings.server.allow_private_targets = False
+        self.container.discovery.search = AsyncMock()
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
+        getaddrinfo = Mock(
+            return_value=[(None, None, None, None, ("2001::4a56:cac", 443))]
+        )
+
+        with patch("gdl_backend.app.socket.getaddrinfo", getaddrinfo):
+            response = self.client.post(
+                "/api/v1/search",
+                headers=self.headers,
+                json={
+                    "sites": ["danbooru"],
+                    "keyword": "direct-branch-fixture",
+                    "limit": 5,
+                    "proxy_mode": "direct",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        source = response.json()["sources"][0]
+        self.assertEqual(source["status"], "failed")
+        self.assertEqual(source["error"]["code"], "invalid_search_source")
+        self.assertEqual(source["address_count"], 0)
+        getaddrinfo.assert_called_once()
+        self.container.discovery.search.assert_not_awaited()
+
+    def test_encrypted_dns_source_error_projection_is_redacted(self):
+        private_keyword = "PRIVATE_API_KEYWORD_8c4f2a"
+        endpoint = "http://127.0.0.1:29077"
+        raw_secret = "RAW_TLS_RESPONSE_SECRET"
+        lease = ProxyLease(
+            task_id="fixture-task",
+            node_id="node-private",
+            endpoint=endpoint,
+            name="fixture-node",
+            protocol="http",
+            tags=[],
+            acquired_at=1.0,
+        )
+        dns_error = EncryptedDNSError(
+            "encrypted_dns_unavailable",
+            "代理节点的加密 DNS TLS 连接失败",
+            retryable=True,
+            proxy_fault=True,
+        )
+        dns_error.__cause__ = RuntimeError(raw_secret)
+        projected = self.container.discovery._network_error(
+            dns_error,
+            mode="required",
+            lease=lease,
+            attempts=2,
+        )
+        self.container.discovery.search = AsyncMock(side_effect=projected)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
+
+        response = self.client.post(
+            "/api/v1/search",
+            headers=self.headers,
+            json={
+                "sites": ["danbooru"],
+                "keyword": private_keyword,
+                "limit": 5,
+                "proxy_mode": "required",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        source = response.json()["sources"][0]
+        self.assertEqual(source["status"], "failed")
+        self.assertEqual(source["error"]["code"], "encrypted_dns_unavailable")
+        self.assertEqual(source["attempts"], 2)
+        rendered = str({"error": source["error"], "proxy": source["proxy"]})
+        for secret in (
+            endpoint,
+            "127.0.0.1",
+            "29077",
+            "danbooru.donmai.us",
+            private_keyword,
+            raw_secret,
+        ):
+            self.assertNotIn(secret, rendered)
+        self.assertNotIn("endpoint", source["proxy"])
+
+    def test_proxy_doh_cache_allows_required_crawl_without_rewriting_url(self):
+        doh = self._prime_danbooru_proxy_cache()
+        proxy_acquire = Mock(side_effect=AssertionError("创建批次不应申请代理租约"))
+        self.container.proxy.acquire = proxy_acquire
+        expected_url = "https://danbooru.donmai.us/posts/123"
+
+        with patch(
+            "gdl_backend.app.socket.getaddrinfo",
+            return_value=self._mixed_dns_entries(),
+        ):
+            response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(body_mode="required"),
+            )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        batch = self.container.db.get_crawl_batch(response.json()["id"])
+        address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(address["url"], expected_url)
+        self.assertEqual(address["proxy_mode"], "required")
+        self.assertNotIn("1.1.1.1", address["url"])
+        self.assertEqual(doh.resolve.call_count, 1)
+        proxy_acquire.assert_not_called()
+
+    def test_cached_proxy_doh_result_does_not_bypass_direct_crawl_dns_failure(self):
+        doh = self._prime_danbooru_proxy_cache()
+        original_create = self.container.db.create_crawl_batch
+
+        with (
+            patch(
+                "gdl_backend.app.socket.getaddrinfo",
+                return_value=self._mixed_dns_entries(),
+            ),
+            patch.object(
+                self.container.db,
+                "create_crawl_batch",
+                wraps=original_create,
+            ) as create_batch,
+        ):
+            response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(body_mode="direct"),
+            )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["error"]["code"], "invalid_crawl")
+        self.assertIn("2001::4a56:cac", response.json()["error"]["message"])
+        create_batch.assert_not_called()
+        self.assertEqual(doh.resolve.call_count, 1)
+
+    def test_non_direct_cache_miss_keeps_original_422_without_database_write(self):
+        self._configure_strict_crawl_network()
+        doh = Mock()
+        self.container.network_validator.encrypted_dns = doh
+        original_create = self.container.db.create_crawl_batch
+
+        with (
+            patch(
+                "gdl_backend.app.socket.getaddrinfo",
+                return_value=self._mixed_dns_entries(),
+            ),
+            patch.object(
+                self.container.db,
+                "create_crawl_batch",
+                wraps=original_create,
+            ) as create_batch,
+        ):
+            response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(body_mode="prefer"),
+            )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["error"]["code"], "invalid_crawl")
+        self.assertIn("2001::4a56:cac", response.json()["error"]["message"])
+        create_batch.assert_not_called()
+        doh.resolve.assert_not_called()
+
+    def test_expired_proxy_doh_cache_keeps_original_422_without_database_write(self):
+        clock = _FakeMonotonicClock()
+        validator = NetworkTargetValidator(
+            allow_private_targets=False,
+            strict_target_dns=True,
+            encrypted_dns=Mock(),
+            proxy_doh_cache_ttl_seconds=1.0,
+            monotonic_clock=clock,
+        )
+        self.container.network_validator = validator
+        doh = self._prime_danbooru_proxy_cache(validator=validator)
+        clock.now = 1.0
+        original_create = self.container.db.create_crawl_batch
+
+        with (
+            patch(
+                "gdl_backend.app.socket.getaddrinfo",
+                return_value=self._mixed_dns_entries(),
+            ),
+            patch.object(
+                self.container.db,
+                "create_crawl_batch",
+                wraps=original_create,
+            ) as create_batch,
+        ):
+            response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(body_mode="required"),
+            )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["error"]["code"], "invalid_crawl")
+        self.assertIn("2001::4a56:cac", response.json()["error"]["message"])
+        create_batch.assert_not_called()
+        self.assertEqual(doh.resolve.call_count, 1)
+
+    def test_malformed_private_and_non_exact_hostnames_cannot_borrow_proxy_cache(self):
+        doh = self._prime_danbooru_proxy_cache()
+        original_create = self.container.db.create_crawl_batch
+        rejected = {
+            "malformed": "https:///missing-host",
+            "private_literal": "https://127.0.0.1/posts/123",
+            "different_subdomain": "https://sub.danbooru.donmai.us/posts/123",
+        }
+
+        with (
+            patch(
+                "gdl_backend.app.socket.getaddrinfo",
+                return_value=self._mixed_dns_entries(),
+            ),
+            patch.object(
+                self.container.db,
+                "create_crawl_batch",
+                wraps=original_create,
+            ) as create_batch,
+        ):
+            for name, url in rejected.items():
+                with self.subTest(name=name):
+                    response = self.client.post(
+                        "/api/v1/crawls",
+                        headers=self.headers,
+                        json=self._danbooru_crawl_payload(
+                            body_mode="required",
+                            url=url,
+                        ),
+                    )
+                    self.assertEqual(response.status_code, 422, response.text)
+
+        create_batch.assert_not_called()
+        self.assertEqual(doh.resolve.call_count, 1)
+
+    def test_crawl_cache_fallback_uses_source_body_and_policy_effective_proxy_mode(self):
+        doh = self._prime_danbooru_proxy_cache()
+        self.container.db.put_site_policy(
+            "danbooru",
+            self._policy_view_payload(proxy_mode="prefer"),
+        )
+
+        with patch(
+            "gdl_backend.app.socket.getaddrinfo",
+            return_value=self._mixed_dns_entries(),
+        ):
+            policy_response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(),
+            )
+            source_response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(
+                    body_mode="direct",
+                    source_mode="required",
+                ),
+            )
+            body_response = self.client.post(
+                "/api/v1/crawls",
+                headers=self.headers,
+                json=self._danbooru_crawl_payload(body_mode="direct"),
+            )
+
+        self.assertEqual(policy_response.status_code, 202, policy_response.text)
+        self.assertEqual(
+            policy_response.json()["sources"][0]["addresses"][0]["proxy_mode"],
+            "prefer",
+        )
+        self.assertEqual(source_response.status_code, 202, source_response.text)
+        self.assertEqual(
+            source_response.json()["sources"][0]["addresses"][0]["proxy_mode"],
+            "required",
+        )
+        self.assertEqual(body_response.status_code, 422, body_response.text)
+        self.assertIn(
+            "2001::4a56:cac",
+            body_response.json()["error"]["message"],
+        )
+        self.assertEqual(doh.resolve.call_count, 1)
 
     def test_exhentai_search_returns_selectable_galleries_with_previews(self):
         raw = {

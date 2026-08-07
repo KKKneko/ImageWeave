@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -57,6 +58,9 @@ import {
 } from "../gdl_backend/webui/js/core/policy-model.js";
 import {
   buildReviewDecisionPayload,
+  deckAdvanceTarget,
+  deckStepTarget,
+  resolveDeckCommand,
   REVIEW_POLL_INTERVAL_MS,
   reviewImageUrl,
   sanitizeReviewPage,
@@ -6431,6 +6435,102 @@ function rawReviewWorkflow() {
     analysis_log_path: `/home/private/${WORKFLOW_SECRET}.log`,
   };
 }
+
+test("REVIEW deck 自动推进覆盖页内、跨页与完成边缘", () => {
+  assert.deepEqual(deckAdvanceTarget({
+    focusedIndex: 3, groupCount: 8, offset: 0, limit: 8, total: 16,
+  }), { type: "group", index: 4 });
+  assert.deepEqual(deckAdvanceTarget({
+    focusedIndex: 7, groupCount: 8, offset: 0, limit: 8, total: 16,
+  }), { type: "next-page", offset: 8 });
+  assert.deepEqual(deckAdvanceTarget({
+    focusedIndex: 7, groupCount: 8, offset: 0, limit: 8, total: 8,
+  }), { type: "complete" });
+  assert.deepEqual(deckAdvanceTarget({
+    focusedIndex: 0, groupCount: 1, offset: 8, limit: 8, total: 9,
+  }), { type: "complete" });
+});
+
+test("REVIEW deck 键位在只读状态仅保留导航命令", () => {
+  assert.deepEqual([
+    resolveDeckCommand("Enter", { editable: true }),
+    resolveDeckCommand(" ", { editable: true }),
+    resolveDeckCommand("1", { editable: true }),
+    resolveDeckCommand("a", { editable: true }),
+    resolveDeckCommand("A", { editable: true }),
+  ], ["accept-advance", "accept-advance", "toggle-1", "keep-all", "keep-all"]);
+  assert.deepEqual([
+    resolveDeckCommand("Enter", { editable: false }),
+    resolveDeckCommand("1", { editable: false }),
+    resolveDeckCommand("a", { editable: false }),
+  ], [null, null, null]);
+  assert.equal(resolveDeckCommand("ArrowRight", { editable: false }), "next-group");
+  assert.deepEqual([
+    resolveDeckCommand("Backspace", { editable: true }),
+    resolveDeckCommand("R", { editable: true }),
+    resolveDeckCommand("h", { editable: false }),
+    resolveDeckCommand("l", { editable: false }),
+    resolveDeckCommand("Home", { editable: false }),
+    resolveDeckCommand("End", { editable: false }),
+    resolveDeckCommand("PageUp", { editable: false }),
+    resolveDeckCommand("PageDown", { editable: false }),
+    resolveDeckCommand("i", { editable: false }),
+    resolveDeckCommand("s", { editable: true }),
+  ], [
+    "discard-all", "reset-recommended", "prev-group", "next-group", "first-group",
+    "last-group", "prev-page", "next-page", "toggle-inspector", "save",
+  ]);
+  assert.equal(resolveDeckCommand("Escape", { editable: true }), null);
+});
+
+test("REVIEW deck 图片切换命令不会吞掉指标命令", () => {
+  const source = readFileSync(
+    new URL("../gdl_backend/webui/js/apps/review.js", import.meta.url),
+    "utf8",
+  );
+  const inspectorBranch = source.indexOf('if (command === "toggle-inspector")');
+  const imageToggleBranch = source.indexOf('if (/^toggle-[1-9]$/.test(command))');
+  assert.ok(inspectorBranch >= 0);
+  assert.ok(imageToggleBranch > inspectorBranch);
+  assert.match(source, /view\.toggleInspector\(\)/);
+  assert.doesNotMatch(source, /command\.startsWith\("toggle-"\)/);
+});
+
+test("REVIEW deck 单步导航正确处理页内与跨页", () => {
+  const page = { focusedIndex: 3, groupCount: 8, offset: 8, limit: 8, total: 24 };
+  assert.deepEqual([
+    deckStepTarget(-1, page),
+    deckStepTarget(1, page),
+  ], [{ type: "group", index: 2 }, { type: "group", index: 4 }]);
+  assert.deepEqual(deckStepTarget(-1, {
+    focusedIndex: 0, groupCount: 8, offset: 8, limit: 8, total: 24,
+  }), { type: "prev-page", offset: 0 });
+  assert.deepEqual(deckStepTarget(1, {
+    focusedIndex: 7, groupCount: 8, offset: 8, limit: 8, total: 24,
+  }), { type: "next-page", offset: 16 });
+});
+
+test("REVIEW 组确认只对当前页已知组置脏且不改选择", () => {
+  const page = sanitizeReviewPage(rawReviewWorkflow(), {
+    batchId: "batch-123", filter: "", requestedOffset: 0,
+  });
+  const store = createStore({ reportError: () => {} });
+  store.dispatch(actionCreators.reviewWorkspaceReceived(page));
+  const beforeUnknown = store.getState();
+  store.dispatch(actionCreators.reviewGroupConfirmed("group-missing"));
+  assert.equal(store.getState(), beforeUnknown);
+  store.dispatch(actionCreators.reviewGroupConfirmed("group-1"));
+  assert.deepEqual({
+    dirty: store.getState().review.dirty,
+    selected: store.getState().review.groups[0].images.map((image) => image.selected),
+    decided: store.getState().review.groups[0].decided,
+  }, { dirty: true, selected: [true, true], decided: false });
+
+  const emptyStore = createStore({ reportError: () => {} });
+  const emptyBefore = emptyStore.getState();
+  emptyStore.dispatch(actionCreators.reviewGroupConfirmed("group-1"));
+  assert.equal(emptyStore.getState(), emptyBefore);
+});
 
 test("REVIEW happy path 分页投影、推荐选择和决策 payload 不暴露路径", () => {
   const page = sanitizeReviewPage(rawReviewWorkflow(), {

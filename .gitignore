@@ -91,3 +91,6 @@ Desktop.ini
 !/docs/**/[Rr][Ee][Aa][Dd][Mm][Ee].[Mm][Dd]
 !/gallery-dl-backend/docs/**/[Rr][Ee][Aa][Dd][Mm][Ee].[Mm][Dd]
 !/Proxy_pool/docs/**/[Rr][Ee][Aa][Dd][Mm][Ee].[Mm][Dd]
+
+# REVIEW.EXE 施工资料仅供本机辅助开发，不提交
+/gallery-dl-backend/docs/review-focus-deck/

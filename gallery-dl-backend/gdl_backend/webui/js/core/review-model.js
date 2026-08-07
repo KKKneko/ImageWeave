@@ -25,6 +25,76 @@ export const REVIEW_FILTERS = Object.freeze([
   Object.freeze({ id: "unreadable", label: "读取失败" }),
 ]);
 
+const DECK_EDIT_COMMANDS = new Set([
+  "accept-advance", "keep-all", "discard-all", "reset-recommended", "save",
+]);
+
+function requireDeckPosition({ focusedIndex, groupCount, offset, limit, total }) {
+  const values = { focusedIndex, groupCount, offset, limit, total };
+  if (!Object.values(values).every(Number.isInteger) || focusedIndex < 0 || groupCount < 0 ||
+      offset < 0 || limit <= 0 || total < 0 || (groupCount && focusedIndex >= groupCount)) {
+    throw new TypeError("审核分拣台位置无效");
+  }
+  return values;
+}
+
+export function resolveDeckCommand(key, { editable = false } = {}) {
+  if (typeof key !== "string") return null;
+  let command = null;
+  if (/^[1-9]$/.test(key)) command = `toggle-${key}`;
+  else if (key === "Enter" || key === " ") command = "accept-advance";
+  else if (key === "Backspace") command = "discard-all";
+  else if (key === "ArrowLeft") command = "prev-group";
+  else if (key === "ArrowRight") command = "next-group";
+  else if (key === "Home") command = "first-group";
+  else if (key === "End") command = "last-group";
+  else if (key === "PageUp") command = "prev-page";
+  else if (key === "PageDown") command = "next-page";
+  else {
+    const normalized = key.toLowerCase();
+    command = ({
+      a: "keep-all",
+      d: "discard-all",
+      r: "reset-recommended",
+      h: "prev-group",
+      l: "next-group",
+      i: "toggle-inspector",
+      s: "save",
+    })[normalized] || null;
+  }
+  const editCommand = /^toggle-[1-9]$/.test(command || "") || DECK_EDIT_COMMANDS.has(command);
+  return editCommand && !editable ? null : command;
+}
+
+export function deckAdvanceTarget(position) {
+  const { focusedIndex, groupCount, offset, limit, total } = requireDeckPosition(position);
+  if (groupCount && focusedIndex + 1 < groupCount) {
+    return Object.freeze({ type: "group", index: focusedIndex + 1 });
+  }
+  if (offset + limit < total) {
+    return Object.freeze({ type: "next-page", offset: offset + limit });
+  }
+  return Object.freeze({ type: "complete" });
+}
+
+export function deckStepTarget(direction, position) {
+  if (direction !== -1 && direction !== 1) throw new TypeError("审核分拣台方向无效");
+  const { focusedIndex, groupCount, offset, limit, total } = requireDeckPosition(position);
+  if (!groupCount) return Object.freeze({ type: "edge" });
+  if (direction < 0) {
+    if (focusedIndex > 0) return Object.freeze({ type: "group", index: focusedIndex - 1 });
+    if (offset > 0) return Object.freeze({ type: "prev-page", offset: Math.max(0, offset - limit) });
+    return Object.freeze({ type: "edge" });
+  }
+  if (focusedIndex + 1 < groupCount) {
+    return Object.freeze({ type: "group", index: focusedIndex + 1 });
+  }
+  if (offset + limit < total) {
+    return Object.freeze({ type: "next-page", offset: offset + limit });
+  }
+  return Object.freeze({ type: "edge" });
+}
+
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

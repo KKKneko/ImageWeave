@@ -53,6 +53,7 @@ from .discovery import (
     search_site_catalog,
     validate_discovery_args,
 )
+from .encrypted_dns import EncryptedDNSResolver, NetworkTargetValidator
 from .gallery import GalleryRunner
 from .log_writer import TaskLogWriter
 from .ordered_crawl import EnqueueBatchCancelled, OrderedCrawlManager
@@ -181,10 +182,22 @@ class ServiceContainer:
             auth_failure_callback=self.auth.invalidate_if_managed,
         )
         self.resolver = SiteResolver(settings.gallery.repo_path)
+        self.encrypted_dns = EncryptedDNSResolver(
+            enabled=settings.encrypted_dns.enabled,
+            endpoint=settings.encrypted_dns.endpoint,
+            timeout_seconds=settings.encrypted_dns.timeout_seconds,
+            max_response_bytes=settings.encrypted_dns.max_response_bytes,
+        )
+        self.network_validator = NetworkTargetValidator(
+            allow_private_targets=settings.server.allow_private_targets,
+            strict_target_dns=settings.server.strict_target_dns,
+            encrypted_dns=self.encrypted_dns,
+        )
         self.discovery = DiscoveryService(
             self.gallery,
             self.proxy,
             settings.runtime_dir,
+            network_validator=self.network_validator,
             auth_failure_callback=self.auth.invalidate_if_managed,
         )
         self.crawl_planner = CrawlPlanner(
@@ -1191,12 +1204,16 @@ def create_app(
                 }
             try:
                 search_url = spec.search_url(body.keyword)
-                await asyncio.to_thread(
-                    _validate_network_target,
-                    search_url,
-                    container.settings.server.allow_private_targets,
-                    strict=container.settings.server.strict_target_dns,
-                )
+                policy = container.policy_for(site)
+                mode = option["proxy_mode"] or policy.proxy_mode
+                container.network_validator.validate_static(search_url)
+                if mode == "direct":
+                    await asyncio.to_thread(
+                        _validate_network_target,
+                        search_url,
+                        container.settings.server.allow_private_targets,
+                        strict=container.settings.server.strict_target_dns,
+                    )
                 credentials_ref, cookies_value, config_value = _managed_request_credentials(
                     container,
                     site,
@@ -1218,7 +1235,7 @@ def create_app(
                         site=site,
                         keyword=term,
                         limit=body.limit,
-                        policy=container.policy_for(site),
+                        policy=policy,
                         proxy_mode=option["proxy_mode"],
                         credentials_ref=credentials_ref,
                         cookies_file=str(cookies) if cookies else None,
@@ -1791,12 +1808,27 @@ def create_app(
                 )
                 for address_order, address in enumerate(source.addresses):
                     url = canonical_gallery_address(site, address.url)
-                    await asyncio.to_thread(
-                        _validate_network_target,
-                        url,
-                        container.settings.server.allow_private_targets,
-                        strict=container.settings.server.strict_target_dns,
-                    )
+                    try:
+                        await asyncio.to_thread(
+                            _validate_network_target,
+                            url,
+                            container.settings.server.allow_private_targets,
+                            strict=container.settings.server.strict_target_dns,
+                        )
+                    except ValueError:
+                        if mode == "direct":
+                            raise
+                        try:
+                            cache_fallback_allowed = await asyncio.to_thread(
+                                container.network_validator.validate_proxy_cache_fallback,
+                                url,
+                            )
+                        except Exception:
+                            # 缓存仅是临时放行辅助；任何内部异常都必须保留
+                            # 原始本机 DNS 校验错误，不能改变 API 的 422 行为。
+                            cache_fallback_allowed = False
+                        if not cache_fallback_allowed:
+                            raise
                     site_info = await asyncio.to_thread(container.resolver.resolve, url)
                     if site_info.supported:
                         _validate_site_match(site, site_info.site)

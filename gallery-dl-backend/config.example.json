@@ -18,6 +18,12 @@
     "allow_private_targets": false,
     "strict_target_dns": true
   },
+  "encrypted_dns": {
+    "enabled": true,
+    "endpoint": "https://cloudflare-dns.com/dns-query",
+    "timeout_seconds": 8,
+    "max_response_bytes": 65536
+  },
   "gallery": {
     "repo_path": "../gallery-dl-codeberg",
     "cache_file": "credentials/managed/gallery-dl-cache.sqlite3",

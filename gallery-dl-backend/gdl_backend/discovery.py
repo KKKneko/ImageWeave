@@ -16,6 +16,11 @@ import requests
 from curl_cffi import requests as curl_requests
 
 from .classifier import FailureDecision, classify_result
+from .encrypted_dns import (
+    EncryptedDNSError,
+    NetworkTargetValidator,
+    validate_network_target_syntax,
+)
 from .file_security import ensure_private_directory
 from .gallery import GalleryRunner
 from .proxy import ProxyLease, ProxyPoolAdapter, ProxyPoolUnavailable
@@ -106,6 +111,21 @@ _EXHENTAI_TAG_NAMESPACE_LABELS = {
     str(item["namespace"]): str(item["label"])
     for item in EXHENTAI_TAG_NAMESPACES
 }
+_DNS_ERROR_CODES = frozenset(
+    {
+        "invalid_network_target",
+        "proxy_dns_failed",
+        "encrypted_dns_unavailable",
+        "encrypted_dns_redirect",
+        "encrypted_dns_http_error",
+        "encrypted_dns_protocol",
+        "encrypted_dns_status_error",
+        "encrypted_dns_nxdomain",
+        "encrypted_dns_no_answer",
+        "encrypted_dns_response_too_large",
+    }
+)
+
 _DISCOVERY_MANAGED_ARGS = {
     "-g",
     "-G",
@@ -187,6 +207,7 @@ def _danbooru_json_request(
             proxy=proxy_url,
             timeout=max(1.0, float(timeout)),
             allow_redirects=False,
+            verify=True,
         )
         status_code = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status_code < 400:
@@ -1373,6 +1394,31 @@ def classify_external_profile(url: str) -> dict[str, Any]:
     }
 
 
+class _StaticNetworkTargetValidator:
+    """仅供直接构造 DiscoveryService 的测试桩使用；生产必须显式注入。"""
+
+    @staticmethod
+    def validate_static(url: str) -> Any:
+        return validate_network_target_syntax(url, False)
+
+    def validate_direct(self, url: str) -> tuple[str, ...]:
+        self.validate_static(url)
+        return ()
+
+    def validate_proxy(
+        self,
+        url: str,
+        lease: ProxyLease,
+    ) -> tuple[str, ...]:
+        self.validate_static(url)
+        raise EncryptedDNSError(
+            "encrypted_dns_unavailable",
+            "代理搜索缺少加密 DNS 校验器，已拒绝连接",
+            retryable=False,
+            proxy_fault=False,
+        )
+
+
 class DiscoveryService:
     def __init__(
         self,
@@ -1380,13 +1426,98 @@ class DiscoveryService:
         proxy: ProxyPoolAdapter,
         runtime_dir: Path,
         *,
+        network_validator: NetworkTargetValidator | None = None,
         auth_failure_callback: Callable[[str, str | None, str], Awaitable[bool]] | None = None,
     ) -> None:
         self.gallery = gallery
         self.proxy = proxy
         self.runtime_dir = Path(os.path.abspath(os.fspath(runtime_dir / "discovery")))
         ensure_private_directory(self.runtime_dir)
+        self.network_validator = network_validator or _StaticNetworkTargetValidator()
         self.auth_failure_callback = auth_failure_callback
+
+    @staticmethod
+    def _proxy_metadata(mode: ProxyMode, lease: ProxyLease | None) -> dict[str, Any]:
+        if lease is None:
+            return {
+                "mode": mode,
+                "used": False,
+                "node_id": None,
+                "node_name": None,
+                "protocol": None,
+            }
+        endpoint = str(lease.endpoint or "")
+        parsed = urlsplit(endpoint)
+        secrets = tuple(
+            value
+            for value in (
+                endpoint,
+                parsed.netloc,
+                parsed.hostname,
+                str(parsed.port) if parsed.port is not None else "",
+            )
+            if value
+        )
+        return {
+            "mode": mode,
+            "used": True,
+            "node_id": redact_text(lease.node_id, secrets=secrets, limit=128),
+            "node_name": redact_text(lease.name, secrets=secrets, limit=200),
+            "protocol": redact_text(lease.protocol, secrets=secrets, limit=50),
+        }
+
+    def _network_error(
+        self,
+        error: EncryptedDNSError,
+        *,
+        mode: ProxyMode,
+        lease: ProxyLease | None,
+        attempts: int,
+    ) -> DiscoveryError:
+        return DiscoveryError(
+            error.code,
+            error.message,
+            details={
+                "attempts": attempts,
+                "proxy": self._proxy_metadata(mode, lease),
+            },
+        )
+
+    async def validate_direct(self, url: str) -> tuple[str, ...]:
+        try:
+            result = await asyncio.to_thread(
+                self.network_validator.validate_direct,
+                url,
+            )
+        except EncryptedDNSError as exc:
+            raise self._network_error(
+                exc,
+                mode="direct",
+                lease=None,
+                attempts=0,
+            ) from exc
+        except ValueError as exc:
+            raise DiscoveryError(
+                "invalid_network_target",
+                redact_text(exc, limit=500),
+                details={
+                    "attempts": 0,
+                    "proxy": self._proxy_metadata("direct", None),
+                },
+            ) from exc
+        return tuple(result or ())
+
+    async def validate_proxy(
+        self,
+        url: str,
+        lease: ProxyLease,
+    ) -> tuple[str, ...]:
+        result = await asyncio.to_thread(
+            self.network_validator.validate_proxy,
+            url,
+            lease,
+        )
+        return tuple(result or ())
 
     def _danbooru_node_tags(self, policy: SitePolicy) -> list[str]:
         if policy.node_tags:
@@ -1415,6 +1546,7 @@ class DiscoveryService:
         params: dict[str, Any],
         policy: SitePolicy,
         proxy_mode: ProxyMode | None,
+        secure_search: bool = True,
     ) -> tuple[Any, dict[str, Any], int]:
         mode: ProxyMode = proxy_mode or policy.proxy_mode
         attempts = max(1, policy.retry_limit + 1)
@@ -1422,12 +1554,19 @@ class DiscoveryService:
         preferred_tags = self._danbooru_node_tags(policy)
         last_error = "Danbooru API 请求失败"
         last_status: int | None = None
+        last_proxy = self._proxy_metadata(mode, None)
+        last_dns_error: EncryptedDNSError | None = None
+
+        if secure_search and mode == "direct":
+            await self.validate_direct(url)
 
         for attempt in range(1, attempts + 1):
             operation_id = f"dan-api-{uuid.uuid4().hex}"
+            last_dns_error = None
             lease: ProxyLease | None = None
             proxy_fault = False
             retryable = True
+            dns_error: EncryptedDNSError | None = None
             try:
                 if mode != "direct":
                     try:
@@ -1440,11 +1579,7 @@ class DiscoveryService:
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
-                        if (
-                            lease is None
-                            and preferred_tags
-                            and not policy.node_tags
-                        ):
+                        if lease is None and preferred_tags and not policy.node_tags:
                             lease = await asyncio.to_thread(
                                 self.proxy.acquire,
                                 operation_id,
@@ -1457,23 +1592,31 @@ class DiscoveryService:
                     except ProxyPoolUnavailable as exc:
                         raise DiscoveryError(
                             "proxy_unavailable",
-                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
-                            details={"attempts": attempt},
+                            "代理不可用，已终止（不会回退直连）",
+                            details={"attempts": attempt, "proxy": last_proxy},
                         ) from exc
                     except Exception as exc:
-                        last_error = redact_text(exc, limit=1000)
-                        if mode == "required":
+                        if secure_search or mode == "required":
                             raise DiscoveryError(
                                 "proxy_unavailable",
-                                last_error,
-                                details={"attempts": attempt},
+                                "代理租约获取失败，已拒绝回退直连",
+                                details={"attempts": attempt, "proxy": last_proxy},
                             ) from exc
+                    if lease is None and secure_search:
+                        raise DiscoveryError(
+                            "proxy_dns_failed",
+                            "当前没有可用于代理 DNS 校验的健康节点，已拒绝回退直连",
+                            details={"attempts": attempt, "proxy": last_proxy},
+                        )
                     if lease is None and mode == "required":
                         raise DiscoveryError(
                             "proxy_unavailable",
                             "当前没有符合 Danbooru API 查询策略的健康代理节点",
-                            details={"attempts": attempt},
+                            details={"attempts": attempt, "proxy": last_proxy},
                         )
+                    last_proxy = self._proxy_metadata(mode, lease)
+                    if secure_search and lease is not None:
+                        await self.validate_proxy(url, lease)
 
                 payload = await asyncio.to_thread(
                     _danbooru_json_request,
@@ -1482,17 +1625,19 @@ class DiscoveryService:
                     proxy_url=lease.endpoint if lease else None,
                     timeout=policy.http_timeout,
                 )
-                return (
-                    payload,
-                    {
-                        "mode": mode,
-                        "used": lease is not None,
-                        "node_id": lease.node_id if lease else None,
-                        "node_name": lease.name if lease else None,
-                        "protocol": lease.protocol if lease else None,
-                    },
-                    attempt,
-                )
+                return payload, self._proxy_metadata(mode, lease), attempt
+            except EncryptedDNSError as exc:
+                dns_error = last_dns_error = exc
+                last_error = exc.message
+                retryable = exc.retryable
+                proxy_fault = bool(lease is not None and exc.proxy_fault)
+                if not proxy_fault:
+                    raise self._network_error(
+                        exc,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt,
+                    ) from exc
             except DiscoveryError:
                 raise
             except _DanbooruApiRequestError as exc:
@@ -1519,16 +1664,34 @@ class DiscoveryService:
                         pass
 
             if not retryable or attempt >= attempts:
+                if dns_error is not None:
+                    raise self._network_error(
+                        dns_error,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt,
+                    ) from dns_error
                 break
             if policy.backoff_base_seconds:
                 await asyncio.sleep(
                     min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0)
                 )
 
+        if last_dns_error is not None:
+            raise self._network_error(
+                last_dns_error,
+                mode=mode,
+                lease=None,
+                attempts=attempts,
+            ) from last_dns_error
         raise DiscoveryError(
             "danbooru_api_failed",
             last_error,
-            details={"attempts": attempts, "status_code": last_status},
+            details={
+                "attempts": attempts,
+                "status_code": last_status,
+                "proxy": last_proxy,
+            },
         )
 
     async def _search_danbooru_posts_api(
@@ -1538,6 +1701,7 @@ class DiscoveryService:
         limit: int,
         policy: SitePolicy,
         proxy_mode: ProxyMode | None,
+        secure_search: bool = True,
     ) -> dict[str, Any]:
         search_url = search_site("danbooru").search_url(keyword)
         requested = max(1, int(limit))
@@ -1559,6 +1723,7 @@ class DiscoveryService:
                 params=params,
                 policy=policy,
                 proxy_mode=proxy_mode,
+                secure_search=secure_search,
             )
             attempts += page_attempts
             if not isinstance(payload, list):
@@ -1695,8 +1860,8 @@ class DiscoveryService:
                 extra_args=extra_args,
                 timeout_seconds=timeout_seconds,
             )
-        except DiscoveryError:
-            if spec.site != "danbooru":
+        except DiscoveryError as exc:
+            if spec.site != "danbooru" or exc.code in _DNS_ERROR_CODES:
                 raise
             return await self._bounded_search_fallback(
                 self._search_danbooru_posts_api(
@@ -1777,6 +1942,10 @@ class DiscoveryService:
             min(float(policy.http_timeout), float(timeout_seconds)),
         )
 
+        target_url = "https://api.e-hentai.org/api.php"
+        if mode == "direct":
+            await self.validate_direct(target_url)
+
         async def fetch_batch(batch: list[tuple[int, str]]) -> list[dict[str, Any]]:
             # e-hentai's gdata API temp-bans an IP after a few rapid requests, so
             # each ≤25-gid batch takes its own proxy lease; consecutive batches
@@ -1784,11 +1953,16 @@ class DiscoveryService:
             attempts = max(1, policy.retry_limit + 1)
             tried: set[str] = set()
             last_error = "EH 画廊预览资料读取失败"
+            last_proxy = self._proxy_metadata(mode, None)
+            last_dns_error: EncryptedDNSError | None = None
 
             for attempt in range(1, attempts + 1):
                 operation_id = f"eh-preview-{uuid.uuid4().hex}"
+                last_dns_error = None
                 lease: ProxyLease | None = None
                 proxy_fault = False
+                retryable = True
+                dns_error: EncryptedDNSError | None = None
                 try:
                     if mode != "direct":
                         try:
@@ -1804,52 +1978,76 @@ class DiscoveryService:
                         except ProxyPoolUnavailable as exc:
                             raise DiscoveryError(
                                 "proxy_unavailable",
-                                f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                                "代理不可用，已终止（不会回退直连）",
+                                details={"attempts": attempt, "proxy": last_proxy},
                             ) from exc
                         except Exception as exc:
-                            if mode == "required":
-                                raise DiscoveryError(
-                                    "proxy_unavailable", redact_text(exc, limit=1000)
-                                ) from exc
-                        if lease is None and mode == "required":
                             raise DiscoveryError(
                                 "proxy_unavailable",
-                                "当前没有符合 EH 预览查询策略的健康代理节点",
+                                "代理租约获取失败，已拒绝回退直连",
+                                details={"attempts": attempt, "proxy": last_proxy},
+                            ) from exc
+                        if lease is None:
+                            raise DiscoveryError(
+                                "proxy_dns_failed",
+                                "当前没有可用于代理 DNS 校验的健康节点，已拒绝回退直连",
+                                details={"attempts": attempt, "proxy": last_proxy},
                             )
+                        last_proxy = self._proxy_metadata(mode, lease)
+                        await self.validate_proxy(target_url, lease)
 
                     def request_batch() -> list[dict[str, Any]]:
                         session = requests.Session()
+                        session.trust_env = False
                         session.headers["User-Agent"] = "gallery-dl-backend/0.3"
                         proxies = (
                             {"http": lease.endpoint, "https": lease.endpoint}
                             if lease
                             else None
                         )
-                        response = session.post(
-                            "https://api.e-hentai.org/api.php",
-                            json={
-                                "method": "gdata",
-                                "gidlist": [list(pair) for pair in batch],
-                                "namespace": 1,
-                            },
-                            proxies=proxies,
-                            timeout=request_timeout,
-                            allow_redirects=False,
-                        )
-                        if 300 <= int(getattr(response, "status_code", 200)) < 400:
-                            raise ValueError("EH gdata API 返回了未接受的重定向")
-                        response.raise_for_status()
-                        payload = response.json()
-                        if not isinstance(payload, dict):
-                            raise ValueError("EH gdata API 返回结构无效")
-                        if payload.get("error"):
-                            raise ValueError(str(payload["error"]))
-                        metadata = payload.get("gmetadata")
-                        if not isinstance(metadata, list):
-                            raise ValueError("EH gdata API 缺少 gmetadata")
-                        return [item for item in metadata if isinstance(item, dict)]
+                        try:
+                            response = session.post(
+                                target_url,
+                                json={
+                                    "method": "gdata",
+                                    "gidlist": [list(pair) for pair in batch],
+                                    "namespace": 1,
+                                },
+                                proxies=proxies,
+                                timeout=request_timeout,
+                                allow_redirects=False,
+                                verify=True,
+                            )
+                            if 300 <= int(getattr(response, "status_code", 200)) < 400:
+                                raise ValueError("EH gdata API 返回了未接受的重定向")
+                            response.raise_for_status()
+                            payload = response.json()
+                            if not isinstance(payload, dict):
+                                raise ValueError("EH gdata API 返回结构无效")
+                            if payload.get("error"):
+                                raise ValueError(str(payload["error"]))
+                            metadata = payload.get("gmetadata")
+                            if not isinstance(metadata, list):
+                                raise ValueError("EH gdata API 缺少 gmetadata")
+                            return [item for item in metadata if isinstance(item, dict)]
+                        finally:
+                            close = getattr(session, "close", None)
+                            if callable(close):
+                                close()
 
                     return await asyncio.to_thread(request_batch)
+                except EncryptedDNSError as exc:
+                    dns_error = last_dns_error = exc
+                    last_error = exc.message
+                    retryable = exc.retryable
+                    proxy_fault = bool(lease is not None and exc.proxy_fault)
+                    if not proxy_fault:
+                        raise self._network_error(
+                            exc,
+                            mode=mode,
+                            lease=lease,
+                            attempts=attempt,
+                        ) from exc
                 except DiscoveryError:
                     raise
                 except Exception as exc:
@@ -1864,13 +2062,17 @@ class DiscoveryService:
                         status_code
                         and (status_code in {408, 425, 429} or status_code >= 500)
                     )
-                    proxy_fault = decision.proxy_fault
-                    if lease is not None and proxy_fault:
-                        tried.add(lease.node_id)
-                    if not decision.retryable and not proxy_fault and not transient_request:
-                        break
+                    retryable = bool(
+                        decision.retryable or transient_request or decision.proxy_fault
+                    )
+                    proxy_fault = bool(
+                        lease is not None
+                        and (decision.proxy_fault or transient_request)
+                    )
                 finally:
                     if lease is not None:
+                        if proxy_fault:
+                            tried.add(lease.node_id)
                         try:
                             await asyncio.to_thread(
                                 self.proxy.release,
@@ -1880,15 +2082,32 @@ class DiscoveryService:
                             )
                         except Exception:
                             pass
-                if attempt < attempts and policy.backoff_base_seconds:
+
+                if not retryable or attempt >= attempts:
+                    if dns_error is not None:
+                        raise self._network_error(
+                            dns_error,
+                            mode=mode,
+                            lease=lease,
+                            attempts=attempt,
+                        ) from dns_error
+                    break
+                if policy.backoff_base_seconds:
                     await asyncio.sleep(
                         min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0)
                     )
 
+            if last_dns_error is not None:
+                raise self._network_error(
+                    last_dns_error,
+                    mode=mode,
+                    lease=None,
+                    attempts=attempts,
+                ) from last_dns_error
             raise DiscoveryError(
                 "exhentai_preview_lookup_failed",
                 last_error,
-                details={"attempts": attempts},
+                details={"attempts": attempts, "proxy": last_proxy},
             )
 
         rows: list[dict[str, Any]] = []
@@ -2049,7 +2268,9 @@ class DiscoveryService:
                 extra_args=[],
                 timeout_seconds=timeout_seconds,
             )
-        except DiscoveryError:
+        except DiscoveryError as exc:
+            if exc.code in _DNS_ERROR_CODES:
+                raise
             return await self._bounded_search_fallback(
                 self._search_danbooru_artists_api(
                     keyword=keyword,
@@ -2120,11 +2341,20 @@ class DiscoveryService:
         tried: set[str] = set()
         last_error = "Danbooru 画师资料读取失败"
         preferred_tags = self._danbooru_node_tags(policy)
+        target_url = "https://danbooru.donmai.us/artists.json"
+        last_proxy = self._proxy_metadata(mode, None)
+        last_dns_error: EncryptedDNSError | None = None
+
+        if mode == "direct":
+            await self.validate_direct(target_url)
 
         for attempt in range(1, attempts + 1):
             operation_id = f"dan-artist-{uuid.uuid4().hex}"
+            last_dns_error = None
             lease: ProxyLease | None = None
             proxy_fault = False
+            retryable = True
+            dns_error: EncryptedDNSError | None = None
             try:
                 if mode != "direct":
                     try:
@@ -2137,11 +2367,7 @@ class DiscoveryService:
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
-                        if (
-                            lease is None
-                            and preferred_tags
-                            and not policy.node_tags
-                        ):
+                        if lease is None and preferred_tags and not policy.node_tags:
                             lease = await asyncio.to_thread(
                                 self.proxy.acquire,
                                 operation_id,
@@ -2154,21 +2380,33 @@ class DiscoveryService:
                     except ProxyPoolUnavailable as exc:
                         raise DiscoveryError(
                             "proxy_unavailable",
-                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
+                            "代理不可用，已终止（不会回退直连）",
+                            details={"attempts": attempt, "proxy": last_proxy},
                         ) from exc
                     except Exception as exc:
-                        if mode == "required":
-                            raise DiscoveryError("proxy_unavailable", redact_text(exc, limit=1000)) from exc
-                    if lease is None and mode == "required":
                         raise DiscoveryError(
                             "proxy_unavailable",
-                            "当前没有符合 Danbooru 资料查询策略的健康代理节点",
+                            "代理租约获取失败，已拒绝回退直连",
+                            details={"attempts": attempt, "proxy": last_proxy},
+                        ) from exc
+                    if lease is None:
+                        raise DiscoveryError(
+                            "proxy_dns_failed",
+                            "当前没有可用于代理 DNS 校验的健康节点，已拒绝回退直连",
+                            details={"attempts": attempt, "proxy": last_proxy},
                         )
+                    last_proxy = self._proxy_metadata(mode, lease)
+                    await self.validate_proxy(target_url, lease)
 
                 def request_profile() -> dict[str, Any] | None:
                     session = requests.Session()
+                    session.trust_env = False
                     session.headers["User-Agent"] = "gallery-dl-backend/0.3"
-                    proxies = {"http": lease.endpoint, "https": lease.endpoint} if lease else None
+                    proxies = (
+                        {"http": lease.endpoint, "https": lease.endpoint}
+                        if lease
+                        else None
+                    )
 
                     def request_json(url: str, params: dict[str, Any]) -> Any:
                         response = session.get(
@@ -2177,6 +2415,7 @@ class DiscoveryService:
                             proxies=proxies,
                             timeout=policy.http_timeout,
                             allow_redirects=False,
+                            verify=True,
                         )
                         status_code = int(getattr(response, "status_code", 200))
                         if 300 <= status_code < 400:
@@ -2192,56 +2431,72 @@ class DiscoveryService:
                         response.raise_for_status()
                         return response.json()
 
-                    payload = request_json(
-                        "https://danbooru.donmai.us/artists.json",
-                        {"search[name]": name, "limit": 20},
-                    )
-                    if not isinstance(payload, list) or not payload:
-                        return None
-                    exact = next(
-                        (
-                            item
-                            for item in payload
-                            if _tag_key(item.get("name", "")) == _tag_key(name)
-                        ),
-                        None,
-                    )
-                    if exact is None:
-                        return None
-                    artist_id = int(exact["id"])
-                    url_payload = request_json(
-                        "https://danbooru.donmai.us/artist_urls.json",
-                        {"search[artist_id]": artist_id, "limit": 100},
-                    )
-                    related: list[dict[str, Any]] = []
-                    if isinstance(url_payload, list):
-                        for row in url_payload:
-                            if not isinstance(row, dict) or not row.get("url"):
-                                continue
-                            classified = classify_external_profile(str(row["url"]))
-                            classified.update(
-                                {
-                                    "id": row.get("id"),
-                                    "active": bool(row.get("is_active", True)),
-                                }
-                            )
-                            related.append(classified)
-                    return {
-                        "id": str(artist_id),
-                        "name": str(exact.get("name") or name),
-                        "other_names": [str(value) for value in exact.get("other_names") or []],
-                        "group_name": exact.get("group_name"),
-                        "profile_url": f"https://danbooru.donmai.us/artists/{artist_id}",
-                        "works_url": "https://danbooru.donmai.us/posts?" + urlencode({"tags": exact.get("name") or name}),
-                        "related_profiles": related,
-                        "proxy": {
-                            "mode": mode,
-                            "used": lease is not None,
-                            "node_id": lease.node_id if lease else None,
-                        },
-                    }
+                    try:
+                        payload = request_json(
+                            target_url,
+                            {"search[name]": name, "limit": 20},
+                        )
+                        if not isinstance(payload, list) or not payload:
+                            return None
+                        exact = next(
+                            (
+                                item
+                                for item in payload
+                                if _tag_key(item.get("name", "")) == _tag_key(name)
+                            ),
+                            None,
+                        )
+                        if exact is None:
+                            return None
+                        artist_id = int(exact["id"])
+                        url_payload = request_json(
+                            "https://danbooru.donmai.us/artist_urls.json",
+                            {"search[artist_id]": artist_id, "limit": 100},
+                        )
+                        related: list[dict[str, Any]] = []
+                        if isinstance(url_payload, list):
+                            for row in url_payload:
+                                if not isinstance(row, dict) or not row.get("url"):
+                                    continue
+                                classified = classify_external_profile(str(row["url"]))
+                                classified.update(
+                                    {
+                                        "id": row.get("id"),
+                                        "active": bool(row.get("is_active", True)),
+                                    }
+                                )
+                                related.append(classified)
+                        return {
+                            "id": str(artist_id),
+                            "name": str(exact.get("name") or name),
+                            "other_names": [
+                                str(value) for value in exact.get("other_names") or []
+                            ],
+                            "group_name": exact.get("group_name"),
+                            "profile_url": f"https://danbooru.donmai.us/artists/{artist_id}",
+                            "works_url": "https://danbooru.donmai.us/posts?"
+                            + urlencode({"tags": exact.get("name") or name}),
+                            "related_profiles": related,
+                            "proxy": self._proxy_metadata(mode, lease),
+                        }
+                    finally:
+                        close = getattr(session, "close", None)
+                        if callable(close):
+                            close()
 
                 return await asyncio.to_thread(request_profile)
+            except EncryptedDNSError as exc:
+                dns_error = last_dns_error = exc
+                last_error = exc.message
+                retryable = exc.retryable
+                proxy_fault = bool(lease is not None and exc.proxy_fault)
+                if not proxy_fault:
+                    raise self._network_error(
+                        exc,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt,
+                    ) from exc
             except DiscoveryError:
                 raise
             except Exception as exc:
@@ -2261,16 +2516,19 @@ class DiscoveryService:
                 if isinstance(exc, _DanbooruApiRequestError):
                     transient_request = exc.retryable
                     challenge = exc.proxy_fault
-                proxy_fault = bool(
-                    decision.proxy_fault
-                    or (lease is not None and (challenge or transient_request))
+                retryable = bool(
+                    decision.retryable
+                    or transient_request
+                    or decision.proxy_fault
                 )
-                if lease is not None and proxy_fault:
-                    tried.add(lease.node_id)
-                if not decision.retryable and not proxy_fault and not transient_request:
-                    break
+                proxy_fault = bool(
+                    lease is not None
+                    and (decision.proxy_fault or challenge or transient_request)
+                )
             finally:
                 if lease is not None:
+                    if proxy_fault:
+                        tried.add(lease.node_id)
                     try:
                         await asyncio.to_thread(
                             self.proxy.release,
@@ -2280,13 +2538,32 @@ class DiscoveryService:
                         )
                     except Exception:
                         pass
-            if attempt < attempts and policy.backoff_base_seconds:
-                await asyncio.sleep(min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0))
 
+            if not retryable or attempt >= attempts:
+                if dns_error is not None:
+                    raise self._network_error(
+                        dns_error,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt,
+                    ) from dns_error
+                break
+            if policy.backoff_base_seconds:
+                await asyncio.sleep(
+                    min(policy.backoff_base_seconds * (2 ** (attempt - 1)), 10.0)
+                )
+
+        if last_dns_error is not None:
+            raise self._network_error(
+                last_dns_error,
+                mode=mode,
+                lease=None,
+                attempts=attempts,
+            ) from last_dns_error
         raise DiscoveryError(
             "danbooru_artist_lookup_failed",
             last_error,
-            details={"artist": name, "attempts": attempts},
+            details={"attempts": attempts, "proxy": last_proxy},
         )
 
     async def discover_url(
@@ -2325,6 +2602,7 @@ class DiscoveryService:
                             limit=limit,
                             policy=policy,
                             proxy_mode=proxy_mode,
+                            secure_search=False,
                         ),
                         timeout=timeout_seconds,
                     )
@@ -2361,25 +2639,26 @@ class DiscoveryService:
             range_limit = limit * 10
         protocol_args = ["--dump-json", range_option, f"1-{range_limit}", *values]
         mode: ProxyMode = proxy_mode or policy.proxy_mode
+        secure_search = keyword is not None
         attempts = max(1, policy.retry_limit + 1)
         attempt_count = 0
         tried: set[str] = set()
         last_message = "搜索任务没有返回结果"
         last_auth_context = ""
         last_decision = FailureDecision("backend_error", False, False, last_message)
-        last_proxy = {
-            "mode": mode,
-            "used": False,
-            "node_id": None,
-            "node_name": None,
-            "protocol": None,
-        }
+        last_proxy = self._proxy_metadata(mode, None)
+        last_dns_error: EncryptedDNSError | None = None
+
+        if secure_search and mode == "direct":
+            await self.validate_direct(url)
 
         for attempt in range(1, attempts + 1):
             operation_id = f"discover-{uuid.uuid4().hex}"
+            last_dns_error = None
             operation_dir = self.runtime_dir / operation_id
             lease: ProxyLease | None = None
             decision = FailureDecision("backend_error", False, False, last_message)
+            dns_error: EncryptedDNSError | None = None
             try:
                 if mode != "direct":
                     try:
@@ -2395,37 +2674,33 @@ class DiscoveryService:
                     except ProxyPoolUnavailable as exc:
                         raise DiscoveryError(
                             "proxy_unavailable",
-                            f"代理不可用，已终止（不会回退直连）：{redact_text(exc, limit=1000)}",
-                            details={"attempts": attempt_count, "proxy": last_proxy},
+                            "代理不可用，已终止（不会回退直连）",
+                            details={"attempts": attempt, "proxy": last_proxy},
                         ) from exc
                     except Exception as exc:
-                        if mode == "required":
-                            if attempt_count and last_decision.retryable:
-                                decision = last_decision
-                                break
+                        if secure_search or mode == "required":
                             raise DiscoveryError(
                                 "proxy_unavailable",
-                                redact_text(exc, limit=1000),
-                                details={"attempts": attempt_count, "proxy": last_proxy},
+                                "代理租约获取失败，已拒绝回退直连",
+                                details={"attempts": attempt, "proxy": last_proxy},
                             ) from exc
+                    if lease is None and secure_search:
+                        raise DiscoveryError(
+                            "proxy_dns_failed",
+                            "当前没有可用于代理 DNS 校验的健康节点，已拒绝回退直连",
+                            details={"attempts": attempt, "proxy": last_proxy},
+                        )
                     if lease is None and mode == "required":
-                        if attempt_count and last_decision.retryable:
-                            decision = last_decision
-                            break
                         raise DiscoveryError(
                             "proxy_unavailable",
                             "当前没有符合站点策略的健康代理节点",
-                            details={"attempts": attempt_count, "proxy": last_proxy},
+                            details={"attempts": attempt, "proxy": last_proxy},
                         )
 
-                last_proxy = {
-                    "mode": mode,
-                    "used": lease is not None,
-                    "node_id": redact_text(lease.node_id, limit=128) if lease else None,
-                    "node_name": redact_text(lease.name, limit=200) if lease else None,
-                    "protocol": redact_text(lease.protocol, limit=50) if lease else None,
-                }
+                last_proxy = self._proxy_metadata(mode, lease)
                 attempt_count += 1
+                if secure_search and lease is not None:
+                    await self.validate_proxy(url, lease)
                 result = await self.gallery.capture(
                     operation_id,
                     url=url,
@@ -2489,10 +2764,29 @@ class DiscoveryService:
                         }
                 else:
                     last_message = decision.message
+            except EncryptedDNSError as exc:
+                dns_error = last_dns_error = exc
+                last_message = exc.message
+                decision = FailureDecision(
+                    "proxy_error" if exc.proxy_fault else "network_target",
+                    exc.retryable,
+                    bool(lease is not None and exc.proxy_fault),
+                    exc.message,
+                )
+                if not decision.proxy_fault:
+                    raise self._network_error(
+                        exc,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt_count,
+                    ) from exc
             except DiscoveryError:
                 raise
             except (FileNotFoundError, ValueError) as exc:
-                raise DiscoveryError("discovery_configuration", redact_text(exc, limit=1000)) from exc
+                raise DiscoveryError(
+                    "discovery_configuration",
+                    redact_text(exc, limit=1000),
+                ) from exc
             except Exception as exc:
                 last_message = redact_text(exc, limit=1000)
                 decision = classify_result(1, last_message)
@@ -2509,16 +2803,33 @@ class DiscoveryService:
                         )
                     except Exception:
                         pass
-                if operation_dir.parent == self.runtime_dir and operation_dir.name.startswith("discover-"):
+                if (
+                    operation_dir.parent == self.runtime_dir
+                    and operation_dir.name.startswith("discover-")
+                ):
                     shutil.rmtree(operation_dir, ignore_errors=True)
 
             last_decision = decision
             if not decision.retryable or attempt >= attempts:
+                if dns_error is not None:
+                    raise self._network_error(
+                        dns_error,
+                        mode=mode,
+                        lease=lease,
+                        attempts=attempt_count,
+                    ) from dns_error
                 break
             delay = policy.backoff_base_seconds * (2 ** max(0, attempt - 1))
             if delay:
                 await asyncio.sleep(min(delay, 10.0))
 
+        if last_dns_error is not None:
+            raise self._network_error(
+                last_dns_error,
+                mode=mode,
+                lease=None,
+                attempts=attempt_count,
+            ) from last_dns_error
         if decision.error_class == "authentication" and self.auth_failure_callback is not None:
             try:
                 await self.auth_failure_callback(

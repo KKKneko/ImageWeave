@@ -9,6 +9,11 @@ from io import StringIO
 from pathlib import Path
 
 from gdl_backend.config import AppSettings, normalize_authorization_proxy
+from gdl_backend.encrypted_dns import (
+    DEFAULT_DOH_ENDPOINT,
+    DEFAULT_DOH_MAX_RESPONSE_BYTES,
+    DEFAULT_DOH_TIMEOUT_SECONDS,
+)
 from gdl_backend.schemas import build_runtime_site_policy
 
 
@@ -268,6 +273,131 @@ class ConfigDefaultsTests(unittest.TestCase):
                 "extra_args": [],
             },
         )
+
+
+class EncryptedDNSConfigTests(unittest.TestCase):
+    @staticmethod
+    def _load(encrypted_dns: dict) -> AppSettings:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "runtime_dir": "runtime",
+                    "database_path": "runtime/backend.sqlite3",
+                    "default_output_root": "runtime/downloads",
+                    "dedup": {"enabled": False},
+                    "encrypted_dns": encrypted_dns,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            return AppSettings.load(config_path)
+        finally:
+            temporary.cleanup()
+
+    def test_defaults_are_enabled_and_public(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = AppSettings.load(Path(temporary) / "missing-config.json")
+
+        self.assertTrue(settings.encrypted_dns.enabled)
+        self.assertEqual(settings.encrypted_dns.endpoint, DEFAULT_DOH_ENDPOINT)
+        self.assertEqual(
+            settings.encrypted_dns.timeout_seconds,
+            DEFAULT_DOH_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            settings.encrypted_dns.max_response_bytes,
+            DEFAULT_DOH_MAX_RESPONSE_BYTES,
+        )
+        self.assertEqual(
+            settings.public_dict()["encrypted_dns"],
+            {
+                "enabled": True,
+                "endpoint": DEFAULT_DOH_ENDPOINT,
+                "timeout_seconds": DEFAULT_DOH_TIMEOUT_SECONDS,
+                "max_response_bytes": DEFAULT_DOH_MAX_RESPONSE_BYTES,
+            },
+        )
+
+    def test_loads_normalizes_and_publishes_encrypted_dns_settings(self):
+        settings = self._load(
+            {
+                "enabled": False,
+                "endpoint": " HTTPS://DNS.Example:443/dns-query ",
+                "timeout_seconds": 12,
+                "max_response_bytes": 32768,
+            }
+        )
+
+        self.assertFalse(settings.encrypted_dns.enabled)
+        self.assertEqual(
+            settings.encrypted_dns.endpoint,
+            "https://dns.example:443/dns-query",
+        )
+        self.assertEqual(settings.encrypted_dns.timeout_seconds, 12.0)
+        self.assertEqual(settings.encrypted_dns.max_response_bytes, 32768)
+        self.assertEqual(
+            settings.public_dict()["encrypted_dns"],
+            {
+                "enabled": False,
+                "endpoint": "https://dns.example:443/dns-query",
+                "timeout_seconds": 12.0,
+                "max_response_bytes": 32768,
+            },
+        )
+
+    def test_enabled_rejects_non_boolean_values(self):
+        for value in ("true", 1, 0, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"encrypted_dns\.enabled"):
+                    self._load({"enabled": value})
+
+    def test_endpoint_rejects_insecure_credentials_query_and_private_literal(self):
+        values = (
+            "http://dns.example/dns-query",
+            "https://user:secret@dns.example/dns-query",
+            "https://dns.example/dns-query?name=private.example",
+            "https://127.0.0.1/dns-query",
+            "https://[::1]/dns-query",
+            "https://192.168.1.1/dns-query",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"encrypted_dns\.endpoint"):
+                    self._load({"endpoint": value})
+
+    def test_timeout_rejects_nan_bool_non_numeric_and_out_of_range(self):
+        for value in (float("nan"), True, False, "8", 0.09, 60.01):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"encrypted_dns\.timeout_seconds",
+                ):
+                    self._load({"timeout_seconds": value})
+
+    def test_timeout_accepts_inclusive_boundaries(self):
+        for value in (0.1, 60.0):
+            with self.subTest(value=value):
+                settings = self._load({"timeout_seconds": value})
+                self.assertEqual(settings.encrypted_dns.timeout_seconds, value)
+
+    def test_response_limit_rejects_bool_non_integer_and_out_of_range(self):
+        for value in (True, False, 65536.0, 1023, 1024 * 1024 + 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"encrypted_dns\.max_response_bytes",
+                ):
+                    self._load({"max_response_bytes": value})
+
+    def test_response_limit_accepts_inclusive_boundaries(self):
+        for value in (1024, 1024 * 1024):
+            with self.subTest(value=value):
+                settings = self._load({"max_response_bytes": value})
+                self.assertEqual(settings.encrypted_dns.max_response_bytes, value)
 
 
 class DedupResourceConfigTests(unittest.TestCase):

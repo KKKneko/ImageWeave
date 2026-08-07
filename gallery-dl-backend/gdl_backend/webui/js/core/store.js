@@ -52,6 +52,7 @@ export const ACTION_TYPES = Object.freeze({
   REVIEW_SUMMARY_RECEIVED: "review/summaryReceived",
   REVIEW_IMAGE_SELECTION_CHANGED: "review/imageSelectionChanged",
   REVIEW_GROUP_MODE_CHANGED: "review/groupModeChanged",
+  REVIEW_GROUP_CONFIRMED: "review/groupConfirmed",
   REVIEW_PAGE_MODE_CHANGED: "review/pageModeChanged",
   REVIEW_PAGE_SAVED: "review/pageSaved",
   REVIEW_CLEARED: "review/cleared",
@@ -596,6 +597,11 @@ function reduceRootState(state, action) {
         ...state,
         review: setReviewGroupMode(state.review, action.payload?.groupId, action.payload?.mode),
       };
+    case ACTION_TYPES.REVIEW_GROUP_CONFIRMED: {
+      const groupId = action.payload?.groupId;
+      if (state.review.dirty || !state.review.groups.some((group) => group.id === groupId)) return state;
+      return { ...state, review: { ...state.review, dirty: true } };
+    }
     case ACTION_TYPES.REVIEW_PAGE_MODE_CHANGED:
       return { ...state, review: setReviewPageMode(state.review, action.payload?.mode) };
     case ACTION_TYPES.REVIEW_PAGE_SAVED:
@@ -752,6 +758,9 @@ export const actionCreators = Object.freeze({
   },
   reviewGroupModeChanged(groupId, mode) {
     return action(ACTION_TYPES.REVIEW_GROUP_MODE_CHANGED, { groupId, mode });
+  },
+  reviewGroupConfirmed(groupId) {
+    return action(ACTION_TYPES.REVIEW_GROUP_CONFIRMED, { groupId });
   },
   reviewPageModeChanged(mode) {
     return action(ACTION_TYPES.REVIEW_PAGE_MODE_CHANGED, { mode });

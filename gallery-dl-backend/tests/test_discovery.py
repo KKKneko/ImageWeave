@@ -7,7 +7,7 @@ import requests
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from gdl_backend.discovery import (
     DiscoveryService,
@@ -22,10 +22,64 @@ from gdl_backend.discovery import (
     search_site,
     validate_discovery_args,
 )
+from gdl_backend.encrypted_dns import (
+    EncryptedDNSError,
+    NetworkTargetValidator,
+    validate_network_target_syntax,
+)
 from gdl_backend.gallery import GalleryCaptureResult, GalleryRunner
 from gdl_backend.proxy import ProxyLease
 from gdl_backend.schemas import SitePolicy
 from tests.helpers import make_settings
+
+
+class _AllowingNetworkValidator:
+    """隔离 gallery/租约测试；真实 DoH 行为由专用测试覆盖。"""
+
+    def __init__(self):
+        self.proxy_calls = []
+
+    @staticmethod
+    def validate_direct(url):
+        validate_network_target_syntax(url, False)
+        return ()
+
+    def validate_proxy(self, url, lease):
+        validate_network_target_syntax(url, False)
+        self.proxy_calls.append((url, lease.endpoint))
+        return ("1.1.1.1",)
+
+
+class _RecordingEncryptedDNS:
+    def __init__(self, outcomes=None):
+        self.outcomes = list(outcomes or [])
+        self.calls = []
+
+    def resolve(self, hostname, *, proxy_url):
+        self.calls.append((hostname, proxy_url))
+        outcome = self.outcomes.pop(0) if self.outcomes else ("1.1.1.1",)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return tuple(outcome)
+
+
+def _encrypted_network_validator(resolver):
+    return NetworkTargetValidator(
+        allow_private_targets=False,
+        strict_target_dns=True,
+        encrypted_dns=resolver,
+    )
+
+
+def _retryable_dns_error(raw_secret):
+    error = EncryptedDNSError(
+        "encrypted_dns_unavailable",
+        "代理节点的加密 DNS TLS 连接失败",
+        retryable=True,
+        proxy_fault=True,
+    )
+    error.__cause__ = requests.exceptions.SSLError(raw_secret)
+    return error
 
 
 class _FakeGallery:
@@ -968,6 +1022,80 @@ class DiscoveryParserTests(unittest.TestCase):
         )
         self.assertTrue(session.calls[1][0].endswith("artist_urls.json"))
 
+    def test_danbooru_artist_profile_uses_same_lease_for_doh_and_requests(self):
+        class Response:
+            status_code = 200
+            text = ""
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        class Session:
+            def __init__(self):
+                self.headers = {}
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("artists.json"):
+                    return Response(
+                        [{"id": 55, "name": "artist_name", "other_names": []}]
+                    )
+                return Response(
+                    [{"id": 99, "artist_id": 55, "url": "https://x.com/artist_name"}]
+                )
+
+            def close(self):
+                return None
+
+        session = Session()
+        proxy = _FakeProxy()
+        resolver = _RecordingEncryptedDNS()
+        getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(
+                _FakeGallery("[]"),
+                proxy,
+                Path(temporary),
+                network_validator=_encrypted_network_validator(resolver),
+            )
+            with (
+                patch("gdl_backend.discovery.requests.Session", return_value=session),
+                patch(
+                    "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                    getaddrinfo,
+                ),
+            ):
+                profiles, errors = asyncio.run(
+                    service.danbooru_artist_profiles(
+                        ["artist_name"],
+                        policy=SitePolicy(proxy_mode="required", retry_limit=0),
+                        proxy_mode="required",
+                    )
+                )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(profiles[0]["id"], "55")
+        self.assertEqual(
+            resolver.calls,
+            [("danbooru.donmai.us", "http://127.0.0.1:29001")],
+        )
+        self.assertEqual(len(session.calls), 2)
+        self.assertTrue(
+            all(
+                call[1]["proxies"]["https"] == resolver.calls[0][1]
+                for call in session.calls
+            )
+        )
+        self.assertFalse(proxy.released[0][1]["proxy_fault"])
+        getaddrinfo.assert_not_called()
+
     def test_danbooru_artist_profile_rejects_non_exact_api_fallback(self):
         class Response:
             status_code = 200
@@ -1253,9 +1381,22 @@ class DiscoveryParserTests(unittest.TestCase):
         }
         session = Session()
         proxy = RotatingProxy()
+        resolver = _RecordingEncryptedDNS()
+        getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(_FakeGallery("[]"), proxy, Path(temporary))
-            with patch("gdl_backend.discovery.requests.Session", return_value=session):
+            service = DiscoveryService(
+                _FakeGallery("[]"),
+                proxy,
+                Path(temporary),
+                network_validator=_encrypted_network_validator(resolver),
+            )
+            with (
+                patch("gdl_backend.discovery.requests.Session", return_value=session),
+                patch(
+                    "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                    getaddrinfo,
+                ),
+            ):
                 enriched = asyncio.run(
                     service.enrich_exhentai_previews(
                         result,
@@ -1288,6 +1429,14 @@ class DiscoveryParserTests(unittest.TestCase):
             session.calls[1][1]["proxies"],
             {"http": "http://127.0.0.1:29002", "https": "http://127.0.0.1:29002"},
         )
+        self.assertEqual(
+            [call[1] for call in resolver.calls],
+            [
+                call[1]["proxies"]["https"]
+                for call in session.calls
+            ],
+        )
+        getaddrinfo.assert_not_called()
         # Every batch's gmetadata is merged back exactly as before.
         self.assertEqual(enriched["preview_count"], 30)
         self.assertEqual(enriched["preview_missing_count"], 0)
@@ -1341,7 +1490,12 @@ class DiscoveryParserTests(unittest.TestCase):
         gallery = _FakeGallery(stdout)
         proxy = _FakeProxy()
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(gallery, proxy, Path(temporary))
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_AllowingNetworkValidator(),
+            )
             result = asyncio.run(
                 service.search(
                     site="danbooru",
@@ -1365,6 +1519,249 @@ class DiscoveryParserTests(unittest.TestCase):
         self.assertEqual(gallery.calls[0][1]["proxy_url"], "http://127.0.0.1:29001")
         self.assertEqual(proxy.acquired[0][1]["node_tags"], ["jp"])
         self.assertFalse(proxy.released[0][1]["proxy_fault"])
+
+    def test_proxy_doh_failure_rotates_before_gallery_and_reuses_second_lease(self):
+        success = json.dumps(
+            [[
+                6,
+                "https://e-hentai.org/g/1531036/91cbde3481/",
+                {"gallery_id": 1531036, "gallery_token": "91cbde3481"},
+            ]]
+        )
+        gallery = _FakeGallery(success)
+        proxy = _RotatingFakeProxy()
+        resolver = _RecordingEncryptedDNS(
+            [
+                _retryable_dns_error("RAW_TLS_SECRET node-1 timeout"),
+                ("1.1.1.1",),
+            ]
+        )
+        getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_encrypted_network_validator(resolver),
+            )
+            with patch(
+                "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                getaddrinfo,
+            ):
+                result = asyncio.run(
+                    service.discover_url(
+                        site="exhentai",
+                        url="https://e-hentai.org/?f_search=private-keyword",
+                        keyword="private-keyword",
+                        limit=20,
+                        range_kind=None,
+                        policy=SitePolicy(
+                            proxy_mode="required",
+                            retry_limit=1,
+                            backoff_base_seconds=0,
+                        ),
+                        proxy_mode="required",
+                        credentials_ref=None,
+                        cookies_file=None,
+                        config_file=None,
+                        extra_args=[],
+                        timeout_seconds=30,
+                    )
+                )
+
+        self.assertEqual(proxy.acquired[1][1]["exclude_ids"], {"node-1"})
+        self.assertTrue(proxy.released[0][1]["proxy_fault"])
+        self.assertFalse(proxy.released[1][1]["proxy_fault"])
+        self.assertEqual(
+            [call[1] for call in resolver.calls],
+            ["http://127.0.0.1:29001", "http://127.0.0.1:29002"],
+        )
+        self.assertEqual(len(gallery.calls), 1)
+        self.assertEqual(gallery.calls[0][1]["proxy_url"], resolver.calls[1][1])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["proxy"]["node_id"], "node-2")
+        getaddrinfo.assert_not_called()
+
+    def test_all_proxy_doh_failures_stop_before_gallery_and_api_and_are_redacted(self):
+        private_keyword = "PRIVATE_KEYWORD_8c4f2a"
+        raw_secret = "RAW_TLS_RESPONSE_SECRET"
+        gallery = _FakeGallery("[]")
+        proxy = _RotatingFakeProxy()
+        resolver = _RecordingEncryptedDNS(
+            [
+                _retryable_dns_error(raw_secret),
+                _retryable_dns_error(raw_secret),
+            ]
+        )
+        getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_encrypted_network_validator(resolver),
+            )
+            with (
+                patch(
+                    "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                    getaddrinfo,
+                ),
+                patch("gdl_backend.discovery._danbooru_json_request") as api_request,
+                self.assertRaises(DiscoveryError) as caught,
+            ):
+                asyncio.run(
+                    service.search(
+                        site="danbooru",
+                        keyword=private_keyword,
+                        limit=20,
+                        policy=SitePolicy(
+                            proxy_mode="required",
+                            retry_limit=1,
+                            backoff_base_seconds=0,
+                        ),
+                        proxy_mode="required",
+                        credentials_ref=None,
+                        cookies_file=None,
+                        config_file=None,
+                        extra_args=[],
+                        timeout_seconds=30,
+                    )
+                )
+
+        error = caught.exception
+        self.assertEqual(error.code, "encrypted_dns_unavailable")
+        self.assertEqual(error.details["attempts"], 2)
+        self.assertEqual(proxy.acquired[1][1]["exclude_ids"], {"node-1"})
+        self.assertEqual(len(proxy.released), 2)
+        self.assertTrue(all(call[1]["proxy_fault"] for call in proxy.released))
+        self.assertEqual(gallery.calls, [])
+        api_request.assert_not_called()
+        getaddrinfo.assert_not_called()
+        rendered = " ".join(
+            [
+                error.message,
+                str(error.details),
+                *(str(call[1].get("reason") or "") for call in proxy.released),
+            ]
+        )
+        for secret in (
+            "http://127.0.0.1:29001",
+            "http://127.0.0.1:29002",
+            "127.0.0.1",
+            "29001",
+            "29002",
+            "danbooru.donmai.us",
+            private_keyword,
+            raw_secret,
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_target_dns_errors_do_not_trigger_danbooru_api_fallback(self):
+        cases = (
+            (
+                "encrypted_dns_nxdomain",
+                EncryptedDNSError(
+                    "encrypted_dns_nxdomain",
+                    "加密 DNS 明确返回目标域名不存在",
+                    retryable=False,
+                    proxy_fault=False,
+                ),
+            ),
+            ("invalid_network_target", ("2001::4a56:cac",)),
+        )
+        for expected_code, outcome in cases:
+            with self.subTest(expected_code=expected_code):
+                gallery = _FakeGallery("[]")
+                proxy = _RotatingFakeProxy()
+                resolver = _RecordingEncryptedDNS([outcome])
+                getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
+                with tempfile.TemporaryDirectory() as temporary:
+                    service = DiscoveryService(
+                        gallery,
+                        proxy,
+                        Path(temporary),
+                        network_validator=_encrypted_network_validator(resolver),
+                    )
+                    with (
+                        patch(
+                            "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                            getaddrinfo,
+                        ),
+                        patch(
+                            "gdl_backend.discovery._danbooru_json_request"
+                        ) as api_request,
+                        self.assertRaises(DiscoveryError) as caught,
+                    ):
+                        asyncio.run(
+                            service.search(
+                                site="danbooru",
+                                keyword="private-target-keyword",
+                                limit=20,
+                                policy=SitePolicy(
+                                    proxy_mode="required",
+                                    retry_limit=2,
+                                    backoff_base_seconds=0,
+                                ),
+                                proxy_mode="required",
+                                credentials_ref=None,
+                                cookies_file=None,
+                                config_file=None,
+                                extra_args=[],
+                                timeout_seconds=30,
+                            )
+                        )
+
+                self.assertEqual(caught.exception.code, expected_code)
+                self.assertEqual(gallery.calls, [])
+                api_request.assert_not_called()
+                getaddrinfo.assert_not_called()
+                self.assertEqual(len(proxy.acquired), 1)
+                self.assertEqual(len(proxy.released), 1)
+                self.assertFalse(proxy.released[0][1]["proxy_fault"])
+
+    def test_danbooru_api_uses_same_proxy_lease_for_doh_and_request(self):
+        proxy = _FakeProxy()
+        resolver = _RecordingEncryptedDNS()
+        getaddrinfo = Mock(side_effect=AssertionError("不应调用本机 DNS"))
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(
+                _FakeGallery("[]"),
+                proxy,
+                Path(temporary),
+                network_validator=_encrypted_network_validator(resolver),
+            )
+            with (
+                patch(
+                    "gdl_backend.encrypted_dns.socket.getaddrinfo",
+                    getaddrinfo,
+                ),
+                patch(
+                    "gdl_backend.discovery._danbooru_json_request",
+                    return_value=[],
+                ) as request,
+            ):
+                payload, proxy_info, attempts = asyncio.run(
+                    service._danbooru_api_json(
+                        "https://danbooru.donmai.us/posts.json",
+                        params={"tags": "fixture", "limit": 1},
+                        policy=SitePolicy(proxy_mode="required", retry_limit=0),
+                        proxy_mode="required",
+                    )
+                )
+
+        self.assertEqual(payload, [])
+        self.assertEqual(attempts, 1)
+        self.assertEqual(proxy_info["node_id"], "node-1")
+        self.assertEqual(
+            resolver.calls,
+            [("danbooru.donmai.us", "http://127.0.0.1:29001")],
+        )
+        self.assertEqual(
+            request.call_args.kwargs["proxy_url"],
+            resolver.calls[0][1],
+        )
+        self.assertFalse(proxy.released[0][1]["proxy_fault"])
+        getaddrinfo.assert_not_called()
 
     def test_pixiv_discovery_emits_only_the_first_media_per_work(self):
         stdout = json.dumps(
@@ -1430,7 +1827,12 @@ class DiscoveryParserTests(unittest.TestCase):
         gallery = _SequenceGallery([tls_error, success])
         proxy = _RotatingFakeProxy()
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(gallery, proxy, Path(temporary))
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_AllowingNetworkValidator(),
+            )
             result = asyncio.run(
                 service.search(
                     site="exhentai",
@@ -1472,7 +1874,12 @@ class DiscoveryParserTests(unittest.TestCase):
         gallery = _SequenceGallery([tls_error, tls_error])
         proxy = _RotatingFakeProxy()
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(gallery, proxy, Path(temporary))
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_AllowingNetworkValidator(),
+            )
             with self.assertRaises(DiscoveryError) as caught:
                 asyncio.run(
                     service.search(
@@ -1512,7 +1919,12 @@ class DiscoveryParserTests(unittest.TestCase):
         )
         proxy = _RotatingFakeProxy()
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(gallery, proxy, Path(temporary))
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_AllowingNetworkValidator(),
+            )
             with self.assertRaises(DiscoveryError) as caught:
                 asyncio.run(
                     service.search(
@@ -1562,7 +1974,12 @@ class DiscoveryParserTests(unittest.TestCase):
         )
         proxy = _FakeProxy()
         with tempfile.TemporaryDirectory() as temporary:
-            service = DiscoveryService(gallery, proxy, Path(temporary))
+            service = DiscoveryService(
+                gallery,
+                proxy,
+                Path(temporary),
+                network_validator=_AllowingNetworkValidator(),
+            )
             with self.assertRaises(DiscoveryError) as caught:
                 asyncio.run(
                     service.search(
